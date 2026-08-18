@@ -412,5 +412,32 @@ class TestEvaluationCap(unittest.TestCase):
         self.assertEqual(deferred, [])
 
 
+class TestDryRunSafety(unittest.TestCase):
+    """A dry run must never suppress a real future alert."""
+
+    def test_dry_run_is_not_banked_as_sent(self):
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        db = Database(_P(_tf.mkdtemp()) / "dry.db")
+        try:
+            notifier = WhatsAppNotifier(db)
+            notifier.dry_run = True
+            ev = Evaluation(
+                fingerprint="fp-dry", company_name="Etisalat",
+                role_title="VoIP Engineer", location="Dubai", match_score=90,
+                source_platform="linkedin", direct_link="https://example.com/1",
+            )
+            result = notifier.dispatch([ev])
+            self.assertEqual(result.sent, 1)
+            self.assertFalse(
+                db.already_alerted("fp-dry"),
+                "a dry run was recorded as delivered, so the real alert would "
+                "never be sent",
+            )
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -200,9 +200,16 @@ class WhatsAppNotifier:
                 log.error("Alert FAILED for %r: %s", ev.role_title[:60], detail)
 
             if self.db:
-                self.db.record_alert(
-                    ev.fingerprint, self.channel, "sent" if ok else "failed", detail
-                )
+                # A dry run must NOT be banked as 'sent'. `already_alerted()`
+                # only counts 'sent', so recording it here would permanently
+                # suppress a job the user never actually received.
+                if self.dry_run:
+                    status = "dry_run"
+                elif ok:
+                    status = "sent"
+                else:
+                    status = "failed"
+                self.db.record_alert(ev.fingerprint, self.channel, status, detail)
         return result
 
     # -- operational messages ----------------------------------------------
