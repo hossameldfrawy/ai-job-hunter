@@ -88,6 +88,20 @@ def _age_gate(jobs: list[JobPost], max_days: int) -> tuple[list[JobPost], int]:
     return kept, dropped
 
 
+def apply_eval_cap(
+    candidates: list[JobPost], cap: int
+) -> tuple[list[JobPost], list[JobPost]]:
+    """Split candidates into (evaluate_now, defer_to_next_run).
+
+    Candidates arrive sorted best-first, so the cap always keeps the strongest.
+    Deferred postings are returned separately because the caller must NOT mark
+    them as seen -- see the note at the call site.
+    """
+    if cap <= 0 or len(candidates) <= cap:
+        return candidates, []
+    return candidates[:cap], candidates[cap:]
+
+
 def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunReport:
     """Execute one complete hunt. Never raises -- failures land in the report."""
     started = time.monotonic()
@@ -145,10 +159,6 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
         report.scraped, len(fresh_enough), len(new_jobs),
     )
 
-    # Record immediately, so a crash mid-run can never cause a duplicate alert
-    # on the next run.
-    db.record_seen(new_jobs)
-
     # -- 4. lexical pre-filter (protects the Gemini quota) ------------------
     candidates, report.prefilter_dropped, report.prefilter_disqualified = prefilter(
         new_jobs, settings.profile, int(engine.get("prefilter_min_score", 2))
@@ -158,14 +168,30 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
         len(candidates), report.prefilter_dropped, report.prefilter_disqualified,
     )
 
-    cap = int(engine.get("max_evaluations_per_run", 120))
-    if len(candidates) > cap:
-        report.over_cap = len(candidates) - cap
+    candidates, deferred = apply_eval_cap(
+        candidates, int(engine.get("max_evaluations_per_run", 120))
+    )
+    report.over_cap = len(deferred)
+    if deferred:
         log.info(
-            "Capping evaluation at %d of %d candidates (highest-scoring first); "
-            "%d deferred to the next run.", cap, len(candidates), report.over_cap,
+            "Capping evaluation at %d candidates; %d deferred to the next run.",
+            len(candidates), report.over_cap,
         )
-        candidates = candidates[:cap]
+
+    # Mark as seen EVERYTHING except the deferred candidates.
+    #
+    # Recording before evaluation is what makes a mid-run crash safe: those
+    # postings are already banked, so the next run cannot re-alert on them.
+    # But a deferred candidate must stay UNSEEN -- marking it would retire a
+    # job that was never actually looked at, and on a first run (with a large
+    # backlog) that silently discards the tail of the queue forever.
+    deferred_fps = {j.fingerprint for j in deferred}
+    db.record_seen([j for j in new_jobs if j.fingerprint not in deferred_fps])
+    if deferred:
+        log.info(
+            "%d deferred posting(s) left unrecorded so the next run re-queues them.",
+            len(deferred),
+        )
 
     # -- 5. Gemini ----------------------------------------------------------
     evaluations: list[Evaluation] = []

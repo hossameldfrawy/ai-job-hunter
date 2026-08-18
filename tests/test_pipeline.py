@@ -351,5 +351,66 @@ class TestTelegramParsing(unittest.TestCase):
         self.assertTrue(TelegramWebScraper._derive_title("\U0001F525 \U0001F525"))
 
 
+class TestEvaluationCap(unittest.TestCase):
+    """The per-run cap must DEFER work, never silently discard it.
+
+    Regression guard: an earlier version marked over-cap candidates as "seen"
+    before evaluating them, which retired jobs the AI had never looked at. On a
+    first run with a large backlog that quietly threw away the tail of the queue
+    forever.
+    """
+
+    def setUp(self):
+        from pipeline import apply_eval_cap
+
+        self.cap = apply_eval_cap
+        self.candidates = [
+            job(title=f"VoIP Engineer {i}", url=f"https://example.com/{i}")
+            for i in range(10)
+        ]
+
+    def test_under_cap_defers_nothing(self):
+        batch, deferred = self.cap(self.candidates, 20)
+        self.assertEqual(len(batch), 10)
+        self.assertEqual(deferred, [])
+
+    def test_over_cap_defers_the_remainder(self):
+        batch, deferred = self.cap(self.candidates, 4)
+        self.assertEqual(len(batch), 4)
+        self.assertEqual(len(deferred), 6)
+
+    def test_nothing_is_lost(self):
+        batch, deferred = self.cap(self.candidates, 3)
+        self.assertEqual(
+            len(batch) + len(deferred), len(self.candidates),
+            "candidates vanished between the batch and the deferred queue",
+        )
+
+    def test_deferred_are_never_marked_seen(self):
+        """The whole point: a deferred job must still be NEW next run."""
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        db = Database(_P(_tf.mkdtemp()) / "cap.db")
+        try:
+            batch, deferred = self.cap(self.candidates, 4)
+            deferred_fps = {j.fingerprint for j in deferred}
+            db.record_seen([j for j in self.candidates
+                            if j.fingerprint not in deferred_fps])
+
+            fresh, _ = db.partition_new(self.candidates)
+            self.assertEqual(
+                len(fresh), len(deferred),
+                "deferred candidates were retired without ever being evaluated",
+            )
+        finally:
+            db.close()
+
+    def test_zero_cap_means_unlimited(self):
+        batch, deferred = self.cap(self.candidates, 0)
+        self.assertEqual(len(batch), 10)
+        self.assertEqual(deferred, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
