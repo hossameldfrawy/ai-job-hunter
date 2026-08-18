@@ -439,5 +439,169 @@ class TestDryRunSafety(unittest.TestCase):
             db.close()
 
 
+class TestTelegramHiringFilter(unittest.TestCase):
+    """The gate that decides which of thousands of group messages are jobs."""
+
+    def setUp(self):
+        from scrapers.telegram_user_client import is_hiring_post, tech_hits
+
+        self.gate = is_hiring_post
+        self.hits = tech_hits
+
+    def test_technical_vacancy_passes(self):
+        self.assertTrue(self.gate(
+            "We are hiring a VoIP Engineer in Dubai. Experience with Asterisk "
+            "and Issabel PBX required. Send your CV to hr@example.com"
+        ))
+
+    def test_arabic_vacancy_passes(self):
+        self.assertTrue(self.gate(
+            "مطلوب مهندس دعم فني لشركة اتصالات بالقاهرة خبرة في SIP و Issabel "
+            "برجاء ارسال السيرة الذاتية على الايميل"
+        ))
+
+    def test_group_chatter_rejected(self):
+        for noise in (
+            "good morning everyone how is the weather today in dubai city",
+            "thanks a lot brother that really helped me solve the problem",
+            "🔥🔥🔥",
+        ):
+            self.assertFalse(self.gate(noise), f"chatter passed the gate: {noise!r}")
+
+    def test_non_technical_vacancy_rejected_when_tech_required(self):
+        nursing = (
+            "We are hiring a Registered Nurse for a hospital in Riyadh. "
+            "BLS certification required. Send your CV today please."
+        )
+        self.assertFalse(self.gate(nursing, require_tech=True))
+        # ...but it is a genuine hiring post, so the looser mode keeps it.
+        self.assertTrue(self.gate(nursing, require_tech=False))
+
+    def test_technical_discussion_without_hiring_words_rejected(self):
+        self.assertFalse(self.gate(
+            "Has anyone configured an Asterisk SIP trunk with a Cisco SBC "
+            "before? I keep getting one-way audio on outbound calls here."
+        ))
+
+    def test_too_short_rejected(self):
+        self.assertFalse(self.gate("hiring voip engineer"))
+
+    def test_sip_word_boundary(self):
+        """'sip' inside 'gossip' must not count as a technical hit."""
+        self.assertNotIn("sip", self.hits("celebrity gossip column vacancy"))
+
+    def test_tech_hits_reports_what_matched(self):
+        hits = self.hits("Hiring: Asterisk / Issabel PBX engineer, Linux and Odoo")
+        for term in ("asterisk", "issabel", "linux", "odoo"):
+            self.assertIn(term, hits)
+
+
+class TestTelegramChatFilter(unittest.TestCase):
+    def setUp(self):
+        from scrapers.telegram_user_client import ChatFilter
+
+        self.ChatFilter = ChatFilter
+
+    @staticmethod
+    def _dialog(name="Gulf IT Jobs", username=None, chat_id=-1001234567890,
+                is_user=False, is_group=True, is_channel=False):
+        entity = type("E", (), {"username": username})()
+        return type("D", (), {
+            "name": name, "entity": entity, "id": chat_id,
+            "is_user": is_user, "is_group": is_group, "is_channel": is_channel,
+        })()
+
+    def test_empty_include_means_all_groups(self):
+        f = self.ChatFilter.from_config({})
+        self.assertTrue(f.allows(self._dialog()))
+
+    def test_private_chats_off_by_default(self):
+        f = self.ChatFilter.from_config({})
+        dm = self._dialog(name="Mum", is_user=True, is_group=False)
+        self.assertFalse(f.allows(dm), "DMs must not be read unless opted in")
+
+    def test_private_chats_can_be_opted_in(self):
+        f = self.ChatFilter.from_config({"include_private_chats": True})
+        self.assertTrue(f.allows(self._dialog(name="Recruiter", is_user=True,
+                                              is_group=False)))
+
+    def test_exclude_wins_over_include(self):
+        f = self.ChatFilter.from_config({
+            "include_chats": ["gulf"], "exclude_chats": ["gulf it jobs"],
+        })
+        self.assertFalse(f.allows(self._dialog()))
+
+    def test_include_matches_title_substring(self):
+        f = self.ChatFilter.from_config({"include_chats": ["gulf"]})
+        self.assertTrue(f.allows(self._dialog(name="Gulf IT Jobs")))
+        self.assertFalse(f.allows(self._dialog(name="Cooking Club")))
+
+    def test_include_matches_username(self):
+        f = self.ChatFilter.from_config({"include_chats": ["@shaabanjobs"]})
+        self.assertTrue(f.allows(self._dialog(name="Anything",
+                                              username="shaabanjobs")))
+
+    def test_channels_can_be_disabled(self):
+        f = self.ChatFilter.from_config({"include_channels": False})
+        channel = self._dialog(is_group=False, is_channel=True)
+        self.assertFalse(f.allows(channel))
+
+
+class TestTelegramMessageConversion(unittest.TestCase):
+    def test_public_permalink(self):
+        from scrapers.telegram_user_client import _message_link
+
+        self.assertEqual(
+            _message_link(-1001234567890, "gulfjobs", 42),
+            "https://t.me/gulfjobs/42",
+        )
+
+    def test_private_supergroup_permalink(self):
+        """A private group has no @username; the -100 prefix is stripped."""
+        from scrapers.telegram_user_client import _message_link
+
+        self.assertEqual(
+            _message_link(-1001234567890, None, 42),
+            "https://t.me/c/1234567890/42",
+        )
+
+    def test_message_becomes_a_usable_jobpost(self):
+        from scrapers.telegram_user_client import message_to_job
+
+        job = message_to_job(
+            chr(10).join([
+                "Urgent hiring",
+                "VoIP Engineer - Dubai",
+                "Asterisk, Issabel, SIP trunking",
+                "Apply: https://jobs.example.com/1",
+            ]),
+            chat_name="Gulf IT Jobs",
+            username=None,
+            chat_id=-1009876543210,
+            message_id=77,
+            posted_at=utc_now(),
+        )
+        self.assertEqual(job.source, "telegram_user:Gulf_IT_Jobs")
+        self.assertIn("VoIP Engineer", job.title)
+        # A real application link is preferred over the Telegram permalink.
+        self.assertEqual(job.url, "https://jobs.example.com/1")
+        self.assertIn("issabel", job.raw["tech_hits"])
+        self.assertTrue(job.fingerprint)
+
+    def test_falls_back_to_permalink_without_an_apply_url(self):
+        from scrapers.telegram_user_client import message_to_job
+
+        job = message_to_job(
+            "We are hiring an IT Support Engineer with Linux and Odoo "
+            "experience for our Cairo office. Send your CV.",
+            chat_name="Private Recruiters",
+            username=None,
+            chat_id=-1005555555555,
+            message_id=9,
+            posted_at=None,
+        )
+        self.assertEqual(job.url, "https://t.me/c/5555555555/9")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4,7 +4,8 @@ One-command setup, verification and cloud-activation helper.
     python setup_wizard.py                  full check + live WhatsApp test
     python setup_wizard.py --no-whatsapp    same, but send nothing
     python setup_wizard.py --extract-cv     write the CV text out for secrets
-    python setup_wizard.py --telegram-login create a Telethon session string
+    python setup_wizard.py --telegram-login authorise Telegram (delegates
+                                            to auth_telegram.py)
     python setup_wizard.py --secrets        print the `gh secret set` commands
 
 It verifies each dependency in the order the pipeline needs them and stops
@@ -184,6 +185,39 @@ def check_whatsapp(send: bool) -> bool:
     return True
 
 
+def check_telegram_user() -> bool:
+    header("9. Telegram user client (optional)")
+    try:
+        from scrapers.telegram_user_client import telethon_available
+    except Exception as exc:
+        warn(f"module not importable: {exc}")
+        return True
+
+    if not telethon_available():
+        warn("Telethon is not installed -- private Telegram groups are unavailable.")
+        info("pip install -r requirements.txt")
+        return True
+
+    if not settings.telegram_api_id or not settings.telegram_api_hash:
+        warn("No TELEGRAM_API_ID / TELEGRAM_API_HASH -- private groups are OFF.")
+        info("Public channels still work. To unlock your joined private groups:")
+        info("  1. get credentials at https://my.telegram.org")
+        info("  2. add them to .env")
+        info("  3. run: python auth_telegram.py")
+        return True
+
+    ok(f"Credentials present (api_id {settings.telegram_api_id})")
+    if not settings.telegram_ready:
+        warn("Not authorised yet -- your private groups are NOT being read.")
+        info("Run the one-time login:  python auth_telegram.py")
+        return True
+
+    ok("Authorised (" + ("string session" if settings.telegram_session
+                         else "local .session file") + ")")
+    info("Verify what it can see:  python check_telegram.py")
+    return True
+
+
 def check_database() -> bool:
     header("7. Deduplication store")
     from db import Database
@@ -253,9 +287,19 @@ def print_secret_commands() -> None:
         f'gh secret set WHATSAPP_PHONE   --body "{settings.whatsapp_phone}"',
         'gh secret set CV_TEXT          < secrets/CV_TEXT.txt',
     ]
+    if settings.telegram_ready:
+        lines += [
+            f'gh secret set TELEGRAM_API_ID   --body "{settings.telegram_api_id}"',
+            f'gh secret set TELEGRAM_API_HASH --body "{settings.telegram_api_hash}"',
+            'gh secret set TELEGRAM_STRING_SESSION < secrets/TELEGRAM_STRING_SESSION.txt',
+        ]
     for line in lines:
         print(f"    {line}")
     print()
+    if not settings.telegram_ready:
+        info("Telegram private groups are not enabled. To add them, run")
+        info("`python auth_telegram.py` and then re-run this command.")
+        print()
     if not has_gh:
         warn("The GitHub CLI (`gh`) is not installed.")
         info("Either install it, or paste the values into")
@@ -271,31 +315,18 @@ def print_secret_commands() -> None:
 
 
 def telegram_login() -> int:
-    header("Telegram session generator (optional)")
-    try:
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
-    except ImportError:
-        fail("Telethon is not installed.")
-        info("Run: pip install -r requirements-extra.txt")
-        return 1
-
-    print("  Public channels need NONE of this -- it is only for PRIVATE ones.")
-    print("  Get api_id / api_hash from https://my.telegram.org -> API development tools\n")
-    api_id = input("  api_id   : ").strip()
-    api_hash = input("  api_hash : ").strip()
-    if not api_id or not api_hash:
-        fail("Both values are required.")
-        return 1
-
-    with TelegramClient(StringSession(), int(api_id), api_hash) as client:
-        session = client.session.save()
+    """Delegates to auth_telegram.py -- one authorisation flow, not two."""
+    header("Telegram authorisation")
+    info("Handing over to the dedicated script...")
     print()
-    ok("Session created. Store these as secrets (the session IS a login token):")
-    print(f"\n    TELEGRAM_API_ID   = {api_id}")
-    print(f"    TELEGRAM_API_HASH = {api_hash}")
-    print(f"    TELEGRAM_SESSION  = {session}\n")
-    return 0
+    try:
+        from auth_telegram import main as auth_main
+
+        return auth_main()
+    except Exception as exc:
+        fail(f"Could not start auth_telegram.py: {exc}")
+        info("Run it directly:  python auth_telegram.py")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +337,7 @@ def main() -> int:
     parser.add_argument("--extract-cv", action="store_true",
                         help="only export the CV for use as a secret")
     parser.add_argument("--telegram-login", action="store_true",
-                        help="only generate a Telethon session string")
+                        help="authorise Telegram (runs auth_telegram.py)")
     parser.add_argument("--secrets", action="store_true",
                         help="only print the cloud activation commands")
     args = parser.parse_args()
@@ -334,6 +365,7 @@ def main() -> int:
         ("whatsapp", lambda: check_whatsapp(not args.no_whatsapp)),
         ("database", check_database),
         ("sources", check_sources),
+        ("telegram", check_telegram_user),
     ]
 
     failed: list[str] = []

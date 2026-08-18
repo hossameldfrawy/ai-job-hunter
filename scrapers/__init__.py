@@ -21,14 +21,14 @@ from scrapers.linkedin import LinkedInScraper
 from scrapers.rss_feeds import RssScraper
 from scrapers.search_proxy import SearchProxyScraper
 from scrapers.talent import TalentScraper
-from scrapers.telegram_api import TelegramApiScraper
+from scrapers.telegram_user_client import TelegramUserClientScraper
 from scrapers.telegram_web import TelegramWebScraper
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     "BaseScraper", "ScrapeResult", "build_scrapers", "run_all",
-    "LinkedInScraper", "TelegramWebScraper", "TelegramApiScraper",
+    "LinkedInScraper", "TelegramWebScraper", "TelegramUserClientScraper",
     "TalentScraper", "JobApiScraper", "RssScraper", "SearchProxyScraper",
     "FacebookScraper",
 ]
@@ -37,6 +37,7 @@ __all__ = [
 REGISTRY: dict[str, type[BaseScraper]] = {
     "linkedin": LinkedInScraper,
     "telegram": TelegramWebScraper,
+    "telegram_user": TelegramUserClientScraper,
     "talent": TalentScraper,
     "job_apis": JobApiScraper,
     "search_proxy": SearchProxyScraper,
@@ -45,8 +46,13 @@ REGISTRY: dict[str, type[BaseScraper]] = {
 }
 
 
-def build_scrapers(settings: Any) -> list[BaseScraper]:
-    """Instantiate every source enabled in config.yml."""
+def build_scrapers(settings: Any, db: Any = None) -> list[BaseScraper]:
+    """Instantiate every source enabled in config.yml.
+
+    `db` is optional and only used by sources that keep a cursor between runs
+    (the Telegram user client stores a last-read message id per chat, so it
+    never re-reads the same history twice).
+    """
     timeout = settings.http_timeout
     profile = settings.profile
     built: list[BaseScraper] = []
@@ -57,20 +63,23 @@ def build_scrapers(settings: Any) -> list[BaseScraper]:
             continue
         cfg = settings.source(key)
         try:
-            # LinkedIn ranks cards against the profile before spending
-            # requests on full descriptions, so it needs the profile block.
             if cls is LinkedInScraper:
+                # Ranks cards against the profile before spending requests on
+                # full descriptions, so it needs the profile block.
                 built.append(cls(cfg, timeout, profile=profile))
+            elif cls is TelegramUserClientScraper:
+                if not settings.telegram_ready:
+                    log.info(
+                        "Source 'telegram_user' is enabled but not authorised yet "
+                        "-- run `python auth_telegram.py` to unlock your private "
+                        "groups. Skipping it for now."
+                    )
+                    continue
+                built.append(cls(cfg, timeout, db=db))
             else:
                 built.append(cls(cfg, timeout))
         except Exception as exc:
             log.error("Could not construct scraper %r: %s", key, exc)
-
-    # Telethon rides on the telegram block but is a separate, optional source.
-    if settings.source_enabled("telegram"):
-        api = TelegramApiScraper(settings.source("telegram"), timeout)
-        if api._configured():  # noqa: SLF001 - intentional capability check
-            built.append(api)
 
     log.info("Active sources: %s", ", ".join(s.name for s in built) or "(none)")
     return built

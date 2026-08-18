@@ -199,7 +199,46 @@ telegram:
     # The auditor reports freshness, IT relevance and subscriber count, and
     # refuses to add anything dormant.
 
-# -- SOURCE 3: Free structured job APIs (clean JSON, no scraping) -----------
+# -- SOURCE 3: Telegram MTProto USER CLIENT (your joined private groups) ----
+# Signs in as YOU over Telegram's native protocol, so it reads the chats the
+# public web preview cannot see at all: private recruitment groups you were
+# invited to, supergroups, and channels with the preview disabled.
+#
+# Requires a one-time interactive login:   python auth_telegram.py
+# Verify it afterwards with:               python check_telegram.py
+#
+# Safety: this only ever READS. It never sends, joins, reacts or forwards, it
+# paces itself between chats, and it obeys Telegram's flood-wait instead of
+# retrying through it.
+telegram_user:
+  enabled: true
+
+  # poll = walk your dialogs each run (works on GitHub Actions).
+  # live = react to messages the instant they arrive; needs a persistent
+  #        process, so it only applies to `python main.py --live`.
+  mode: poll
+
+  messages_per_dialog: 60      # per chat, per run (cursor means little repeat work)
+  max_dialogs: 250             # how far down your dialog list to look
+  lookback_hours: 72           # ignore anything older on first sight
+  pause_between_chats_seconds: 0.4
+
+  # Which of your chats to read. Empty include_chats = EVERY group/channel you
+  # have joined. Entries match a chat title substring, an @username, or a
+  # numeric chat id.
+  include_chats: []
+  exclude_chats:
+    - "saved messages"
+  include_groups: true         # groups + supergroups
+  include_channels: true       # broadcast channels
+  include_private_chats: false # your 1:1 DMs -- off by default, deliberately
+
+  # Require a technical keyword (VoIP/SIP/Issabel/Asterisk/IT support/Linux/
+  # Odoo/POS/telecom/...) in addition to a hiring keyword. Set false to widen
+  # the net and let Gemini do all the judging (costs more quota).
+  require_tech_match: true
+
+# -- SOURCE 4: Free structured job APIs (clean JSON, no scraping) -----------
 job_apis:
   enabled: true
   sources:
@@ -210,7 +249,7 @@ job_apis:
     remotive: true          # ~17 remote roles
     themuse: true           # global, filterable
 
-# -- SOURCE 4: talent.com regional boards (GCC-native, bot-friendly) --------
+# -- SOURCE 5: talent.com regional boards (GCC-native, bot-friendly) --------
 # The most productive Gulf-native board that still serves clean HTML to a
 # plain HTTP client. Bayt / GulfTalent / Naukrigulf / Wuzzuf / Indeed all
 # answer HTTP 403; talent.com does not, and it aggregates much of the same
@@ -228,7 +267,7 @@ talent:
     - "Odoo support"
     - "contact center engineer"
 
-# -- SOURCE 5: Search-engine proxy for boards that block direct scraping ----
+# -- SOURCE 6: Search-engine proxy for boards that block direct scraping ----
 # Reaches Bayt / GulfTalent / Naukrigulf / Wuzzuf through Google News RSS,
 # which is the ONLY free path to them. Read the honest trade-off first:
 #   * links are opaque news.google.com redirects -- tappable from WhatsApp and
@@ -251,7 +290,7 @@ search_proxy:
     - site: wuzzuf.net
       terms: ["VoIP", "Odoo", "IT support"]
 
-# -- SOURCE 6: Plain RSS job feeds ------------------------------------------
+# -- SOURCE 7: Plain RSS job feeds ------------------------------------------
 rss:
   enabled: true
   feeds:
@@ -262,7 +301,7 @@ rss:
     - name: Jobicy
       url: https://jobicy.com/?feed=job_feed
 
-# -- SOURCE 7: Facebook public recruitment posts (best-effort) --------------
+# -- SOURCE 8: Facebook public recruitment posts (best-effort) --------------
 # Facebook aggressively blocks unauthenticated scraping. Without a cookie
 # this falls back to search-engine indexing of public FB job posts.
 facebook:

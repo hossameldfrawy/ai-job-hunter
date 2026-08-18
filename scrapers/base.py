@@ -105,6 +105,68 @@ def parse_date(value: Any) -> datetime | None:
     return None
 
 
+# Decorative padding that channels wrap every post in.
+_DECOR = re.compile(
+    r"[🌀-🫿☀-➿←-⇿⬀-⯿"
+    r"️‍\*_~`#=\-•▪●✅❌]+"
+)
+_CONTACT_LINE = re.compile(
+    r"(whats?app|واتس|للتواصل"
+    r"|send (your )?cv|apply|email|@gmail|@yahoo|\+\d{7,}|00\d{9,}|t\.me/)",
+    re.I,
+)
+
+
+# Lines that are pure announcement boilerplate and name no role at all.
+_BOILERPLATE_ONLY = re.compile(
+    r"\s*(?:"
+    r"(?:very\s+)?urgent(?:ly)?(?:\s+(?:required|needed|hiring))?"
+    r"|(?:we\s+are|now|immediate)?\s*hiring(?:\s+now)?"
+    r"|(?:job\s+)?vacanc(?:y|ies)"
+    r"|(?:new\s+)?job\s+(?:post|opening|opportunity|alert)s?"
+    r"|(?:we\s+are\s+)?looking\s+for"
+    r"|join\s+our\s+team|apply\s+now|opportunity"
+    r"|مطلوب(?:\s+فورا)?|وظيفة\s+شاغرة|وظائف\s+شاغرة|فرصة\s+عمل|إعلان\s+وظيفة"
+    r")\s*[:!.\-]*\s*",
+    re.I,
+)
+
+
+def derive_post_title(text: str, limit: int = 180) -> str:
+    """Pick the line most likely to be the role name from a free-form post.
+
+    Telegram and Facebook posts have no title field, so the first substantial
+    line that is neither decoration, contact details, nor pure announcement
+    boilerplate is used. Gemini corrects it downstream, but getting it roughly
+    right still matters: the lexical pre-filter weights the title twice, and a
+    title of "Urgent hiring" throws away every keyword the role actually had.
+    A JobPost must never carry a blank title, so this always returns something.
+    """
+    fallback = ""
+    for raw_line in (text or "").splitlines():
+        line = _DECOR.sub(" ", raw_line).strip(" :.-|،")
+        line = _WS.sub(" ", line)
+        if len(line) < 4 or len(line) > limit:
+            continue
+        if _CONTACT_LINE.search(line):
+            continue
+        if _BOILERPLATE_ONLY.fullmatch(line):
+            # "Urgent hiring", "We are hiring", "مطلوب" -- keep looking for the
+            # line that names the role, but remember this one in case there
+            # is nothing better.
+            fallback = fallback or line
+            continue
+        return line[:limit]
+    if fallback:
+        return fallback[:limit]
+
+    flat = _WS.sub(" ", _DECOR.sub(" ", text or "")).strip()
+    if flat:
+        return flat[:limit]
+    raw = _WS.sub(" ", text or "").strip()
+    return raw[:limit] if raw else "(untitled posting)"
+
+
 def first_url(text: str) -> str:
     m = URL_RE.search(text or "")
     if not m:

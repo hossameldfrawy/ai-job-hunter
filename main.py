@@ -3,6 +3,7 @@ AI Job Hunter -- entry point.
 
     python main.py                 one hunt, then exit  (GitHub Actions / cron)
     python main.py --daemon        run forever on an interval (Docker / Render)
+    python main.py --live          real-time Telegram listener + periodic sweeps
     python main.py --dry-run       full pipeline, but print alerts instead of
                                    sending them
     python main.py --stats         what the bot has done so far
@@ -29,7 +30,7 @@ from typing import Any
 from config import ConfigError, settings
 from db import Database
 from notifier import WhatsAppNotifier
-from pipeline import run_once
+from pipeline import handle_live_job, run_once
 
 log = logging.getLogger("job_hunter")
 
@@ -151,6 +152,84 @@ def cmd_daemon(db: Database, interval_minutes: int) -> int:
     return 0
 
 
+def cmd_live(db: Database, interval_minutes: int) -> int:
+    """Real-time mode: a persistent Telegram listener plus periodic full sweeps.
+
+    The listener reacts the instant a message lands in one of your groups, so a
+    high-scoring post reaches WhatsApp in seconds. The periodic sweep still runs
+    underneath it, because every other source (LinkedIn, talent.com, the job
+    APIs, RSS) has no push channel and must be polled.
+
+    This mode needs a process that stays alive, so it is for Docker, a VPS or
+    your own machine -- NOT for GitHub Actions, whose runs are killed on
+    completion. Scheduled runs use poll mode, which covers the same chats.
+    """
+    from cv_profile import load_cv
+    from evaluator import GeminiEvaluator
+    from scrapers.telegram_user_client import TelegramLiveListener
+
+    if not settings.telegram_ready:
+        log.error(
+            "Live mode needs the Telegram user client. Run `python auth_telegram.py` "
+            "once, then try again."
+        )
+        return 2
+
+    cfg = settings.source("telegram_user")
+    if not settings.source_enabled("telegram_user"):
+        log.error("telegram_user is disabled in config.yml; nothing to listen to.")
+        return 2
+
+    state: dict[str, Any] = {"status": "starting", "runs": 0, "live_alerts": 0}
+    start_health_server(state)
+    _install_signal_handlers()
+
+    cv = load_cv()
+    # One shared notifier keeps the CallMeBot send-throttle honest across both
+    # the listener thread and the sweep loop.
+    notifier = WhatsAppNotifier(db)
+    evaluator = GeminiEvaluator()
+
+    def on_job(job: Any) -> None:
+        if handle_live_job(job, db, notifier, cv.to_prompt(), evaluator):
+            state["live_alerts"] = state.get("live_alerts", 0) + 1
+
+    listener = TelegramLiveListener(cfg, on_job)
+    threading.Thread(
+        target=listener.run_forever, daemon=True, name="telegram-live"
+    ).start()
+    log.info("Real-time Telegram listener started.")
+    log.info("Periodic sweep of all other sources every %d minute(s).", interval_minutes)
+
+    while not _shutdown.is_set():
+        try:
+            report = run_once(db, notifier)
+            state.update(
+                status=report.status,
+                runs=state["runs"] + 1,
+                last_report=report.to_dict(),
+                live_messages_seen=listener.messages_seen,
+            )
+        except Exception as exc:
+            log.exception("Sweep failed: %s", exc)
+            state["status"] = "error"
+
+        import http_client
+
+        http_client.reset_circuits()
+
+        for _ in range(interval_minutes * 60):
+            if _shutdown.is_set():
+                break
+            time.sleep(1)
+
+    log.info(
+        "Live mode stopped -- %d sweep(s), %d live message(s) seen, %d live alert(s).",
+        state["runs"], listener.messages_seen, state.get("live_alerts", 0),
+    )
+    return 0
+
+
 def cmd_stats(db: Database) -> int:
     stats = db.stats()
     print("\n" + "=" * 62)
@@ -227,6 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="run a single hunt and exit (default)")
     mode.add_argument("--daemon", action="store_true",
                       help="run continuously on an interval")
+    mode.add_argument("--live", action="store_true",
+                      help="real-time Telegram listener + periodic sweeps")
     mode.add_argument("--stats", action="store_true", help="print lifetime statistics")
     mode.add_argument("--selftest", action="store_true",
                       help="verify Gemini + CallMeBot connectivity")
@@ -273,6 +354,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_selftest(db)
         if args.prune:
             return cmd_prune(db, args.keep_days)
+        if args.live:
+            _banner()
+            return cmd_live(db, max(1, args.interval))
         if args.daemon:
             _banner()
             return cmd_daemon(db, max(1, args.interval))

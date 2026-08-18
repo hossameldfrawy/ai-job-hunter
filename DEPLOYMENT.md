@@ -71,10 +71,41 @@ gh secret set CV_TEXT          < secrets/CV_TEXT.txt
 | `WHATSAPP_PHONE` | yes | International format, leading `+` |
 | `CV_TEXT` | yes* | Plain-text CV. **Preferred** |
 | `MASTER_CV_B64` | no | base64 PDF. Only if under GitHub's 64 KB secret cap — a 57 KB PDF becomes 76 KB and will **not** fit, so use `CV_TEXT` |
-| `TELEGRAM_API_ID` / `_HASH` / `_SESSION` | no | Private Telegram channels only |
+| `TELEGRAM_API_ID` | no | Unlocks your joined **private** Telegram groups |
+| `TELEGRAM_API_HASH` | no | Pairs with the api_id |
+| `TELEGRAM_STRING_SESSION` | no | Produced by `python auth_telegram.py`. **Full login to your account** — encrypted secret only |
 | `FACEBOOK_COOKIE` | no | Opt-in Facebook page reading |
 
 \* one of `CV_TEXT` or `MASTER_CV_B64`.
+
+### 2b. Optional: unlock your private Telegram groups
+
+Without this the bot reads public channels only. With it, it reads every group,
+supergroup and restricted channel you have joined.
+
+```bash
+# once, on your own machine (needs the login code Telegram sends you)
+python auth_telegram.py
+python check_telegram.py          # confirm it sees your groups
+
+# then push the session to the cloud
+gh secret set TELEGRAM_API_ID          --body "<your api_id>"
+gh secret set TELEGRAM_API_HASH        --body "<your api_hash>"
+gh secret set TELEGRAM_STRING_SESSION  < secrets/TELEGRAM_STRING_SESSION.txt
+```
+
+The workflow prints a notice on every run saying whether the Telegram client is
+ON or OFF, so you can tell at a glance from the Actions log.
+
+Scheduled runs use **poll** mode: they sign in, read what is new since the last
+cursor, and disconnect. The event-driven **live** listener needs a process that
+stays alive and therefore belongs on Docker/VPS (`python main.py --live`), not
+on Actions — a scheduled runner is destroyed the moment the job finishes.
+
+If the session ever stops working (you revoked it, or Telegram expired it), the
+run logs `The Telegram session is invalid, expired or was revoked` and carries
+on with the other sources. Re-run `python auth_telegram.py` and update the
+secret.
 
 ### 3. Start it
 
@@ -135,6 +166,12 @@ docker compose logs -f
 
 `restart: unless-stopped` brings it back after any reboot. State lives in the
 `hunter-state` Docker volume. Health: `curl localhost:8080`.
+
+**This is the deployment that unlocks real-time Telegram.** Change the compose
+command to `python main.py --live` and the container holds an open MTProto
+connection: a job posted in one of your groups is scored and can be on WhatsApp
+within seconds, while the periodic sweep keeps covering LinkedIn, talent.com,
+the job APIs and RSS underneath it.
 
 The same steps work on any VPS, a NAS, or a Raspberry Pi.
 
@@ -250,6 +287,15 @@ workflow has `permissions: contents: write`.
 
 **Run fails with HTTP 429 from Gemini.** Free-tier rate limiting. Lower
 `engine.eval_concurrency` to 1 and raise `eval_batch_size` to 10–12.
+
+**Telegram says "session is invalid, expired or was revoked".** Someone
+terminated the session in Telegram → Settings → Devices, or it aged out. Re-run
+`python auth_telegram.py` and update the `TELEGRAM_STRING_SESSION` secret.
+
+**Telegram logs a flood-wait.** Telegram is asking for a slower pace and the
+client is obeying it — that is the designed behaviour, not a fault. Reduce
+`telegram_user.messages_per_dialog` or `max_dialogs` in `config.yml` if it
+recurs every run.
 
 **A source reports 0 postings.** Normal for one source occasionally — the
 circuit breaker skips a host after repeated failures and retries next run. If

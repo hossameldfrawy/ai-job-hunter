@@ -3,6 +3,9 @@
 .env.local
 *.session
 *.session-journal
+*.session-shm
+*.session-wal
+TELEGRAM_STRING_SESSION.txt
 assets/master_cv.pdf
 assets/cv_profile.json
 secrets/

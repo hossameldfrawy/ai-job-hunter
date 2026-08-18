@@ -7,8 +7,9 @@ makes this the single most valuable property of this scraper: it needs **no
 API ID, no api_hash, no phone number, no session file and no login**, so it
 runs unchanged inside a stateless GitHub Actions runner.
 
-(For PRIVATE or join-restricted channels see `telegram_api.py`, which uses
-Telethon and does require credentials.)
+(For PRIVATE groups, supergroups and join-restricted channels see
+`telegram_user_client.py`, which signs in over MTProto as you and can read
+every chat you have actually joined.)
 
 Telegram posts are free-form prose, not structured records, so this scraper
 deliberately does only light structuring -- extracting the apply link, the
@@ -27,22 +28,13 @@ from bs4 import BeautifulSoup
 
 import http_client
 from models import JobPost
-from scrapers.base import BaseScraper, clean, first_url, parse_date
+from scrapers.base import (
+    BaseScraper, clean, derive_post_title, first_url, parse_date,
+)
 
 log = logging.getLogger(__name__)
 
 CHANNEL_URL = "https://t.me/s/{channel}"
-
-# Decorative characters that channels pad every post with.
-_DECOR = re.compile(
-    r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF←-⇿⬀-⯿"
-    r"️‍\*_~`#=\-•▪●✅❌]+"
-)
-_CONTACT_LINE = re.compile(
-    r"(whats?app|واتس|للتواصل|send (your )?cv|apply|email|@gmail|@yahoo|"
-    r"\+\d{7,}|00\d{9,}|t\.me/)",
-    re.I,
-)
 
 # A post must look like a vacancy at all -- channels mix in news and adverts.
 _JOBBY = re.compile(
@@ -121,30 +113,8 @@ class TelegramWebScraper(BaseScraper):
     # -- parsing ------------------------------------------------------------
     @staticmethod
     def _derive_title(text: str) -> str:
-        """Pick the line most likely to be the role name.
-
-        Telegram posts have no title field, so the first substantial non-emoji,
-        non-contact line is used. Gemini corrects it downstream; this only needs
-        to be good enough for the lexical pre-filter.
-        """
-        for raw_line in text.splitlines():
-            line = _DECOR.sub(" ", raw_line).strip(" :.-|،")
-            line = re.sub(r"\s+", " ", line)
-            if len(line) < 4 or len(line) > 180:
-                continue
-            if _CONTACT_LINE.search(line):
-                continue
-            return line[:180]
-
-        # No line survived the filters. Fall back to the stripped text, and if
-        # that is empty too (a post made entirely of emoji), to the raw text --
-        # a JobPost must never carry a blank title, because the pre-filter and
-        # the alert both read it.
-        flat = re.sub(r"\s+", " ", _DECOR.sub(" ", text)).strip()
-        if flat:
-            return flat[:180]
-        raw = re.sub(r"\s+", " ", text).strip()
-        return raw[:180] if raw else "(untitled posting)"
+        """Delegates to the shared helper -- see scrapers/base.derive_post_title."""
+        return derive_post_title(text)
 
     def _parse_message(self, wrap: Any, channel: str) -> JobPost | None:
         text_el = wrap.select_one(".tgme_widget_message_text")

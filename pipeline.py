@@ -102,6 +102,60 @@ def apply_eval_cap(
     return candidates[:cap], candidates[cap:]
 
 
+def handle_live_job(
+    job: JobPost,
+    db: Database,
+    notifier: WhatsAppNotifier,
+    cv_text: str,
+    evaluator: GeminiEvaluator | None = None,
+) -> bool:
+    """Single-posting fast path for the real-time Telegram listener.
+
+    Same stages as a batch run -- dedupe, pre-filter, score, threshold, alert --
+    but for one message, so an alert can land on WhatsApp seconds after the post
+    appears in the group rather than at the next scheduled sweep.
+
+    Returns True if an alert was sent. Never raises: this runs inside an event
+    handler, and an exception here would take the listener down.
+    """
+    try:
+        fresh, _dupes = db.partition_new([job])
+        if not fresh:
+            log.debug("LIVE: already seen -- %s", job.title[:60])
+            return False
+
+        candidates, _weak, _dq = prefilter(
+            fresh, settings.profile,
+            int(settings.engine.get("prefilter_min_score", 2)),
+        )
+        db.record_seen(fresh)
+        if not candidates:
+            log.info("LIVE: pre-filter dropped %r", job.title[:60])
+            return False
+
+        evaluator = evaluator or GeminiEvaluator()
+        evaluations = evaluator.evaluate(candidates, cv_text)
+        for ev in evaluations:
+            db.record_evaluation(ev)
+
+        threshold = settings.match_threshold
+        matches = [
+            e for e in evaluations if e.match_score >= threshold and not e.error
+        ]
+        if not matches:
+            best = max((e.match_score for e in evaluations), default=0)
+            log.info("LIVE: scored %d%%, below the %d%% bar -- %s",
+                     best, threshold, job.title[:60])
+            return False
+
+        log.info("LIVE MATCH %d%% -- %s", matches[0].match_score, job.title[:70])
+        result = notifier.dispatch(matches)
+        return result.sent > 0
+    except Exception as exc:
+        log.exception("LIVE handler failed on %r: %s", job.title[:60], exc)
+        return False
+
+
 def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunReport:
     """Execute one complete hunt. Never raises -- failures land in the report."""
     started = time.monotonic()
@@ -124,7 +178,7 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
         return report
 
     # -- 1. ingest ----------------------------------------------------------
-    built = scrapers.build_scrapers(settings)
+    built = scrapers.build_scrapers(settings, db=db)
     raw, results = scrapers.run_all(
         built, max_workers=int(engine.get("scraper_concurrency", 8))
     )

@@ -27,7 +27,8 @@ It runs entirely on GitHub's infrastructure. **Your computer can be off.**
   SOURCES                    FILTERING                   AI + DELIVERY
   ─────────                  ─────────                   ─────────────
   LinkedIn guest API  ─┐
-  Telegram channels    │     age gate                    Gemini scores
+  Telegram public      │
+  Telegram YOUR GROUPS │     age gate                    Gemini scores
   talent.com (GCC)     ├──▶  deduplication  ──▶  ~7%  ─▶ each posting  ─┐
   6 free job APIs      │     lexical pre-filter          against your   │
   Google News proxy    │                                 CV (0-100)     │
@@ -46,7 +47,8 @@ postings that are both new and plausible.
 | Source | Method | Credentials | Status |
 |---|---|---|---|
 | **LinkedIn** | Public logged-out guest endpoint | none | Best source. Fresh, structured, includes full descriptions |
-| **Telegram** | `t.me/s/<channel>` web preview | none | Works for any public channel. Arabic posts handled |
+| **Telegram (public)** | `t.me/s/<channel>` web preview | none | Works for any public channel. Arabic posts handled |
+| **Telegram (your groups)** | MTProto user client (Telethon) | api_id + session | Reads the **private groups, supergroups and restricted channels you have joined** -- the web preview cannot see any of these |
 | **talent.com** | Regional HTML (ae/sa/qa/kw/om/bh/eg) | none | Most productive GCC-native board that serves bots |
 | **Job APIs** | arbeitnow, remoteok, jobicy, himalayas, remotive, themuse | none | Clean JSON, skews remote/global |
 | **Bayt, GulfTalent, Naukrigulf, Wuzzuf** | Google News RSS proxy | none | These boards return **HTTP 403** to bots. The proxy is the only free path; links are Google redirects |
@@ -111,7 +113,50 @@ profile:
 **Getting too many alerts?** Raise `match_threshold` to 80–85.
 **Getting too few?** Lower it to 70, and add keywords to `secondary_keywords`.
 
-### Adding Telegram channels
+### Watching your own Telegram groups
+
+The public-channel scraper only sees channels that expose a `t.me/s/` web
+preview. Most real recruitment communities are **private groups or supergroups**,
+which have no preview at all. To read those, the bot signs in as you over
+Telegram's native MTProto protocol:
+
+```bash
+python auth_telegram.py     # one-time, interactive: enter the login code
+python check_telegram.py    # lists your groups + shows what the filter catches
+```
+
+`auth_telegram.py` produces two things: a local `.session` file for this
+machine, and a portable `TELEGRAM_STRING_SESSION` string that lets GitHub
+Actions sign in with no human present, forever.
+
+> The string session is a **full login to your Telegram account**. It lives in
+> `.env` (git-ignored) and in encrypted GitHub Secrets — never in the repo.
+> Revoke it any time from Telegram → Settings → Devices → "AI Job Hunter".
+
+Two modes:
+
+| | What it does | Where it runs |
+|---|---|---|
+| **poll** (default) | Walks your dialogs each run, reads messages newer than a per-chat cursor | Anywhere, including GitHub Actions |
+| **live** | Reacts to `events.NewMessage` the instant a post lands, so an alert can reach WhatsApp within seconds | Needs a persistent process: `python main.py --live` on Docker/VPS |
+
+Scheduled Actions runs cannot hold an open connection — the runner is destroyed
+after each execution — so they use poll mode. It covers the same chats, just on
+the 30-minute cadence instead of instantly.
+
+Tune it under `telegram_user:` in `config.yml`. By default it reads every group
+and channel you have joined, skips your 1:1 DMs, and requires a message to
+contain both a hiring word *and* a technical keyword (VoIP, SIP, Issabel,
+Asterisk, IT support, Linux, Odoo, POS, telecom …) before it costs any Gemini
+quota. Narrow it with `include_chats`, or set `require_tech_match: false` to
+widen the net.
+
+The client is **read-only**: it never sends, joins, forwards or reacts. It
+paces itself between chats and obeys Telegram's `FloodWaitError` rather than
+retrying through it. That keeps it well clear of the limits, though no
+automation on a personal account is entirely without risk.
+
+### Adding public Telegram channels
 
 Telegram publishes no channel-search API, so channels can only be added by
 exact `@username`. Validate before adding — most job channels people recommend
@@ -140,12 +185,15 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python main.py` | One hunt, then exit (what the cloud runs) |
 | `python main.py --dry-run` | Everything except sending WhatsApp messages |
 | `python main.py --daemon` | Run forever on an interval (Docker/VPS) |
+| `python main.py --live` | Real-time Telegram listener + periodic sweeps |
 | `python main.py --stats` | Lifetime statistics and recent run history |
 | `python main.py --selftest` | Verify Gemini + WhatsApp connectivity |
 | `python main.py --prune` | Compact the deduplication database |
 | `python setup_wizard.py` | Full setup verification |
-| `python discover_channels.py` | Audit Telegram channels |
-| `python tests/test_pipeline.py` | Offline test suite (41 tests, no network) |
+| `python discover_channels.py` | Audit public Telegram channels |
+| `python auth_telegram.py` | One-time Telegram login (private groups) |
+| `python check_telegram.py` | Verify the Telegram client, list your groups |
+| `python tests/test_pipeline.py` | Offline test suite (66 tests, no network) |
 
 ---
 
@@ -165,14 +213,17 @@ http_client.py          Throttling, retries, UA rotation, circuit breaker
 scrapers/               One module per source
   ├─ linkedin.py        Public guest endpoint + description enrichment
   ├─ telegram_web.py    t.me/s/ preview (no credentials)
-  ├─ telegram_api.py    Telethon, for private channels (optional)
+  ├─ telegram_user_client.py  MTProto user client: your joined private
+  │                     groups, poll + live event modes
   ├─ talent.py          talent.com regional boards
   ├─ job_apis.py        Six free JSON APIs
   ├─ search_proxy.py    Google News RSS for 403-blocked boards
   ├─ rss_feeds.py       Generic RSS/Atom
   └─ facebook.py        Indexed posts / optional cookie
 setup_wizard.py         Setup, verification, secret export
-discover_channels.py    Telegram channel auditor
+auth_telegram.py        One-time interactive Telegram authorisation
+check_telegram.py       Telegram connection/dialog/filter verification
+discover_channels.py    Public Telegram channel auditor
 n8n_workflow.json       Importable n8n visual workflow
 .github/workflows/      The 24/7 GitHub Actions engine
 ```

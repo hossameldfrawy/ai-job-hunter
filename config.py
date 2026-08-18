@@ -81,10 +81,11 @@ class Settings:
     cv_b64_env: str = ""
     cv_path: str = ""
 
-    # optional
+    # optional -- Telegram MTProto user client
     telegram_api_id: str = ""
     telegram_api_hash: str = ""
-    telegram_session: str = ""
+    telegram_session: str = ""     # StringSession (headless / cloud)
+    telegram_phone: str = ""
     facebook_cookie: str = ""
 
     # -- runtime ------------------------------------------------------------
@@ -120,6 +121,24 @@ class Settings:
     @property
     def http_timeout(self) -> int:
         return int(self.engine.get("http_timeout", 25))
+
+    @property
+    def telegram_session_path(self) -> Path:
+        """Where the local .session file lives (interactive/desktop use)."""
+        return Path(_env("TELEGRAM_SESSION_PATH") or (ROOT / "secrets" / "job_hunter"))
+
+    @property
+    def telegram_ready(self) -> bool:
+        """True when the MTProto user client can authenticate without prompting.
+
+        A StringSession works anywhere. A local .session file only works on the
+        machine that created it, which is why the cloud path needs the string.
+        """
+        if not (self.telegram_api_id and self.telegram_api_hash):
+            return False
+        if self.telegram_session:
+            return True
+        return self.telegram_session_path.with_suffix(".session").exists()
 
     def source(self, name: str) -> dict[str, Any]:
         """Config block for one ingestion source ({} if absent)."""
@@ -188,7 +207,10 @@ def load_settings(config_path: Path | None = None) -> Settings:
         cv_path=cv_path,
         telegram_api_id=_env("TELEGRAM_API_ID"),
         telegram_api_hash=_env("TELEGRAM_API_HASH"),
-        telegram_session=_env("TELEGRAM_SESSION"),
+        # TELEGRAM_STRING_SESSION is the documented name; TELEGRAM_SESSION is
+        # accepted as a legacy alias so older deployments keep working.
+        telegram_session=_env("TELEGRAM_STRING_SESSION") or _env("TELEGRAM_SESSION"),
+        telegram_phone=_env("TELEGRAM_PHONE"),
         facebook_cookie=_env("FACEBOOK_COOKIE"),
         db_path=db_path,
         dry_run=_env_bool("DRY_RUN"),
