@@ -1,0 +1,284 @@
+# ==========================================================================
+#  AI JOB HUNTER -- Tuning Surface
+#  Everything here is safe to edit and commit. Secrets live in .env / GitHub
+#  Secrets and are NEVER stored in this file.
+# ==========================================================================
+
+engine:
+  # Alert only when Gemini scores a job at/above this. 0-100.
+  match_threshold: 75
+  # Jobs evaluated per Gemini call. Higher = fewer API calls = less quota burn.
+  eval_batch_size: 8
+  # Gemini batches run in parallel. Each call is mostly network wait, so this
+  # is the difference between a ~3-minute and a ~1-minute evaluation phase.
+  # Keep it low: the free tier limits REQUESTS PER MINUTE, and 429s are handled
+  # by backoff but cost latency. 3 is a safe, tested default.
+  eval_concurrency: 3
+  # Hard ceiling on jobs sent to Gemini per run (protects the free-tier quota).
+  max_evaluations_per_run: 120
+  # Hard ceiling on WhatsApp messages per run (protects against alert storms).
+  max_alerts_per_run: 12
+  # Seconds between WhatsApp sends. CallMeBot throttles aggressively below ~6s.
+  alert_interval_seconds: 8
+  # Ignore postings older than this. Telegram/RSS often resurface stale posts.
+  max_job_age_days: 21
+  # Concurrent scraper workers.
+  scraper_concurrency: 8
+  # Per-request HTTP timeout (seconds).
+  http_timeout: 25
+  # Drop a job before it ever reaches Gemini unless it clears this cheap
+  # lexical pre-filter score. Saves a large share of AI quota. 0 disables it.
+  prefilter_min_score: 2
+
+gemini:
+  # Tried in order; first model that answers wins. Verified live 2026-08-19.
+  model_chain:
+    - gemini-3.5-flash
+    - gemini-2.5-flash
+    - gemini-3.5-flash-lite
+  temperature: 0.15
+  max_output_tokens: 8192
+  # Retry/backoff for 429 (rate limit) and 5xx (transient).
+  max_retries: 4
+  backoff_base_seconds: 2.5
+
+# -- What counts as a match -------------------------------------------------
+profile:
+  # Core skills. A job hitting these scores highest in the pre-filter.
+  primary_keywords:
+    - voip
+    - sip
+    - iax
+    - issabel
+    - asterisk
+    - freepbx
+    - pbx
+    - softphone
+    - ivr
+    - telephony
+    - unified communications
+    - contact center
+    - call center
+    - session border controller
+    - sbc
+    - kamailio
+    - opensips
+    - 3cx
+    - genesys
+    - avaya
+    - cisco voice
+
+  secondary_keywords:
+    - it support
+    - application support
+    - technical support
+    - service desk
+    - help desk
+    - helpdesk
+    - it specialist
+    - system administrator
+    - sysadmin
+    - noc
+    - network engineer
+    - odoo
+    - erp support
+    - itsm
+    - pos
+    - point of sale
+    - cctv
+    - python
+    - automation engineer
+    - solution engineer
+    - presales engineer
+    - implementation engineer
+    - field engineer
+    - product support
+
+  # Instant-disqualify. Cheap way to kill the noise that floods job feeds.
+  negative_keywords:
+    - nurse
+    - nursing
+    - medical representative
+    - pharmacist
+    - teacher
+    - chef
+    - waiter
+    - driver
+    - security guard
+    - cleaner
+    - housekeeping
+    - civil engineer
+    - mechanical engineer
+    - hvac
+    - welder
+    - accountant
+    - real estate agent
+    - insurance agent
+    - graphic designer
+    - content writer
+    - social media manager
+
+  # Preferred geography. Used for scoring, not hard filtering -- a great
+  # remote role outside this list still gets through.
+  target_locations:
+    - united arab emirates
+    - uae
+    - dubai
+    - abu dhabi
+    - sharjah
+    - saudi arabia
+    - ksa
+    - riyadh
+    - jeddah
+    - dammam
+    - qatar
+    - doha
+    - kuwait
+    - oman
+    - muscat
+    - bahrain
+    - manama
+    - gcc
+    - gulf
+    - egypt
+    - cairo
+    - remote
+    - worldwide
+
+# -- SOURCE 1: LinkedIn public guest endpoint (no login, no cookies) --------
+# Highest-signal source. Verified returning fresh GCC roles.
+linkedin:
+  enabled: true
+  # Restrict to postings from the last N seconds (604800 = 7 days).
+  recency_seconds: 604800
+  pages_per_query: 2          # 10 results per page
+  queries:
+    - keywords: "VoIP Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Qatar", "Egypt"]
+    - keywords: "SIP Engineer OR Telephony Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Kuwait"]
+    - keywords: "IT Application Support Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Qatar", "Egypt"]
+    - keywords: "Unified Communications Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia"]
+    - keywords: "PBX Asterisk Issabel"
+      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
+    - keywords: "IT Support Engineer"
+      locations: ["Dubai, United Arab Emirates", "Riyadh, Saudi Arabia"]
+    - keywords: "Odoo Support Consultant"
+      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
+    - keywords: "Contact Center Engineer"
+      locations: ["United Arab Emirates", "Qatar", "Saudi Arabia"]
+    - keywords: "Technical Support Engineer Telecom"
+      locations: ["Oman", "Bahrain", "Qatar"]
+    - keywords: "POS Support Engineer"
+      locations: ["United Arab Emirates", "Egypt"]
+
+# -- SOURCE 2: Telegram public channels (t.me/s/ web preview, zero auth) ----
+# VERIFIED LIVE on 2026-08-19. Add your own channels here -- run
+# `python discover_channels.py @name1 @name2` to validate before adding.
+telegram:
+  enabled: true
+  messages_per_channel: 40
+  # Every channel below was AUDITED on 2026-08-19 and confirmed to be posting
+  # RECENTLY and to carry real IT/engineering signal. Dozens of the obvious
+  # names (@gulfjobsin, @jobsgulf, @ciscojobs, @Egypt_Jobs ...) exist but are
+  # dormant or off-topic, so they were deliberately excluded.
+  # Columns: last post age | IT-keyword density | subscribers
+  channels:
+    - telecomcareers        #  5d | IT 67 |  9.9K  <- best telecom/VoIP signal
+    - FreeJobsInDubai       #  0d | IT 43 | 15.4K
+    - gulfjobexpress        #  6d | IT 10 |  6.3K
+    - qatarjobsvacancy      #  0d | IT  8 |    91
+    - gulfwalkins           #  0d | IT  5 | 12.6K
+    - emiratesjobs          #  7d | IT  - |  6.1K
+    # -- ADD YOUR OWN BELOW (e.g. the Mohamed Shaaban channel) -----------
+    # Telegram has NO public channel-search API, so a channel can only be
+    # added by its exact @username. Validate before adding:
+    #     python discover_channels.py @name1 @name2 --add
+    # The auditor reports freshness, IT relevance and subscriber count, and
+    # refuses to add anything dormant.
+
+# -- SOURCE 3: Free structured job APIs (clean JSON, no scraping) -----------
+job_apis:
+  enabled: true
+  sources:
+    arbeitnow: true         # ~176 live postings, global + remote
+    remoteok: true          # ~100 remote tech roles
+    jobicy: true            # ~50 remote roles
+    himalayas: true         # ~20 remote roles
+    remotive: true          # ~17 remote roles
+    themuse: true           # global, filterable
+
+# -- SOURCE 4: talent.com regional boards (GCC-native, bot-friendly) --------
+# The most productive Gulf-native board that still serves clean HTML to a
+# plain HTTP client. Bayt / GulfTalent / Naukrigulf / Wuzzuf / Indeed all
+# answer HTTP 403; talent.com does not, and it aggregates much of the same
+# inventory. Verified returning real UAE postings on 2026-08-19.
+talent:
+  enabled: true
+  max_per_query: 20
+  countries: [ae, sa, qa, kw, om, bh, eg]
+  terms:
+    - "VoIP engineer"
+    - "SIP telephony"
+    - "IT support engineer"
+    - "application support"
+    - "unified communications"
+    - "Odoo support"
+    - "contact center engineer"
+
+# -- SOURCE 5: Search-engine proxy for boards that block direct scraping ----
+# Reaches Bayt / GulfTalent / Naukrigulf / Wuzzuf through Google News RSS,
+# which is the ONLY free path to them. Read the honest trade-off first:
+#   * links are opaque news.google.com redirects -- tappable from WhatsApp and
+#     they do land on the posting, but they are not clean canonical URLs;
+#   * precision is lower than a real job API (listing pages sneak in).
+# Bing RSS ignores `site:` and DuckDuckGo bot-challenges, so neither is wired
+# up. Set enabled: false if the extra noise annoys you -- coverage of the
+# blocked GCC boards is the only thing you lose.
+search_proxy:
+  enabled: true
+  max_items_per_query: 25
+  engines: ["google_news"]
+  site_queries:
+    - site: bayt.com
+      terms: ["VoIP engineer", "IT support engineer", "application support"]
+    - site: gulftalent.com
+      terms: ["VoIP", "telecom engineer", "IT support"]
+    - site: naukrigulf.com
+      terms: ["VoIP engineer", "IT support engineer", "Odoo"]
+    - site: wuzzuf.net
+      terms: ["VoIP", "Odoo", "IT support"]
+
+# -- SOURCE 6: Plain RSS job feeds ------------------------------------------
+rss:
+  enabled: true
+  feeds:
+    - name: WeWorkRemotely-DevOps
+      url: https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+    - name: WeWorkRemotely-Support
+      url: https://weworkremotely.com/categories/remote-customer-support-jobs.rss
+    - name: Jobicy
+      url: https://jobicy.com/?feed=job_feed
+
+# -- SOURCE 7: Facebook public recruitment posts (best-effort) --------------
+# Facebook aggressively blocks unauthenticated scraping. Without a cookie
+# this falls back to search-engine indexing of public FB job posts.
+facebook:
+  enabled: true
+  # Only used when the FACEBOOK_COOKIE secret is set (opt-in, your own account).
+  pages: []
+  search_terms:
+    - "VoIP engineer Egypt hiring"
+    - "IT support engineer Dubai hiring"
+    - "Odoo support Cairo hiring"
+
+# -- Alert delivery ---------------------------------------------------------
+notifications:
+  # Send a run summary even when nothing matched (quiet heartbeat).
+  send_heartbeat: false
+  # Alert if the pipeline itself breaks (scrapers all dead, Gemini down).
+  send_failure_alerts: true
+  # Don't re-send the same failure more than once per N minutes.
+  failure_cooldown_minutes: 180

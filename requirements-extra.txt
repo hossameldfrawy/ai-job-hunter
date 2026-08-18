@@ -1,0 +1,3 @@
+# Optional: authenticated Telegram ingestion for PRIVATE/restricted channels.
+# Public channels work WITHOUT this via the t.me/s/ web-preview scraper.
+Telethon==1.36.0

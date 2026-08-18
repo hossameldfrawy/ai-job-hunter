@@ -1,0 +1,32 @@
+# =============================================================================
+#  Always-on deployment for a VPS, NAS, Raspberry Pi, or an Oracle Cloud
+#  "Always Free" VM -- the best genuinely-free 24/7 option after GitHub Actions.
+#
+#    cp .env.example .env && nano .env
+#    docker compose up -d
+#    docker compose logs -f
+# =============================================================================
+services:
+  job-hunter:
+    build: .
+    image: ai-job-hunter:latest
+    container_name: ai-job-hunter
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RUN_INTERVAL_MINUTES: "30"
+      LOG_LEVEL: "INFO"
+      PORT: "8080"
+    ports:
+      - "8080:8080"          # JSON health/status endpoint
+    volumes:
+      # The dedup database must outlive the container.
+      - hunter-state:/app/state
+      # Optional: mount the CV instead of using the CV_TEXT secret.
+      # - ./assets/master_cv.pdf:/app/assets/master_cv.pdf:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  hunter-state:

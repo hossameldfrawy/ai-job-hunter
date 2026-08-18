@@ -1,0 +1,485 @@
+{
+  "name": "AI Job Hunter -- Gemini + WhatsApp",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "every-30-minutes",
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -660,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "run-now-(manual)",
+      "name": "Run Now (Manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n//  CONFIGURATION -- the only node you must edit.\n// ===========================================================================\n//  Secrets: set these as n8n environment variables (recommended) or paste\n//  them literally below. In n8n, $env.NAME reads a host environment variable.\n// ===========================================================================\n\nconst config = {\n  geminiApiKey:    $env.GEMINI_API_KEY    || 'PASTE_GEMINI_API_KEY',\n  callmebotApiKey: $env.CALLMEBOT_APIKEY  || 'PASTE_CALLMEBOT_APIKEY',\n  whatsappPhone:   $env.WHATSAPP_PHONE    || '+201234567890',\n\n  // Gemini model chain is handled by the HTTP node URL; change it there.\n  matchThreshold: 75,\n  evalBatchSize: 8,\n  maxAlertsPerRun: 12,\n  maxJobAgeDays: 21,\n\n  // Paste your CV as plain text (Settings > Variables works too).\n  cvText: $env.CV_TEXT || `PASTE YOUR CV TEXT HERE.\nReplace this with the full plain text of your CV. The AI scores every job\nagainst exactly this text, so the more complete it is, the better the scoring.`,\n\n  // Public Telegram channels (no credentials needed -- t.me/s/ web preview).\n  telegramChannels: [\n    'telecomcareers',\n    'FreeJobsInDubai',\n    'gulfjobexpress',\n    'qatarjobsvacancy',\n    'gulfwalkins',\n  ],\n\n  // LinkedIn public guest search: keyword + location pairs.\n  linkedinQueries: [\n    { keywords: 'VoIP Engineer',                 location: 'United Arab Emirates' },\n    { keywords: 'VoIP Engineer',                 location: 'Saudi Arabia' },\n    { keywords: 'SIP Engineer OR Telephony',     location: 'United Arab Emirates' },\n    { keywords: 'IT Application Support Engineer', location: 'United Arab Emirates' },\n    { keywords: 'IT Application Support Engineer', location: 'Egypt' },\n    { keywords: 'Unified Communications Engineer', location: 'Saudi Arabia' },\n    { keywords: 'PBX Asterisk Issabel',          location: 'Egypt' },\n    { keywords: 'Odoo Support Consultant',       location: 'United Arab Emirates' },\n  ],\n\n  primaryKeywords: ['voip','sip','iax','issabel','asterisk','freepbx','pbx',\n    'softphone','ivr','telephony','unified communications','contact center',\n    'kamailio','opensips','3cx','genesys','avaya'],\n  secondaryKeywords: ['it support','application support','technical support',\n    'service desk','help desk','helpdesk','sysadmin','system administrator',\n    'noc','network engineer','odoo','erp','itsm','pos','point of sale','python'],\n  negativeKeywords: ['nurse','nursing','pharmacist','teacher','chef','waiter',\n    'driver','security guard','cleaner','housekeeping','civil engineer',\n    'mechanical engineer','hvac','welder','accountant','real estate'],\n};\n\n// Fan out into one item per HTTP request the next nodes must make.\nconst requests = [];\n\nfor (const q of config.linkedinQueries) {\n  const url = 'https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search'\n    + '?keywords=' + encodeURIComponent(q.keywords)\n    + '&location=' + encodeURIComponent(q.location)\n    + '&f_TPR=r604800&sortBy=DD&start=0';\n  requests.push({ json: { kind: 'linkedin', url, config, meta: q } });\n}\n\nfor (const ch of config.telegramChannels) {\n  requests.push({\n    json: { kind: 'telegram', url: 'https://t.me/s/' + ch, config, meta: { channel: ch } },\n  });\n}\n\nreturn requests;"
+      },
+      "id": "configuration",
+      "name": "Configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 25000,
+          "redirect": {
+            "redirect": {}
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9,ar;q=0.8"
+            }
+          ]
+        }
+      },
+      "id": "fetch-source-html",
+      "name": "Fetch Source HTML",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -180,
+        300
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n//  PARSE -- turn raw HTML into normalised job records.\n//  Uses regex rather than a DOM library so it runs on stock n8n with no\n//  extra npm modules enabled.\n// ===========================================================================\n\nconst out = [];\n\nfunction stripTags(s) {\n  return (s || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\")\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction fingerprint(company, title, location) {\n  const basis = (company + '|' + title + '|' + location)\n    .toLowerCase().replace(/[^a-z0-9\\u0600-\\u06FF ]+/g, ' ').replace(/\\s+/g, ' ').trim();\n  let h = 0;\n  for (let i = 0; i < basis.length; i++) {\n    h = ((h << 5) - h) + basis.charCodeAt(i);\n    h |= 0;\n  }\n  return 'fp' + Math.abs(h).toString(36) + '_' + basis.length;\n}\n\nfor (const item of $input.all()) {\n  const kind = item.json.kind;\n  const html = typeof item.json.data === 'string' ? item.json.data : (item.json.body || '');\n  const config = item.json.config;\n  const meta = item.json.meta || {};\n\n  if (!html) continue;\n\n  if (kind === 'linkedin') {\n    // Each result card is an <li> containing h3 (title), h4 (company),\n    // .job-search-card__location, <time datetime>, and an anchor.\n    const cards = html.split(/<li[\\s>]/i).slice(1);\n    for (const card of cards) {\n      const title = stripTags((card.match(/<h3[^>]*>([\\s\\S]*?)<\\/h3>/i) || [])[1]);\n      if (!title) continue;\n      const company = stripTags((card.match(/<h4[^>]*>([\\s\\S]*?)<\\/h4>/i) || [])[1]);\n      const location = stripTags(\n        (card.match(/job-search-card__location\"[^>]*>([\\s\\S]*?)</i) || [])[1]\n      );\n      const link = ((card.match(/href=\"(https:\\/\\/[a-z]{0,3}\\.?linkedin\\.com\\/jobs\\/view\\/[^\"?]+)/i) || [])[1] || '');\n      const posted = (card.match(/datetime=\"([^\"]+)\"/i) || [])[1] || '';\n\n      out.push({ json: {\n        source: 'linkedin',\n        title, company, location,\n        url: link,\n        description: '',\n        posted_at: posted,\n        fingerprint: fingerprint(company, title, location),\n        config,\n      }});\n    }\n  }\n\n  if (kind === 'telegram') {\n    const channel = meta.channel || 'unknown';\n    // Each post: <div class=\"tgme_widget_message_text ...\">TEXT</div>\n    const re = /<div class=\"tgme_widget_message_text[^\"]*\"[^>]*>([\\s\\S]*?)<\\/div>/gi;\n    const times = [...html.matchAll(/<time datetime=\"([^\"]+)\"/gi)].map(m => m[1]);\n    let m, i = 0;\n    while ((m = re.exec(html)) !== null) {\n      const text = stripTags(m[1].replace(/<br\\s*\\/?>/gi, '\\n'));\n      i++;\n      if (text.length < 40) continue;\n      if (!/(hiring|vacanc|job|position|opening|required|apply|recruit|مطلوب|وظيف|وظائف|فرصة)/i.test(text)) continue;\n\n      const firstLine = text.split('\\n')[0].slice(0, 180) || text.slice(0, 180);\n      const extLink = (text.match(/https?:\\/\\/[^\\s<>\"']+/) || [])[0] || ('https://t.me/' + channel);\n\n      out.push({ json: {\n        source: 'telegram:' + channel,\n        title: firstLine,\n        company: '',\n        location: '',\n        url: extLink,\n        description: text.slice(0, 3000),\n        posted_at: times[i - 1] || '',\n        fingerprint: fingerprint('', firstLine, ''),\n        config,\n      }});\n    }\n  }\n}\n\nreturn out;"
+      },
+      "id": "parse-postings",
+      "name": "Parse Postings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n//  DEDUPLICATE + PRE-FILTER\n//  Deduplication uses n8n's persistent workflow static data, so it survives\n//  across executions exactly like the Python build's SQLite database.\n// ===========================================================================\n\nconst store = $getWorkflowStaticData('global');\nif (!Array.isArray(store.seen)) store.seen = [];\nif (!store.alerted) store.alerted = {};\n\nconst seen = new Set(store.seen);\nconst items = $input.all();\nconst config = items.length ? items[0].json.config : null;\nif (!config) return [];\n\nfunction norm(s) {\n  return (s || '').toLowerCase().replace(/[^a-z0-9\\u0600-\\u06FF ]+/g, ' ').replace(/\\s+/g, ' ').trim();\n}\n\nfunction hits(text, list) {\n  let n = 0;\n  for (const term of list) if (text.includes(term)) n++;\n  return n;\n}\n\nconst fresh = [];\nconst batchSeen = new Set();\n\nfor (const item of items) {\n  const j = item.json;\n  const fp = j.fingerprint;\n\n  if (!fp || seen.has(fp) || batchSeen.has(fp)) continue;\n  batchSeen.add(fp);\n\n  // Age gate -- skip anything older than maxJobAgeDays.\n  if (j.posted_at) {\n    const ts = Date.parse(j.posted_at);\n    if (!isNaN(ts)) {\n      const ageDays = (Date.now() - ts) / 86400000;\n      if (ageDays > config.maxJobAgeDays) continue;\n    }\n  }\n\n  const blob = norm([j.title, j.company, j.location, j.description].join(' '));\n  if (hits(blob, config.negativeKeywords) > 0) continue;\n\n  const score = 3 * hits(blob, config.primaryKeywords)\n              + 1 * hits(blob, config.secondaryKeywords)\n              + 2 * hits(norm(j.title), config.primaryKeywords);\n  if (score < 2) continue;\n\n  j.prefilter_score = score;\n  fresh.push({ json: j });\n}\n\n// Record everything we are about to evaluate so the next run skips it.\nfor (const f of fresh) seen.add(f.json.fingerprint);\nstore.seen = Array.from(seen).slice(-8000);   // bounded, keeps static data small\n\nfresh.sort((a, b) => b.json.prefilter_score - a.json.prefilter_score);\n\n// Group into Gemini batches -- one item per API call.\nconst batchSize = config.evalBatchSize || 8;\nconst batches = [];\nfor (let i = 0; i < fresh.length; i += batchSize) {\n  batches.push({ json: {\n    config,\n    jobs: fresh.slice(i, i + batchSize).map(f => f.json),\n    batchIndex: batches.length,\n  }});\n}\n\nreturn batches;"
+      },
+      "id": "dedupe-+-pre-filter",
+      "name": "Dedupe + Pre-filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n//  BUILD THE GEMINI REQUEST (strict JSON schema, batched)\n// ===========================================================================\n\nconst out = [];\n\nconst SYSTEM = `You are a precise technical recruiter screening job postings for ONE candidate.\nYou receive the candidate's CV and a numbered batch of postings, some scraped from messy\nsources (Telegram, RSS) that may be in Arabic or English.\nReturn exactly one evaluation object per posting, echoing its job_index.\n\nSCORING RUBRIC:\n  90-100  Bullseye: core VoIP/SIP/PBX/telephony or IT application support, right level, target location.\n  75-89   Strong: most core requirements met, minor learnable gaps. THIS IS THE ALERT THRESHOLD.\n  50-74   Adjacent role, missing differentiators, or wrong seniority.\n  25-49   Same industry, wrong discipline.\n  0-24    Irrelevant, or not a genuine single vacancy.\n\nHARD RULES:\n  * Score the candidate's ACTUAL EVIDENCE, not the role's prestige.\n  * A role demanding 8+ years senior/lead/principal experience must not exceed 60.\n  * Listing pages, search-results pages, CVs/profiles, adverts, news: is_real_job=false, match_score=0.\n  * why_matched must name the concrete overlapping technologies -- never generic filler.\n  * skill_gaps lists real specific missing requirements; empty array if none.\n  * Translate Arabic postings and answer in English.`;\n\nfor (const item of $input.all()) {\n  const { config, jobs, batchIndex } = item.json;\n\n  const blocks = jobs.map((j, i) =>\n    `### JOB ${i}\\nsource: ${j.source}\\ntitle: ${j.title || 'unknown'}\\n` +\n    `company: ${j.company || 'unknown'}\\nlocation: ${j.location || 'unknown'}\\n` +\n    `url: ${j.url || 'none'}\\nposted: ${j.posted_at || 'unknown'}\\n` +\n    `description: ${(j.description || '(none provided)').slice(0, 1400)}`\n  ).join('\\n');\n\n  const prompt = `=== CANDIDATE CV ===\\n${config.cvText}\\n\\n` +\n    `=== JOB POSTINGS TO EVALUATE (${jobs.length}) ===\\n${blocks}\\n\\n` +\n    `Return exactly ${jobs.length} evaluation objects, one per JOB index 0-${jobs.length - 1}.`;\n\n  out.push({ json: {\n    config, jobs, batchIndex,\n    geminiBody: {\n      systemInstruction: { parts: [{ text: SYSTEM }] },\n      contents: [{ role: 'user', parts: [{ text: prompt }] }],\n      generationConfig: {\n        responseMimeType: 'application/json',\n        temperature: 0.15,\n        maxOutputTokens: 8192,\n        responseSchema: {\n          type: 'OBJECT',\n          properties: {\n            evaluations: {\n              type: 'ARRAY',\n              items: {\n                type: 'OBJECT',\n                properties: {\n                  job_index:    { type: 'INTEGER' },\n                  is_real_job:  { type: 'BOOLEAN' },\n                  company_name: { type: 'STRING' },\n                  role_title:   { type: 'STRING' },\n                  location:     { type: 'STRING' },\n                  match_score:  { type: 'INTEGER' },\n                  why_matched:  { type: 'STRING' },\n                  skill_gaps:   { type: 'ARRAY', items: { type: 'STRING' } },\n                },\n                required: ['job_index','is_real_job','company_name','role_title',\n                           'location','match_score','why_matched','skill_gaps'],\n              },\n            },\n          },\n          required: ['evaluations'],\n        },\n      },\n      safetySettings: [\n        'HARM_CATEGORY_HARASSMENT','HARM_CATEGORY_HATE_SPEECH',\n        'HARM_CATEGORY_SEXUALLY_EXPLICIT','HARM_CATEGORY_DANGEROUS_CONTENT',\n      ].map(c => ({ category: c, threshold: 'BLOCK_ONLY_HIGH' })),\n    },\n  }});\n}\n\nreturn out;"
+      },
+      "id": "build-gemini-request",
+      "name": "Build Gemini Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={{ $json.config.geminiApiKey }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiBody) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "gemini:-score-jobs",
+      "name": "Gemini: Score Jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n//  READ GEMINI'S VERDICT -> keep only genuine high matches -> format alerts\n// ===========================================================================\n\nconst store = $getWorkflowStaticData('global');\nif (!store.alerted) store.alerted = {};\n\nconst matches = [];\n\nfor (const item of $input.all()) {\n  let config, jobs;\n  try {\n    // The paired input carries the batch context alongside Gemini's response.\n    const paired = $('Build Gemini Request').all()[item.pairedItem?.item ?? 0];\n    config = paired.json.config;\n    jobs   = paired.json.jobs;\n  } catch (e) {\n    continue;\n  }\n\n  const raw = item.json?.candidates?.[0]?.content?.parts?.[0]?.text;\n  if (!raw) continue;\n\n  let parsed;\n  try { parsed = JSON.parse(raw); } catch (e) { continue; }\n\n  for (const ev of (parsed.evaluations || [])) {\n    const idx = Number(ev.job_index);\n    const job = jobs[idx];\n    if (!job) continue;\n    if (ev.is_real_job === false) continue;\n\n    const score = Math.max(0, Math.min(100, parseInt(ev.match_score, 10) || 0));\n    if (score < config.matchThreshold) continue;\n    if (store.alerted[job.fingerprint]) continue;   // never alert twice\n\n    store.alerted[job.fingerprint] = new Date().toISOString();\n\n    // The model must never invent the link or the source -- take ours.\n    const gaps = Array.isArray(ev.skill_gaps) ? ev.skill_gaps.join(', ') : '';\n    const lines = [\n      `\\u{1F6A8} *NEW HIGH-MATCH JOB FOUND* (Score: ${score}%)`,\n      `\\u{1F3E2} *Company:* ${ev.company_name || job.company || 'Unknown'}`,\n      `\\u{1F4CD} *Location:* ${ev.location || job.location || 'Unknown'}`,\n      `\\u{1F4BC} *Role:* ${ev.role_title || job.title || 'Unknown'}`,\n      `\\u{1F517} *Link:* ${job.url || '(no direct link)'}`,\n      `\\u{1F4E1} *Source:* ${job.source}`,\n    ];\n    if (ev.why_matched) lines.push(`\\u2705 *Why You Match:* ${String(ev.why_matched).slice(0, 420)}`);\n    if (gaps)           lines.push(`\\u26A0\\uFE0F *Gaps to address:* ${gaps.slice(0, 220)}`);\n\n    matches.push({ json: {\n      match_score: score,\n      company_name: ev.company_name || job.company || 'Unknown',\n      role_title: ev.role_title || job.title || 'Unknown',\n      location: ev.location || job.location || 'Unknown',\n      source_platform: job.source,\n      direct_link: job.url,\n      why_matched: ev.why_matched || '',\n      skill_gaps: ev.skill_gaps || [],\n      messageText: lines.join('\\n').slice(0, 900),\n      config,\n    }});\n  }\n}\n\n// Best first, then apply the per-run alert cap.\nmatches.sort((a, b) => b.json.match_score - a.json.match_score);\nconst cap = matches.length ? matches[0].json.config.maxAlertsPerRun : 12;\nreturn matches.slice(0, cap);"
+      },
+      "id": "select-high-matches",
+      "name": "Select High Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-matches",
+              "leftValue": "={{ $json.match_score }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "any-matches?",
+      "name": "Any Matches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "one-alert-at-a-time",
+      "name": "One Alert At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1500,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.callmebot.com/whatsapp.php",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "phone",
+              "value": "={{ $json.config.whatsappPhone }}"
+            },
+            {
+              "name": "apikey",
+              "value": "={{ $json.config.callmebotApiKey }}"
+            },
+            {
+              "name": "text",
+              "value": "={{ $json.messageText }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "whatsapp:-send-alert",
+      "name": "WhatsApp: Send Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1740,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 8,
+        "unit": "seconds"
+      },
+      "id": "throttle-8s",
+      "name": "Throttle 8s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        220
+      ],
+      "webhookId": "throttle-8s-callmebot"
+    },
+    {
+      "parameters": {},
+      "id": "no-matches-this-run",
+      "name": "No Matches This Run",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now (Manual)": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration": {
+      "main": [
+        [
+          {
+            "node": "Fetch Source HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Source HTML": {
+      "main": [
+        [
+          {
+            "node": "Parse Postings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Postings": {
+      "main": [
+        [
+          {
+            "node": "Dedupe + Pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe + Pre-filter": {
+      "main": [
+        [
+          {
+            "node": "Build Gemini Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Gemini Request": {
+      "main": [
+        [
+          {
+            "node": "Gemini: Score Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Score Jobs": {
+      "main": [
+        [
+          {
+            "node": "Select High Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select High Matches": {
+      "main": [
+        [
+          {
+            "node": "Any Matches?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Matches?": {
+      "main": [
+        [
+          {
+            "node": "One Alert At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Matches This Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One Alert At A Time": {
+      "main": [
+        [],
+        [
+          {
+            "node": "WhatsApp: Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: Send Alert": {
+      "main": [
+        [
+          {
+            "node": "Throttle 8s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle 8s": {
+      "main": [
+        [
+          {
+            "node": "One Alert At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 1800,
+    "timezone": "Africa/Cairo"
+  },
+  "tags": [
+    {
+      "name": "job-hunter"
+    },
+    {
+      "name": "gemini"
+    },
+    {
+      "name": "whatsapp"
+    }
+  ],
+  "meta": {
+    "instanceId": "ai-job-hunter-blueprint"
+  },
+  "versionId": "1.0.0"
+}

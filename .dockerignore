@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+venv
+__pycache__
+*.pyc
+.env
+.env.local
+secrets/
+state/*.db
+run_report.json
+tests/
+*.md
+n8n_workflow.json

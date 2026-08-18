@@ -1,0 +1,32 @@
+# Fly.io deployment. `fly launch --no-deploy` then `fly deploy`.
+# Set secrets first:
+#   fly secrets set GEMINI_API_KEY=... CALLMEBOT_APIKEY=... WHATSAPP_PHONE=...
+#   fly secrets set CV_TEXT="$(cat secrets/CV_TEXT.txt)"
+app = "ai-job-hunter"
+primary_region = "cdg"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUN_INTERVAL_MINUTES = "30"
+  LOG_LEVEL = "INFO"
+  DB_PATH = "/data/jobs.db"
+  PORT = "8080"
+
+# The dedup database must survive restarts.
+[mounts]
+  source = "hunter_state"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Never sleep: the hunt loop must keep ticking.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

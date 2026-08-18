@@ -1,0 +1,228 @@
+# ============================================================================
+#  AI JOB HUNTER -- 24/7 zero-cost execution engine
+# ============================================================================
+#  Runs entirely on GitHub's infrastructure. Your PC can be off, offline, or
+#  thrown in a lake; this keeps hunting.
+#
+#  HOW STATE SURVIVES A STATELESS RUNNER
+#  Every run gets a brand-new virtual machine that is destroyed afterwards, so
+#  the deduplication database cannot live on disk. Instead it lives on an
+#  ORPHAN BRANCH called `bot-state`, which is force-pushed as a single commit
+#  each run. That means:
+#    * the database survives forever, across thousands of runs;
+#    * repository size stays constant (no accumulating history of binaries);
+#    * `main` is never touched, so your code history stays clean.
+#
+#  A useful side effect: pushing to `bot-state` every 30 minutes counts as
+#  repository activity, which stops GitHub auto-disabling the schedule on
+#  repos that look dormant for 60 days.
+#
+#  COST
+#  Public repository  -> Actions minutes are UNLIMITED and free. Recommended.
+#  Private repository -> 2,000 free minutes/month. At ~4 min/run every 30 min
+#                        you would need ~5,800, so switch the cron below to
+#                        hourly ('0 * * * *') or make the repo public. Your
+#                        secrets are NOT exposed by a public repo -- the CV and
+#                        every key live in encrypted GitHub Secrets, which is
+#                        exactly why nothing personal is committed here.
+# ============================================================================
+
+name: AI Job Hunter
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub queues scheduled jobs under load, so treat this
+    # as "at least every 30 min", not a hard real-time guarantee.
+    - cron: "*/30 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the full pipeline but send no WhatsApp messages"
+        type: boolean
+        default: false
+      threshold:
+        description: "Override the match threshold (0-100)"
+        type: string
+        default: ""
+      log_level:
+        description: "Log verbosity"
+        type: choice
+        options: [INFO, DEBUG, WARNING]
+        default: INFO
+
+# Never let two hunts run at once -- concurrent writers would fork the
+# deduplication database and cause duplicate alerts.
+concurrency:
+  group: ai-job-hunter
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # required to push the bot-state branch
+
+jobs:
+  hunt:
+    name: Hunt and alert
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+      WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+      CV_TEXT: ${{ secrets.CV_TEXT }}
+      MASTER_CV_B64: ${{ secrets.MASTER_CV_B64 }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+      FACEBOOK_COOKIE: ${{ secrets.FACEBOOK_COOKIE }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      MATCH_THRESHOLD: ${{ inputs.threshold }}
+      LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Check out the bot
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          pip install -r requirements.txt --quiet
+
+      - name: Verify required secrets are present
+        run: |
+          missing=""
+          [ -z "$GEMINI_API_KEY" ]   && missing="$missing GEMINI_API_KEY"
+          [ -z "$CALLMEBOT_APIKEY" ] && missing="$missing CALLMEBOT_APIKEY"
+          [ -z "$WHATSAPP_PHONE" ]   && missing="$missing WHATSAPP_PHONE"
+          if [ -z "$CV_TEXT" ] && [ -z "$MASTER_CV_B64" ]; then
+            missing="$missing CV_TEXT(or MASTER_CV_B64)"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "Set them with:  python setup_wizard.py --secrets"
+            exit 1
+          fi
+          echo "All required secrets are present."
+
+      # --- restore the deduplication database ----------------------------
+      - name: Restore persistent state
+        run: |
+          mkdir -p state
+          if git fetch --depth=1 origin bot-state 2>/dev/null; then
+            if git show origin/bot-state:jobs.db > state/jobs.db 2>/dev/null; then
+              echo "Restored dedup DB ($(du -h state/jobs.db | cut -f1))."
+            else
+              echo "bot-state exists but holds no database yet -- starting fresh."
+              rm -f state/jobs.db
+            fi
+          else
+            echo "No bot-state branch yet -- this is the first run."
+          fi
+
+      # --- the actual work ------------------------------------------------
+      - name: Hunt for jobs
+        id: hunt
+        run: python main.py --once
+
+      # --- persist state, even if the hunt failed -------------------------
+      - name: Persist state to the bot-state branch
+        if: always()
+        run: |
+          [ -f state/jobs.db ] || { echo "No database to persist."; exit 0; }
+          workdir=$(mktemp -d)
+          cp state/jobs.db "$workdir/jobs.db"
+          [ -f run_report.json ] && cp run_report.json "$workdir/"
+
+          cat > "$workdir/README.md" <<'EOF'
+          # bot-state
+
+          Machine-managed branch. Do not edit, merge or delete.
+
+          `jobs.db` is the AI Job Hunter's deduplication database -- the record
+          of every posting ever seen and every alert ever sent. It is what stops
+          the same job being sent to WhatsApp twice.
+
+          This branch is force-pushed as a single commit on every run so the
+          repository never accumulates binary history. Deleting it makes the bot
+          forget everything and re-alert on jobs you have already been told about.
+          EOF
+
+          cd "$workdir"
+          git init --quiet
+          git checkout --quiet -b bot-state
+          git add -A
+          git -c user.name="ai-job-hunter[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --quiet --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            bot-state
+          echo "State persisted ($(du -h jobs.db | cut -f1))."
+
+      - name: Publish the run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-report-${{ github.run_number }}
+          path: |
+            run_report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          {
+            echo "## AI Job Hunter -- run #${{ github.run_number }}"
+            echo ""
+            if [ -f run_report.json ]; then
+              python - <<'PY'
+          import json, pathlib
+          r = json.loads(pathlib.Path("run_report.json").read_text(encoding="utf-8"))
+          print(f"**Status:** `{r['status']}` in {r['duration_s']}s\n")
+          print("| stage | count |")
+          print("|---|---:|")
+          for key in ("scraped", "too_old", "duplicates", "prefilter_dropped",
+                      "prefilter_disqualified", "evaluated", "matched",
+                      "alerts_sent", "alerts_failed"):
+              print(f"| {key.replace('_', ' ')} | {r.get(key, 0)} |")
+          print(f"\n**Gemini:** {r['gemini_calls']} calls, ~{r['gemini_tokens']} tokens\n")
+          if r.get("sources"):
+              print("| source | ok | postings | seconds |")
+              print("|---|:--:|---:|---:|")
+              for s in r["sources"]:
+                  print(f"| {s['name']} | {'yes' if s['ok'] else 'NO'} | {s['count']} | {s['seconds']} |")
+          if r.get("top_matches"):
+              print("\n### Best matches this run\n")
+              for m in r["top_matches"][:5]:
+                  print(f"- **{m['score']}%** {m['role']} @ {m['company']} ({m['location']})")
+          if r.get("errors"):
+              print("\n### Problems\n")
+              for e in r["errors"][:10]:
+                  print(f"- `{e}`")
+          PY
+            else
+              echo "No run report was produced -- the job failed before the pipeline started."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- last-resort alert: the pipeline itself broke --------------------
+      - name: Alert on WhatsApp that the bot is down
+        if: failure()
+        continue-on-error: true
+        run: |
+          text="AI JOB HUNTER - RUN FAILED%0A%0AWorkflow run #${{ github.run_number }} did not complete.%0A%0AOpen:%0Ahttps://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -G "https://api.callmebot.com/whatsapp.php" \
+            --data-urlencode "phone=$WHATSAPP_PHONE" \
+            --data-urlencode "apikey=$CALLMEBOT_APIKEY" \
+            --data "text=$text" > /dev/null || true
+          echo "Failure notification attempted."

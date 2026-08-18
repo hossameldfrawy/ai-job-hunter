@@ -1,0 +1,65 @@
+# =============================================================================
+#  Render blueprint.
+#
+#  HONEST NOTE ON COST: Render's free tier covers Web Services only, and those
+#  spin down after ~15 minutes of inactivity -- which would stop the hunt loop.
+#  Background Workers and Cron Jobs are paid plans.
+#
+#  So: use this if you already pay for Render. If you want FREE 24/7, use the
+#  GitHub Actions workflow instead (.github/workflows/job_hunter.yml) -- it is
+#  the primary deployment target for exactly this reason.
+#
+#  Two options are defined below. Enable ONE.
+# =============================================================================
+services:
+  # -- Option A: continuous worker (paid; simplest, keeps state on a disk) ----
+  - type: worker
+    name: ai-job-hunter
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CALLMEBOT_APIKEY
+        sync: false
+      - key: WHATSAPP_PHONE
+        sync: false
+      - key: CV_TEXT
+        sync: false
+      - key: RUN_INTERVAL_MINUTES
+        value: "30"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DB_PATH
+        value: /var/data/jobs.db
+    disk:
+      name: hunter-state
+      mountPath: /var/data
+      sizeGB: 1
+
+  # -- Option B: scheduled run (paid; mirrors the GitHub Actions model) -------
+  # Comment out Option A and uncomment this to run on a schedule instead.
+  # - type: cron
+  #   name: ai-job-hunter-cron
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   schedule: "*/30 * * * *"
+  #   dockerCommand: python main.py --once
+  #   plan: starter
+  #   envVars:
+  #     - key: GEMINI_API_KEY
+  #       sync: false
+  #     - key: CALLMEBOT_APIKEY
+  #       sync: false
+  #     - key: WHATSAPP_PHONE
+  #       sync: false
+  #     - key: CV_TEXT
+  #       sync: false
+  #     - key: DB_PATH
+  #       value: /var/data/jobs.db
+  #   disk:
+  #     name: hunter-state
+  #     mountPath: /var/data
+  #     sizeGB: 1

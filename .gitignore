@@ -1,0 +1,26 @@
+# ── Secrets: never commit ────────────────────────────────────────────────
+.env
+.env.local
+*.session
+*.session-journal
+assets/master_cv.pdf
+assets/cv_profile.json
+secrets/
+
+# ── Local state (cloud state lives on the 'bot-state' branch) ────────────
+state/*.db
+state/*.db-journal
+state/*.db-wal
+state/*.db-shm
+run_report.json
+logs/
+*.log
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
