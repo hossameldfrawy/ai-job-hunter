@@ -1,13 +1,24 @@
 # ── AI Job Hunter :: runtime dependencies ────────────────────────────────
-requests==2.32.3
-urllib3==2.2.3
-beautifulsoup4==4.12.3
-lxml==5.3.0
-feedparser==6.0.11
-PyYAML==6.0.2
-python-dotenv==1.0.1
-tenacity==9.0.0
-pypdf==5.1.0
+#
+# RANGES, NOT EXACT PINS, and the reason is Python 3.14. These were pinned to
+# the versions current when the project started, and `lxml==5.3.0` has no cp314
+# wheel -- pip falls back to building from source and dies on a missing
+# libxml2, so `pip install -r requirements.txt` simply FAILED on 3.14. That is
+# the desktop that runs auto-apply, and the failure was invisible because the
+# machine already had newer versions installed by other means.
+#
+# The floors are the versions the code was written against; the ceilings stop a
+# major release landing unannounced. Both supported interpreters are now
+# exercised on every push -- see .github/workflows/tests.yml.
+requests>=2.32,<3
+urllib3>=2.2,<3
+beautifulsoup4>=4.12,<5
+lxml>=5.3,<7
+feedparser>=6.0.11,<7
+PyYAML>=6.0.2,<7
+python-dotenv>=1.0,<2
+tenacity>=9,<10
+pypdf>=5.1,<7
 
 # Telegram MTProto user client. NOT optional, despite how it started out:
 #   * it ingests your joined private groups, and
