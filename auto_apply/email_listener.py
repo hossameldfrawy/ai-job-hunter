@@ -198,31 +198,152 @@ def _body_text(msg: email.message.Message) -> str:
     return re.sub(r"[ \t\xa0]+", " ", text).strip()[:8000]
 
 
-class EmailMonitor:
-    """Reads the mailbox, classifies, records and alerts."""
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+# Two ways into the same mailbox, behind one interface. Gmail API is preferred
+# because Google no longer issues App Passwords on newer accounts -- the setting
+# is simply absent -- so IMAP is not an option there at all. IMAP is kept for
+# older accounts that still have a working password, and for any non-Gmail host.
 
-    def __init__(self, store: SecureStore, notifier: Any = None):
-        self.store = store
-        self.notifier = notifier
-        cfg = settings.raw.get("email_monitor", {}) or {}
-        self.host = cfg.get("imap_host", "imap.gmail.com")
-        self.port = int(cfg.get("imap_port", 993))
-        self.mailbox = cfg.get("mailbox", "INBOX")
-        self.lookback_days = int(cfg.get("lookback_days", 14))
-        self.max_messages = int(cfg.get("max_messages", 40))
-        self.mark_seen = bool(cfg.get("mark_seen_when_classified", True))
-        self.user = settings.job_email
-        self.password = settings.job_email_password
 
-    # -- connection ---------------------------------------------------------
+class MailBackend:
+    """Fetch unread mail and optionally flag it read."""
+
+    name = "base"
+
+    def fetch_unread(self, lookback_days: int, limit: int) -> list[InboxMessage]:
+        raise NotImplementedError
+
+    def mark_seen(self, message: InboxMessage) -> None:
+        raise NotImplementedError
+
+    def account(self) -> str:
+        return ""
+
+
+class GmailApiBackend(MailBackend):
+    """Gmail API over OAuth2. The supported path on modern accounts."""
+
+    name = "gmail-api"
+
+    def __init__(self) -> None:
+        from auto_apply.gmail_oauth import gmail_service
+
+        self._service = gmail_service(interactive=False)
+
+    def account(self) -> str:
+        try:
+            profile = self._service.users().getProfile(userId="me").execute()
+            return str(profile.get("emailAddress", ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _header(payload: dict[str, Any], name: str) -> str:
+        for h in payload.get("headers", []) or []:
+            if str(h.get("name", "")).lower() == name.lower():
+                return str(h.get("value", ""))
+        return ""
+
+    @staticmethod
+    def _decode_part(data: str) -> str:
+        import base64
+
+        try:
+            return base64.urlsafe_b64decode(data.encode()).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            return ""
+
+    @classmethod
+    def _extract_body(cls, payload: dict[str, Any]) -> str:
+        """Walk the MIME tree, preferring text/plain over de-tagged HTML."""
+        plain, html_body = "", ""
+        stack = [payload]
+        while stack:
+            part = stack.pop()
+            mime = str(part.get("mimeType", ""))
+            body = part.get("body", {}) or {}
+            data = body.get("data")
+            if data:
+                if mime == "text/plain" and not plain:
+                    plain = cls._decode_part(data)
+                elif mime == "text/html" and not html_body:
+                    html_body = cls._decode_part(data)
+            stack.extend(part.get("parts", []) or [])
+
+        text = plain or re.sub(r"<[^>]+>", " ", html_body)
+        return re.sub(r"[ \t\xa0]+", " ", text).strip()[:8000]
+
+    def fetch_unread(self, lookback_days: int, limit: int) -> list[InboxMessage]:
+        query = f"is:unread newer_than:{max(1, lookback_days)}d"
+        listing = self._service.users().messages().list(
+            userId="me", q=query, maxResults=max(1, limit),
+        ).execute()
+
+        out: list[InboxMessage] = []
+        for stub in listing.get("messages", []) or []:
+            # `get` READS a message; it does NOT mark it read. Only an explicit
+            # modify() removing the UNREAD label does that, which is what makes
+            # scanning a personal inbox safe here.
+            msg = self._service.users().messages().get(
+                userId="me", id=stub["id"], format="full",
+            ).execute()
+            payload = msg.get("payload", {}) or {}
+
+            received = None
+            internal = msg.get("internalDate")
+            if internal:
+                try:
+                    received = datetime.fromtimestamp(
+                        int(internal) / 1000, tz=timezone.utc
+                    )
+                except Exception:
+                    received = None
+
+            out.append(InboxMessage(
+                uid=stub["id"],
+                message_id=self._header(payload, "Message-ID") or f"gmail-{stub['id']}",
+                sender=self._header(payload, "From"),
+                subject=self._header(payload, "Subject"),
+                body=self._extract_body(payload),
+                received=received,
+            ))
+        log.info("Gmail API: %d unread message(s) in the last %d days.",
+                 len(out), lookback_days)
+        return out
+
+    def mark_seen(self, message: InboxMessage) -> None:
+        try:
+            self._service.users().messages().modify(
+                userId="me", id=message.uid,
+                body={"removeLabelIds": ["UNREAD"]},
+            ).execute()
+        except Exception as exc:
+            log.debug("Could not mark %s read: %s", message.uid, exc)
+
+
+class ImapBackend(MailBackend):
+    """Legacy IMAP with an App Password. Kept for accounts that still have one."""
+
+    name = "imap"
+
+    def __init__(self, host: str, port: int, mailbox: str,
+                 user: str, password: str) -> None:
+        self.host, self.port, self.mailbox = host, port, mailbox
+        self.user, self.password = user, password
+
+    def account(self) -> str:
+        return self.user
+
     def _connect(self) -> imaplib.IMAP4_SSL:
         if not self.user or not self.password:
             raise RuntimeError(
-                "JOB_EMAIL and JOB_EMAIL_APP_PASSWORD are not set. Create a "
-                "Gmail App Password (Google Account > Security > App passwords) "
-                "and put both in .env."
+                "JOB_EMAIL and JOB_EMAIL_APP_PASSWORD are not set, and no Gmail "
+                "OAuth token exists. Run `python auth_gmail.py`."
             )
-
         conn = imaplib.IMAP4_SSL(
             self.host, self.port, ssl_context=ssl.create_default_context()
         )
@@ -240,34 +361,31 @@ class EmailMonitor:
         except Exception:
             pass
         raise RuntimeError(
-            f"Gmail rejected the credentials for {self.user} ({last}).\n"
-            "Check, in order:\n"
-            "  1. the mailbox exists and you can sign in to it in a browser;\n"
-            "  2. 2-Step Verification is ON (app passwords require it);\n"
-            "  3. the App Password is current -- they are shown once and are\n"
-            "     revoked whenever the account password changes;\n"
-            "  4. IMAP is enabled: Gmail > Settings > Forwarding and POP/IMAP.\n"
-            "Generate a fresh one at https://myaccount.google.com/apppasswords "
-            "and update JOB_EMAIL_APP_PASSWORD in .env."
+            f"{self.host} rejected the credentials for {self.user} ({last}).\n"
+            "Google no longer issues App Passwords on newer accounts -- if the "
+            "setting is missing from your account, that is expected and IMAP "
+            "cannot work. Use the Gmail API instead:\n"
+            "  python auth_gmail.py\n"
+            "Otherwise check: 2-Step Verification is on, the App Password is "
+            "current, and IMAP is enabled in Gmail settings."
         )
 
-    def fetch_unread(self) -> list[InboxMessage]:
-        """Return unread messages WITHOUT marking any of them read."""
+    def fetch_unread(self, lookback_days: int, limit: int) -> list[InboxMessage]:
         conn = self._connect()
         out: list[InboxMessage] = []
         try:
             since = (datetime.now(timezone.utc)
-                     - timedelta(days=self.lookback_days)).strftime("%d-%b-%Y")
-            status, data = conn.search(None, f'(UNSEEN SINCE {since})')
+                     - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
+            status, data = conn.search(None, f"(UNSEEN SINCE {since})")
             if status != "OK":
                 return []
-            uids = (data[0] or b"").split()[-self.max_messages:]
-            log.info("Inbox: %d unread message(s) in the last %d days.",
-                     len(uids), self.lookback_days)
+            uids = (data[0] or b"").split()[-limit:]
+            log.info("IMAP: %d unread message(s) in the last %d days.",
+                     len(uids), lookback_days)
 
             for uid in uids:
-                # BODY.PEEK is the whole point: it does NOT set the \Seen flag,
-                # so scanning the inbox never marks a personal email as read.
+                # BODY.PEEK does NOT set \Seen -- scanning never marks personal
+                # mail as read.
                 status, payload = conn.fetch(uid, "(BODY.PEEK[])")
                 if status != "OK" or not payload or not payload[0]:
                     continue
@@ -297,16 +415,72 @@ class EmailMonitor:
                 pass
         return out
 
-    def _mark_seen(self, uid: str) -> None:
-        if not self.mark_seen:
-            return
+    def mark_seen(self, message: InboxMessage) -> None:
         try:
             conn = self._connect()
-            conn.store(uid.encode(), "+FLAGS", "\\Seen")
+            conn.store(message.uid.encode(), "+FLAGS", "\\Seen")
             conn.close()
             conn.logout()
         except Exception as exc:
-            log.debug("Could not flag uid %s as seen: %s", uid, exc)
+            log.debug("Could not flag uid %s as seen: %s", message.uid, exc)
+
+
+def select_backend() -> MailBackend:
+    """Gmail API if authorised, else IMAP, else a message explaining both."""
+    from auto_apply import gmail_oauth
+
+    if gmail_oauth.is_configured():
+        try:
+            backend = GmailApiBackend()
+            log.info("Mail backend: Gmail API (OAuth2).")
+            return backend
+        except Exception as exc:
+            log.warning("Gmail API unusable (%s); falling back to IMAP.", exc)
+
+    cfg = settings.raw.get("email_monitor", {}) or {}
+    if settings.job_email and settings.job_email_password:
+        log.info("Mail backend: IMAP (App Password).")
+        return ImapBackend(
+            host=cfg.get("imap_host", "imap.gmail.com"),
+            port=int(cfg.get("imap_port", 993)),
+            mailbox=cfg.get("mailbox", "INBOX"),
+            user=settings.job_email,
+            password=settings.job_email_password,
+        )
+
+    raise RuntimeError(
+        "No mailbox access configured.\n"
+        "  Preferred: python auth_gmail.py    (Gmail API over OAuth2)\n"
+        "  Legacy:    set JOB_EMAIL_APP_PASSWORD in .env (older accounts only --\n"
+        "             Google no longer issues App Passwords on new ones)."
+    )
+
+
+class EmailMonitor:
+    """Reads the mailbox, classifies, records and alerts."""
+
+    def __init__(self, store: SecureStore, notifier: Any = None,
+                 backend: MailBackend | None = None):
+        self.store = store
+        self.notifier = notifier
+        cfg = settings.raw.get("email_monitor", {}) or {}
+        self.lookback_days = int(cfg.get("lookback_days", 14))
+        self.max_messages = int(cfg.get("max_messages", 40))
+        self.mark_seen_flag = bool(cfg.get("mark_seen_when_classified", True))
+        self._backend = backend
+
+    @property
+    def backend(self) -> MailBackend:
+        if self._backend is None:
+            self._backend = select_backend()
+        return self._backend
+
+    def fetch_unread(self) -> list[InboxMessage]:
+        return self.backend.fetch_unread(self.lookback_days, self.max_messages)
+
+    def _mark_seen(self, message: InboxMessage) -> None:
+        if self.mark_seen_flag:
+            self.backend.mark_seen(message)
 
     # -- classification -----------------------------------------------------
     def classify(self, message: InboxMessage) -> dict[str, Any]:
@@ -334,37 +508,38 @@ class EmailMonitor:
     def format_alert(result: dict[str, Any], app: dict[str, Any] | None) -> str:
         kind = str(result.get("classification", "other")).lower()
         icon, title = {
-            "interview": ("🎉", "INTERVIEW INVITATION RECEIVED!"),
-            "assessment": ("📋", "ASSESSMENT / TEST RECEIVED"),
-            "rejection": ("📪", "Application closed"),
-            "acknowledgment": ("📨", "Application acknowledged"),
-            "recruiter_outreach": ("📬", "RECRUITER REACHED OUT"),
-        }.get(kind, ("📧", "Job-related email"))
+            "interview": ("\U0001F389", "INTERVIEW INVITATION RECEIVED!"),
+            "assessment": ("\U0001F4CB", "ASSESSMENT / TEST RECEIVED"),
+            "rejection": ("\U0001F4EA", "Application closed"),
+            "acknowledgment": ("\U0001F4E8", "Application acknowledged"),
+            "recruiter_outreach": ("\U0001F4EC", "RECRUITER REACHED OUT"),
+        }.get(kind, ("\U0001F4E7", "Job-related email"))
 
         submitted = "not linked to a tracked application"
         if app:
-            submitted = (f"#{app['id']} — {app.get('role')} via "
+            submitted = (f"#{app['id']} \u2014 {app.get('role')} via "
                          f"{app.get('platform')}, {str(app.get('submitted_at'))[:16]}")
 
         lines = [
             f"{icon} *{title}*",
-            f"🏢 Company: {result.get('company') or '(unknown)'}",
-            f"💼 Role Applied: {result.get('role') or (app or {}).get('role') or '(unknown)'}",
+            f"\U0001F3E2 Company: {result.get('company') or '(unknown)'}",
+            f"\U0001F4BC Role Applied: "
+            f"{result.get('role') or (app or {}).get('role') or '(unknown)'}",
         ]
         if result.get("meeting_datetime"):
-            lines.append(f"📅 Date & Time: {result['meeting_datetime']}")
+            lines.append(f"\U0001F4C5 Date & Time: {result['meeting_datetime']}")
         if result.get("meeting_link"):
-            lines.append(f"🔗 Meeting Link: {result['meeting_link']}")
+            lines.append(f"\U0001F517 Meeting Link: {result['meeting_link']}")
         if result.get("action_required"):
-            lines.append(f"❗ Action: {result['action_required']}")
-        lines.append(f"📄 Submitted Application Data: {submitted}")
+            lines.append(f"\u2757 Action: {result['action_required']}")
+        lines.append(f"\U0001F4C4 Submitted Application Data: {submitted}")
         if result.get("summary"):
             lines.append(f"\n{result['summary']}")
         return "\n".join(lines)
 
     # -- the pass -----------------------------------------------------------
     def run_once(self) -> dict[str, int]:
-        """One sweep. Returns counters."""
+        """One sweep. Returns counters. Never raises."""
         counts = {"scanned": 0, "skipped": 0, "classified": 0, "alerted": 0}
         try:
             messages = self.fetch_unread()
@@ -419,8 +594,12 @@ class EmailMonitor:
                 log.info("Recorded %s from %s (no alert).", kind,
                          result.get("company"))
 
-            self._mark_seen(message.uid)
+            self._mark_seen(message)
 
-        log.info("Inbox pass: %(scanned)d scanned, %(skipped)d not job mail, "
-                 "%(classified)d classified, %(alerted)d alerted.", counts)
+        log.info(
+            "Inbox pass via %s: %d scanned, %d not job mail, %d classified, "
+            "%d alerted.",
+            self.backend.name, counts["scanned"], counts["skipped"],
+            counts["classified"], counts["alerted"],
+        )
         return counts

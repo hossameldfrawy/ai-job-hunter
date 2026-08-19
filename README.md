@@ -169,14 +169,44 @@ letter is ready to paste, and you get the link to apply by hand.
 
 ### Interview monitor
 
-IMAP over `imap.gmail.com:993`, classified by Gemini into interview /
-assessment / rejection / acknowledgment, cross-referenced against your
-applications, pushed to Telegram with the meeting time and joining link already
-extracted.
+Recruiter mail is classified by Gemini into interview / assessment / rejection /
+acknowledgment, cross-referenced against your applications, and pushed to
+Telegram with the meeting time and joining link already extracted.
 
-It is careful with a real mailbox: fetches use `BODY.PEEK`, so scanning never
-marks anything read, and a cheap local filter runs first — a message that does
-not look job-related is never sent to the AI and never stored.
+**Two ways in, chosen automatically:**
+
+| Backend | When | Setup |
+|---|---|---|
+| **Gmail API (OAuth2)** | preferred; the only option on newer accounts | `python auth_gmail.py` |
+| IMAP + App Password | older accounts that still have one | `JOB_EMAIL_APP_PASSWORD` in `.env` |
+
+Google has stopped issuing App Passwords on newly created accounts — the
+setting is simply absent — so OAuth2 is the supported path. It is also better:
+the token is scoped to Gmail alone and can be revoked without changing any
+password.
+
+```bash
+python auth_gmail.py            # one-time browser consent
+python auth_gmail.py --status   # what is authorised
+python auth_gmail.py --revoke   # delete the local token
+```
+
+One-time Google Cloud setup, because OAuth identifies the *application* and no
+credential for that can ship in a public repo:
+
+1. [console.cloud.google.com](https://console.cloud.google.com/) → new project
+2. APIs & Services → Library → enable **Gmail API**
+3. OAuth consent screen → External → add your address under **Test users**
+4. Credentials → Create → **OAuth client ID** → *Desktop app*
+5. Save the JSON as `secrets/gmail_client_secret.json`
+
+Both the client secret and the resulting token are git-ignored; a test asserts
+neither can be committed and that no client secret is embedded in the source.
+
+It is careful with a real mailbox either way. `messages.get` does not mark
+anything read (nor does IMAP's `BODY.PEEK`) — only an explicit label change
+does, and only for mail already classified as job-related. A cheap local filter
+runs first, so a personal email is never sent to the AI at all.
 
 ---
 

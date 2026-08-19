@@ -19,6 +19,10 @@ state/vault.db
 # Playwright persistent profiles: live login cookies for every board.
 state/browser_sessions/
 secrets/vault.key
+# Gmail OAuth: the token IS mailbox access; the client secret
+# identifies the Cloud project. Neither may ever be published.
+secrets/gmail_token.json
+secrets/gmail_client_secret.json
 screenshots/
 state/*.db-wal
 state/*.db-shm

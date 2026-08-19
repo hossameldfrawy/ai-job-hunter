@@ -626,17 +626,17 @@ class TestAppPasswordNormalisation(unittest.TestCase):
 
 class TestInboxFailsSafely(unittest.TestCase):
     def test_missing_credentials_raise_a_useful_message(self):
-        from auto_apply.email_listener import EmailMonitor
+        """Connecting is the backend's job now, not the monitor's."""
+        from auto_apply.email_listener import ImapBackend
 
-        v = _store()
-        try:
-            monitor = EmailMonitor(v, notifier=None)
-            monitor.user, monitor.password = "", ""
-            with self.assertRaises(RuntimeError) as ctx:
-                monitor._connect()
-            self.assertIn("JOB_EMAIL", str(ctx.exception))
-        finally:
-            v.close()
+        backend = ImapBackend(host="imap.gmail.com", port=993, mailbox="INBOX",
+                              user="", password="")
+        with self.assertRaises(RuntimeError) as ctx:
+            backend._connect()
+        message = str(ctx.exception)
+        self.assertIn("JOB_EMAIL", message)
+        self.assertIn("auth_gmail.py", message,
+                      "the error should point at the supported route")
 
     def test_a_failed_pass_returns_zero_counts_rather_than_crashing(self):
         """A dead mailbox must not take down a --daemon or --live process."""

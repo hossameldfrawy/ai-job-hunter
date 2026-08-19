@@ -27,3 +27,10 @@ Telethon==1.44.0
 # a 3.14 desktop.
 playwright>=1.49,<2
 cryptography>=42,<47
+
+# Gmail API over OAuth2. Google no longer issues App Passwords on newer
+# accounts -- the setting is simply absent -- so IMAP is not a route in at all
+# there and this is the only supported way to read the mailbox.
+google-api-python-client>=2.100,<3
+google-auth-httplib2>=0.2,<1
+google-auth-oauthlib>=1.2,<2
