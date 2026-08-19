@@ -446,6 +446,259 @@ def _label_for(page: Any, handle: Any) -> str:
     return " | ".join(p.strip() for p in parts if p and p.strip())[:300]
 
 
+# The control that reveals the real application form.
+#
+# On Tanqeeb -- and on most aggregators -- the job page you land on has NO
+# application form at all. It has a description and a button. The form lives in
+# a modal, a second route, or on the employer's own ATS, and none of it exists
+# in the DOM until that button is clicked. Inspecting the landing page finds
+# only the site's search widget, which `looks_like_application_form` then
+# (correctly) refuses -- and the draft is unsubmittable for a reason that reads
+# like a bug in the detector rather than a step never taken.
+#
+# Ordered most-specific first. A `[data-action=apply]` hook is unambiguous; a
+# link whose text merely contains "apply" might be "apply filters".
+APPLY_SELECTORS: tuple[str, ...] = (
+    '[data-action="apply"]',
+    ".apply-btn",
+    ".btn-apply",
+    "#apply-button",
+    'a[href*="/apply"]',
+    'button:has-text("قدّم الآن")',
+    'button:has-text("قدم الآن")',
+    'a:has-text("قدّم الآن")',
+    'a:has-text("قدم الآن")',
+    'button:has-text("تقدم للوظيفة")',
+    'button:has-text("التقديم")',
+    'button:has-text("Apply Now")',
+    'a:has-text("Apply Now")',
+    # Verified live on Tanqeeb, which renders both as
+    # <a href="javascript:void(0)"> rather than as buttons or real links.
+    'a:has-text("Apply on the Job Website")',
+    'button:has-text("Easy Apply")',
+    'button:has-text("Apply for this job")',
+    'a:has-text("Apply for this job")',
+    'button:has-text("Apply")',
+    'a:has-text("Apply")',
+)
+
+#: Text that means "this is not the apply button", checked before clicking one
+#: whose match was only textual. "Apply filters" and "Applied" are both common
+#: on a board's own search chrome.
+_NOT_APPLY = ("filter", "search", "applied", "sort", "apply coupon",
+              "تصفية", "بحث")
+
+
+def _apply_text_ok(element: Any, selector: str) -> bool:
+    """Guard the loose text-matched selectors against the site's own chrome."""
+    if selector.startswith(("[", ".", "#")):
+        return True                       # explicit hooks need no second guess
+    try:
+        text = (element.inner_text() or "").strip().lower()
+    except Exception:
+        return True                       # unreadable: let the click decide
+    return not any(bad in text for bad in _NOT_APPLY)
+
+
+def _is_clickable(element: Any) -> bool:
+    """Visible and enabled.
+
+    Load-bearing on a real board. Tanqeeb renders "Apply Now" TWICE -- once in
+    the article and once in a sticky bar that is hidden until you scroll -- and
+    `page.click(selector)` picked the hidden one, waited out its actionability
+    timeout, raised, and left the whole flow reporting "no apply control found"
+    on a page that plainly had one.
+    """
+    try:
+        if not element.is_visible():
+            return False
+    except Exception:
+        return True                       # cannot tell: let the click decide
+    try:
+        return element.is_enabled()
+    except Exception:
+        return True
+
+
+def never_automate_hosts() -> tuple[str, ...]:
+    """Domains this project refuses to drive a browser against.
+
+    Read from the same `auto_apply.never_automate` list the engine uses, so
+    the rule is stated once. LinkedIn is on it because its anti-automation
+    enforcement is the strictest of any source here and it is also the most
+    productive one -- a flagged account costs far more than the applications
+    it saved.
+    """
+    raw = (settings.raw.get("auto_apply", {}) or {}).get(
+        "never_automate", ["linkedin"])
+    return tuple(str(x).lower().strip() for x in raw if str(x).strip())
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def is_automatable_url(url: str) -> tuple[bool, str]:
+    """May we drive a browser at this URL? (allowed, why not)."""
+    host = _host_of(url)
+    if not host:
+        return True, ""
+    for banned in never_automate_hosts():
+        if host == banned or host.endswith("." + banned) or banned in host:
+            return False, (
+                f"this application is hosted on {host}, which is never "
+                f"automated: applications there are manual-only, by design"
+            )
+    return True, ""
+
+
+def open_application_form(
+    page: Any, timeout_ms: int = 5000
+) -> tuple[Any, bool, str]:
+    """Click through to the real application view.
+
+    Returns `(page_to_use, opened, note)`. The page comes back because the
+    click routinely opens a NEW TAB rather than changing the current one --
+    verified live on Tanqeeb, where "Apply on the Job Website" pops the
+    employer's own site and leaves the original page untouched. A caller that
+    kept inspecting the original page would see the job description forever and
+    conclude, wrongly, that there is no application form anywhere.
+
+    `opened` is False when there was nothing to click, which is the normal case
+    on a page that already IS the form -- so callers can treat "no apply
+    button" as "already there" rather than as a failure.
+
+    A popup that lands on a never-automate domain is CLOSED and refused. That
+    is not a failure either: it is the LinkedIn rule holding at the one moment
+    it matters, and the note says so in words the user can act on.
+    """
+    already = inspect_form(page)
+    if looks_like_application_form(already)[0]:
+        return page, False, "the page already shows an application form"
+
+    before_url = str(getattr(page, "url", "") or "")
+    context = getattr(page, "context", None)
+
+    def open_pages() -> list[Any]:
+        try:
+            return list(context.pages) if context is not None else []
+        except Exception:
+            return []
+
+    pages_before = open_pages()
+
+    for selector in APPLY_SELECTORS:
+        # Resolve to ELEMENTS, then pick one that can actually be clicked.
+        #
+        # Two reasons this is not `page.click(selector)`:
+        #   * cost -- clicking speculatively down the whole list pays the
+        #     actionability timeout on every MISS, and most of this list misses
+        #     on any given page. Eighteen selectors at 2.5s is forty-five
+        #     seconds of dead waiting; measured live at roughly six minutes per
+        #     job, nearly all of it here.
+        #   * correctness -- a board that renders the same control twice (one
+        #     in the article, one in a sticky bar that is hidden until you
+        #     scroll) hands `page.click` the hidden copy first, which times out
+        #     and takes the whole flow down with it.
+        try:
+            elements = page.query_selector_all(selector) or []
+        except Exception:
+            continue
+
+        clicked_element = False
+        for element in elements:
+            if not _is_clickable(element) or not _apply_text_ok(element, selector):
+                continue
+            try:
+                element.click(timeout=2500)
+                clicked_element = True
+                break
+            except Exception:
+                continue
+        if not clicked_element:
+            continue
+
+        # Let whichever of the three things happen, happen.
+        for settle in (
+            lambda: page.wait_for_load_state("networkidle", timeout=timeout_ms),
+            lambda: page.wait_for_load_state("domcontentloaded",
+                                             timeout=timeout_ms),
+        ):
+            try:
+                settle()
+                break
+            except Exception:
+                continue
+        try:
+            page.wait_for_timeout(800)    # modal animation, lazy form render
+        except Exception:
+            pass
+
+        # Did the click open a NEW TAB? On an aggregator this is the common
+        # case, not the exception.
+        #
+        # POLLED, not checked once. A tab takes a moment to register with the
+        # context, and a single look right after the click misses it -- which
+        # showed up live as "the form opened in place" on a page that had in
+        # fact just popped the employer's site into a second tab.
+        popup = None
+        for _attempt in range(16):
+            popup = next((p for p in open_pages() if p not in pages_before),
+                         None)
+            if popup is not None:
+                break
+            try:
+                page.wait_for_timeout(250)
+            except Exception:
+                break
+        if popup is not None:
+            try:
+                popup.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            except Exception:
+                pass
+            try:
+                popup.wait_for_timeout(800)
+            except Exception:
+                pass
+            popup_url = str(getattr(popup, "url", "") or "")
+
+            allowed, refusal = is_automatable_url(popup_url)
+            if not allowed:
+                # Close it. Leaving a LinkedIn tab open in a persistent,
+                # logged-in browser profile is exactly the footprint the rule
+                # exists to avoid.
+                try:
+                    popup.close()
+                except Exception:
+                    pass
+                log.warning("Refusing the external application: %s", refusal)
+                return page, False, refusal
+
+            log.info("The application opened in a new tab: %s", popup_url[:90])
+            return popup, True, (f"clicked {selector}; the application opened "
+                                 f"in a new tab at {popup_url[:80]}")
+
+        after_url = str(getattr(page, "url", "") or "")
+        moved = after_url and after_url != before_url
+        if moved:
+            allowed, refusal = is_automatable_url(after_url)
+            if not allowed:
+                log.warning("Refusing the external application: %s", refusal)
+                return page, False, refusal
+        detail = (f"clicked {selector} and the page moved to {after_url[:80]}"
+                  if moved else f"clicked {selector}; the form opened in place")
+        log.info("Opened the application view: %s", detail)
+        return page, True, detail
+
+    return page, False, "no apply control found on this page"
+
+
 def inspect_form(page: Any, root_selector: str = "form") -> list[FormField]:
     """Describe every fillable field on the page.
 

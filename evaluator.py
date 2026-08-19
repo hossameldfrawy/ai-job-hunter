@@ -45,6 +45,12 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
+#: The model this project is tuned against, and the only one it should use in
+#: normal operation. Enforced as the head of the chain in `GeminiEvaluator`
+#: even if config.yml says otherwise, so a stale config cannot quietly move the
+#: whole pipeline onto a different model's scoring behaviour.
+PRIMARY_MODEL = "gemini-3.5-flash"
+
 # Gemini uses an OpenAPI 3 subset: type names are UPPERCASE.
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
@@ -209,14 +215,152 @@ def _retry_delay_from(payload: dict[str, Any]) -> float | None:
     return None
 
 
+class RateLimiter:
+    """Paces requests so the free tier's per-minute limit is never reached.
+
+    WHY PACE INSTEAD OF JUST RETRYING
+    ---------------------------------
+    Backoff is a cure; this is the prevention. Measured on this project: a run
+    that leaned on retries alone spent four escalating waits (34s, 57s, 57s,
+    58s) on ONE batch before giving up on the model entirely and falling
+    through the chain. Nearly four minutes of wall clock, no work done, and the
+    run ended on a different model than it started on. Spacing the requests a
+    few seconds apart costs a fraction of that and the 429 never happens.
+
+    ADAPTIVE, because a fixed delay is either too slow or too fast and there is
+    no way to know which in advance:
+
+      * every 429 widens the gap (x1.5, capped), because the current pace is
+        demonstrably too quick for whatever quota is actually in force
+      * a run of clean successes narrows it back toward the floor, so one
+        transient rate-limit does not slow the rest of the run forever
+
+    SHARED ACROSS THREADS on purpose. Batches are evaluated concurrently, and a
+    per-thread limiter would let N threads each send "politely" at the same
+    instant -- which is exactly the burst the quota counts.
+    """
+
+    #: The limiter's own sleep, deliberately NOT `time.sleep` looked up through
+    #: the module. Pacing and backoff are different concerns that happen to
+    #: both wait, and a test that neutralises one must be able to leave the
+    #: other alone -- otherwise "was this retried correctly?" and "was this
+    #: paced correctly?" become the same unanswerable question.
+    _sleep = staticmethod(time.sleep)
+
+    def __init__(self, min_interval: float = 3.5, max_interval: float = 30.0,
+                 recovery_after: int = 5) -> None:
+        self.min_interval = max(0.0, float(min_interval))
+        self.max_interval = max(self.min_interval, float(max_interval))
+        self.interval = self.min_interval
+        self.recovery_after = max(1, int(recovery_after))
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self._clean_streak = 0
+        self.waited_seconds = 0.0
+        self.throttle_events = 0
+
+    def acquire(self) -> float:
+        """Block until it is this caller's turn. Returns the seconds waited.
+
+        The slot is reserved BEFORE sleeping, so two threads arriving together
+        are spaced from each other rather than both waking at the same moment.
+        """
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_allowed)
+            self._next_allowed = start + self.interval
+            delay = start - now
+        if delay > 0:
+            self._sleep(delay)
+            with self._lock:
+                self.waited_seconds += delay
+        return delay
+
+    def penalise(self) -> float:
+        """A 429 happened: the current pace is too fast. Returns the new gap."""
+        with self._lock:
+            self._clean_streak = 0
+            self.throttle_events += 1
+            self.interval = min(self.max_interval, max(
+                self.min_interval, self.interval * 1.5
+            ))
+            return self.interval
+
+    def reward(self) -> None:
+        """A clean response. Ease back toward the floor after a steady run."""
+        with self._lock:
+            self._clean_streak += 1
+            if (self._clean_streak >= self.recovery_after
+                    and self.interval > self.min_interval):
+                self._clean_streak = 0
+                self.interval = max(self.min_interval, self.interval / 1.5)
+
+    def snapshot(self) -> dict[str, float]:
+        with self._lock:
+            return {
+                "interval": round(self.interval, 2),
+                "waited_seconds": round(self.waited_seconds, 1),
+                "throttle_events": float(self.throttle_events),
+            }
+
+
 class GeminiEvaluator:
+    #: model -> monotonic time it may be tried again. PROCESS-WIDE, because
+    #: the quota is per API KEY, not per object -- and `draft_answers` builds a
+    #: fresh evaluator for every application. Without this, each draft re-walks
+    #: the whole chain from the top and pays the full retry ladder again:
+    #: measured live at eight minutes per draft, every draft, once the daily
+    #: allowance was gone.
+    _quota_cooldown: dict[str, float] = {}
+    _cooldown_lock = threading.Lock()
+
+    #: How long a model stays benched after it runs out of quota. Long enough
+    #: that a batch run does not keep probing it, short enough that a daemon
+    #: picks the model back up when the allowance resets.
+    QUOTA_COOLDOWN_SECONDS = 900.0
+
+    @classmethod
+    def _bench(cls, model: str, seconds: float | None = None) -> None:
+        with cls._cooldown_lock:
+            cls._quota_cooldown[model] = time.monotonic() + (
+                cls.QUOTA_COOLDOWN_SECONDS if seconds is None else seconds
+            )
+
+    @classmethod
+    def _benched(cls, model: str) -> bool:
+        with cls._cooldown_lock:
+            until = cls._quota_cooldown.get(model, 0.0)
+        return time.monotonic() < until
+
+    @classmethod
+    def reset_quota_cooldowns(cls) -> None:
+        with cls._cooldown_lock:
+            cls._quota_cooldown.clear()
+
     def __init__(self) -> None:
         cfg = settings.gemini
-        self.models: list[str] = list(cfg.get("model_chain") or ["gemini-2.5-flash"])
+        # gemini-3.5-flash is the model this project is tuned for and the only
+        # one it should normally use. The rest of the chain is a LAST RESORT,
+        # reached only when 3.5-flash has failed hard -- retired, refusing the
+        # key, or out of quota after every retry. See `_generate`.
+        self.models: list[str] = list(cfg.get("model_chain") or [PRIMARY_MODEL])
+        if self.models and self.models[0] != PRIMARY_MODEL:
+            log.warning(
+                "config.yml puts %s ahead of %s in the model chain. The "
+                "primary model is enforced regardless -- reorder the chain to "
+                "silence this.", self.models[0], PRIMARY_MODEL,
+            )
+            self.models = [PRIMARY_MODEL] + [m for m in self.models
+                                             if m != PRIMARY_MODEL]
         self.temperature = float(cfg.get("temperature", 0.15))
         self.max_output_tokens = int(cfg.get("max_output_tokens", 8192))
         self.max_retries = int(cfg.get("max_retries", 4))
         self.backoff_base = float(cfg.get("backoff_base_seconds", 2.5))
+        # One limiter per evaluator, shared by every worker thread it spawns.
+        self.limiter = RateLimiter(
+            min_interval=float(cfg.get("min_request_interval_seconds", 3.5)),
+            max_interval=float(cfg.get("max_request_interval_seconds", 30.0)),
+        )
         self.api_key = settings.gemini_api_key
         self.batch_size = int(settings.engine.get("eval_batch_size", 8))
         self.concurrency = int(settings.engine.get("eval_concurrency", 3))
@@ -237,6 +381,9 @@ class GeminiEvaluator:
         last = ""
 
         for attempt in range(self.max_retries):
+            # Pace BEFORE sending, every time, including retries. This is the
+            # prevention; the backoff below is only the cure.
+            self.limiter.acquire()
             try:
                 resp = http_client.session().post(
                     url,
@@ -252,6 +399,7 @@ class GeminiEvaluator:
             with self._counter_lock:
                 self.calls_made += 1
             if resp.status_code == 200:
+                self.limiter.reward()
                 return resp.json()
 
             try:
@@ -266,6 +414,13 @@ class GeminiEvaluator:
                 raise GeminiError(last)
 
             if resp.status_code in (429, 500, 502, 503, 504):
+                if resp.status_code == 429:
+                    # The pace itself was too fast. Widen the gap for every
+                    # later request, not just this retry -- otherwise the next
+                    # batch walks into the same wall.
+                    spacing = self.limiter.penalise()
+                    log.info("Rate limit hit; spacing requests %.1fs apart "
+                             "from now on.", spacing)
                 wait = _retry_delay_from(payload) or (
                     self.backoff_base * (2**attempt) + random.uniform(0, 1.5)
                 )
@@ -282,6 +437,24 @@ class GeminiEvaluator:
             raise QuotaExhausted(last)
         raise GeminiError(f"exhausted retries -- {last}")
 
+    def _note_fallback(self, model: str, reason: str) -> None:
+        """Say clearly when we leave the primary model, and why.
+
+        Falling off `gemini-3.5-flash` used to be a single WARNING that read
+        like routine chatter, so a run that silently finished on a different
+        model looked identical to one that did not. It is not routine: the
+        rubric in SYSTEM_INSTRUCTION is calibrated against this model, and a
+        different one scores the same posting differently.
+        """
+        if model == PRIMARY_MODEL:
+            log.error(
+                "PRIMARY MODEL FAILED HARD -- %s: %s. Falling back down the "
+                "chain; this run's scores will not be directly comparable.",
+                model, reason,
+            )
+        else:
+            log.warning("Fallback model %s also unavailable (%s).", model, reason)
+
     def _generate(self, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         """Try the model chain until one answers."""
         chain = (
@@ -289,6 +462,16 @@ class GeminiEvaluator:
             if self._preferred
             else list(self.models)
         )
+        # Skip models known to be out of quota -- unless that would leave
+        # nothing to try, in which case attempt them anyway. A stale cooldown
+        # must never be the reason a run does no work at all.
+        live = [m for m in chain if not self._benched(m)]
+        if live:
+            skipped = [m for m in chain if m not in live]
+            if skipped:
+                log.info("Skipping %s: still out of quota.", ", ".join(skipped))
+            chain = live
+
         errors: list[str] = []
         # Whether any model in the chain refused for QUOTA reasons specifically.
         # This has to survive the loop. `QuotaExhausted` is a `GeminiError`, so
@@ -305,12 +488,23 @@ class GeminiEvaluator:
             except QuotaExhausted as exc:
                 quota_blocked = True
                 errors.append(f"{model}: {exc}")
-                log.warning("Gemini model %s is out of quota -- trying next.", model)
+                self._bench(model)
+                self._note_fallback(
+                    model,
+                    f"out of quota after every retry -- benched for "
+                    f"{int(self.QUOTA_COOLDOWN_SECONDS / 60)} min",
+                )
                 continue
             except GeminiError as exc:
                 errors.append(f"{model}: {exc}")
-                log.warning("Gemini model %s unavailable -- trying next.", model)
+                self._note_fallback(model, str(exc)[:120])
                 continue
+            if model != PRIMARY_MODEL:
+                log.warning(
+                    "Serving this request with %s, NOT %s. Scores from a "
+                    "different model are not directly comparable with the "
+                    "rest of the run.", model, PRIMARY_MODEL,
+                )
             self._preferred = model
             usage = payload.get("usageMetadata") or {}
             with self._counter_lock:
@@ -527,9 +721,14 @@ class GeminiEvaluator:
                         log.warning("on_batch callback failed: %s", exc)
                 log.info("Gemini progress: %d/%d batches", done, total)
 
+        pacing = self.limiter.snapshot()
         log.info(
-            "Evaluation complete: %d verdicts, %d API call(s), ~%d tokens.",
+            "Evaluation complete: %d verdicts, %d API call(s), ~%d tokens, "
+            "model %s. Rate limiter: %.1fs spacing, %.0f throttle event(s), "
+            "%.0fs spent pacing.",
             len(results), self.calls_made, self.tokens_used,
+            self._preferred or PRIMARY_MODEL, pacing["interval"],
+            pacing["throttle_events"], pacing["waited_seconds"],
         )
         return results
 

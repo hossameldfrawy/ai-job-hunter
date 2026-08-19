@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -593,3 +594,390 @@ class TestBrowserFallbacks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+class ApplyPage:
+    """A job page whose application form only exists after a click."""
+
+    def __init__(self, controls=(), fields_before=None, fields_after=None,
+                 url="https://egypt.tanqeeb.com/jobs/1.html",
+                 new_url="", control_text=None, popup_url=""):
+        self.controls = tuple(controls)
+        self.fields_before = list(fields_before or [])
+        self.fields_after = list(fields_after or [])
+        self.url = url
+        self.new_url = new_url
+        self.control_text = dict(control_text or {})
+        self.clicked = []
+        self.waited = []
+        self.opened = False
+        self.popup_url = popup_url
+        self.context = _FakeContext(self)
+        self.closed = False
+
+    # -- what inspect_form will be handed -------------------------------
+    @property
+    def fields(self):
+        return self.fields_after if self.opened else self.fields_before
+
+    def query_selector_all(self, selector):
+        if selector not in self.controls:
+            return []
+        # A board that renders the same control twice -- one hidden in a
+        # sticky bar, one visible in the article -- is the case that broke
+        # `page.click(selector)` on the real Tanqeeb page.
+        hidden = _FakeControl(self.control_text.get(selector, "Apply Now"),
+                              page=self, selector=selector, visible=False)
+        shown = _FakeControl(self.control_text.get(selector, "Apply Now"),
+                             page=self, selector=selector, visible=True)
+        return [hidden, shown]
+
+    def _register_click(self, selector):
+        self.clicked.append(selector)
+        self.opened = True
+        if self.new_url:
+            self.url = self.new_url
+        if self.popup_url:
+            # Verified live on Tanqeeb: the apply control opens a NEW TAB and
+            # leaves the original page untouched.
+            self.context.pages.append(
+                ApplyPage(url=self.popup_url, fields_before=APPLY_FORM,
+                          fields_after=APPLY_FORM)
+            )
+
+    def wait_for_load_state(self, state, timeout=None):
+        self.waited.append(state)
+
+    def wait_for_timeout(self, ms):
+        self.waited.append(f"timeout:{ms}")
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeContext:
+    """Just the pages list -- popup detection is all `open_application_form`
+    asks a context for."""
+
+    def __init__(self, page):
+        self.pages = [page]
+
+
+class _FakeControl:
+    def __init__(self, text, page=None, selector="", visible=True,
+                 enabled=True, raises=False):
+        self._text = text
+        self._page = page
+        self._selector = selector
+        self._visible = visible
+        self._enabled = enabled
+        self._raises = raises
+
+    def inner_text(self):
+        return self._text
+
+    def is_visible(self):
+        return self._visible
+
+    def is_enabled(self):
+        return self._enabled
+
+    def click(self, timeout=None):
+        if self._raises:
+            raise RuntimeError("intercepted by an overlay")
+        if self._page is not None:
+            self._page._register_click(self._selector)
+
+
+APPLY_FORM = [
+    FormField(selector="#cv", kind="resume", input_type="file",
+              label="Upload CV"),
+    FormField(selector="#cover", kind="cover_letter", input_type="textarea",
+              label="Cover letter"),
+]
+
+SEARCH_WIDGET = [
+    FormField(selector='[name="keywords"]', kind="unknown", input_type="text",
+              label="keywords | Search jobs"),
+]
+
+
+@contextmanager
+def _inspecting(page):
+    """Point inspect_form at whatever stage the fake page is currently in."""
+    original = browser_mod.inspect_form
+    browser_mod.inspect_form = lambda p, *a, **k: list(p.fields)
+    try:
+        yield
+    finally:
+        browser_mod.inspect_form = original
+
+
+class TestOpenApplicationForm(unittest.TestCase):
+    """On an aggregator the landing page has a button, not a form."""
+
+    def test_the_apply_button_is_clicked_and_the_form_appears(self):
+        page = ApplyPage(controls=('button:has-text("قدّم الآن")',),
+                         fields_before=SEARCH_WIDGET,
+                         fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+            self.assertTrue(opened, note)
+            self.assertTrue(
+                browser_mod.looks_like_application_form(page.fields)[0]
+            )
+        self.assertEqual(page.clicked, ['button:has-text("قدّم الآن")'])
+
+    def test_a_page_that_is_already_the_form_is_left_alone(self):
+        """Clicking anything here risks pressing submit on a real form."""
+        page = ApplyPage(controls=('button:has-text("Apply")',),
+                         fields_before=APPLY_FORM, fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertEqual(page.clicked, [])
+        self.assertIn("already", note)
+
+    def test_a_page_with_no_apply_control_reports_it_without_failing(self):
+        page = ApplyPage(controls=(), fields_before=SEARCH_WIDGET,
+                         fields_after=SEARCH_WIDGET)
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertIn("no apply control", note)
+
+    def test_every_documented_selector_is_covered(self):
+        for selector in ('[data-action="apply"]', ".apply-btn",
+                         'button:has-text("Apply")',
+                         'a:has-text("Apply Now")',
+                         'button:has-text("قدّم الآن")',
+                         'a:has-text("قدّم الآن")'):
+            with self.subTest(selector=selector):
+                self.assertIn(selector, browser_mod.APPLY_SELECTORS)
+
+    def test_it_waits_for_the_dom_to_settle_after_clicking(self):
+        """A modal animating in, or a redirect, is not synchronous."""
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        with _inspecting(page):
+            browser_mod.open_application_form(page)
+        self.assertIn("networkidle", page.waited)
+        self.assertTrue(any(str(w).startswith("timeout:") for w in page.waited))
+
+    def test_a_redirect_to_an_external_ats_is_reported(self):
+        page = ApplyPage(controls=('a[href*="/apply"]',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+                         new_url="https://boards.greenhouse.io/acme/jobs/1")
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+        self.assertIn("greenhouse.io", note)
+
+    def test_a_search_filter_button_is_not_mistaken_for_apply(self):
+        """"Apply filters" is on almost every board's search chrome."""
+        page = ApplyPage(controls=('button:has-text("Apply")',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+                         control_text={'button:has-text("Apply")':
+                                       "Apply filters"})
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertEqual(page.clicked, [])
+
+    def test_an_already_applied_button_is_not_clicked(self):
+        page = ApplyPage(controls=('button:has-text("Apply")',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+                         control_text={'button:has-text("Apply")': "Applied"})
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+
+    def test_an_explicit_data_hook_is_trusted_without_a_text_check(self):
+        page = ApplyPage(controls=('[data-action="apply"]',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+                         control_text={'[data-action="apply"]': ""})
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+
+    def test_the_most_specific_selector_wins(self):
+        """A data hook is unambiguous; loose text matching is a last resort."""
+        page = ApplyPage(
+            controls=('[data-action="apply"]', 'button:has-text("Apply")'),
+            fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+        )
+        with _inspecting(page):
+            browser_mod.open_application_form(page)
+        self.assertEqual(page.clicked, ['[data-action="apply"]'])
+
+    def test_a_click_that_throws_moves_on_to_the_next_selector(self):
+        class Stubborn(ApplyPage):
+            def query_selector_all(self, selector):
+                elements = super().query_selector_all(selector)
+                if selector == ".apply-btn":
+                    for element in elements:
+                        element._raises = True
+                return elements
+
+        page = Stubborn(controls=(".apply-btn", 'button:has-text("Apply")'),
+                        fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+        self.assertEqual(page.clicked, ['button:has-text("Apply")'])
+
+    def test_a_hidden_duplicate_control_does_not_block_the_visible_one(self):
+        """Tanqeeb renders "Apply Now" twice -- once in the article and once in
+        a sticky bar hidden until you scroll. `page.click(selector)` picked the
+        hidden one, timed out, and reported "no apply control found" on a page
+        that plainly had one."""
+        page = ApplyPage(controls=('a:has-text("Apply Now")',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertTrue(opened, note)
+        self.assertEqual(page.clicked, ['a:has-text("Apply Now")'])
+
+    def test_a_disabled_control_is_skipped(self):
+        page = ApplyPage(controls=('button:has-text("Apply")',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        original = page.query_selector_all
+
+        def all_disabled(selector):
+            elements = original(selector)
+            for element in elements:
+                element._enabled = False
+            return elements
+
+        page.query_selector_all = all_disabled
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertEqual(page.clicked, [])
+
+    def test_the_real_tanqeeb_control_shape_is_covered(self):
+        """Verified live: <a href="javascript:void(0)">Apply Now</a>."""
+        self.assertIn('a:has-text("Apply Now")', browser_mod.APPLY_SELECTORS)
+        self.assertIn('a:has-text("Apply on the Job Website")',
+                      browser_mod.APPLY_SELECTORS)
+
+    def test_a_page_that_cannot_be_waited_on_still_counts_as_opened(self):
+        class NoWait(ApplyPage):
+            def wait_for_load_state(self, state, timeout=None):
+                raise RuntimeError("navigation already finished")
+
+        page = NoWait(controls=('.apply-btn',), fields_before=SEARCH_WIDGET,
+                      fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+
+
+class TestApplyOpensANewTab(unittest.TestCase):
+    """Verified live on Tanqeeb: the apply control pops a new tab.
+
+    A caller that kept inspecting the ORIGINAL page would read the job
+    description forever and conclude, wrongly, that there is no application
+    form anywhere -- which is exactly what every refused draft said.
+    """
+
+    def test_the_returned_page_is_the_new_tab(self):
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=SEARCH_WIDGET,
+                         popup_url="https://boards.greenhouse.io/acme/jobs/1")
+        with _inspecting(page):
+            active, opened, note = browser_mod.open_application_form(page)
+        self.assertTrue(opened, note)
+        self.assertIsNot(active, page, "still inspecting the original page")
+        self.assertIn("greenhouse.io", active.url)
+        self.assertIn("new tab", note)
+
+    def test_the_new_tabs_form_is_what_gets_inspected(self):
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=SEARCH_WIDGET,
+                         popup_url="https://boards.greenhouse.io/acme/jobs/1")
+        with _inspecting(page):
+            active, _opened, _note = browser_mod.open_application_form(page)
+            self.assertTrue(
+                browser_mod.looks_like_application_form(active.fields)[0]
+            )
+
+    def test_a_linkedin_popup_is_refused_and_closed(self):
+        """The posting is syndicated FROM LinkedIn, so applying means applying
+        on LinkedIn -- which this project never automates. Leaving the tab open
+        in a persistent logged-in profile is the footprint the rule exists to
+        avoid."""
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=SEARCH_WIDGET,
+                         popup_url="https://www.linkedin.com/jobs/view/4446628803")
+        with _inspecting(page):
+            active, opened, note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertIs(active, page)
+        self.assertIn("never automated", note)
+        self.assertIn("linkedin.com", note)
+        self.assertTrue(page.context.pages[-1].closed,
+                        "the refused tab was left open")
+
+    def test_an_in_place_redirect_to_linkedin_is_also_refused(self):
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM,
+                         new_url="https://www.linkedin.com/jobs/view/1")
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertFalse(opened)
+        self.assertIn("never automated", note)
+
+    def test_an_ordinary_ats_popup_is_allowed(self):
+        for url in ("https://boards.greenhouse.io/a/jobs/1",
+                    "https://jobs.lever.co/a/b",
+                    "https://acme.wd1.myworkdayjobs.com/x",
+                    "https://acme-corp.com/careers/1"):
+            with self.subTest(url=url):
+                page = ApplyPage(controls=('.apply-btn',),
+                                 fields_before=SEARCH_WIDGET,
+                                 fields_after=SEARCH_WIDGET, popup_url=url)
+                with _inspecting(page):
+                    _a, opened, _n = browser_mod.open_application_form(page)
+                self.assertTrue(opened, url)
+
+    def test_a_page_with_no_context_still_works(self):
+        """Popup detection must degrade, not crash, on a page double that has
+        no context attached."""
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        page.context = None
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+
+
+class TestNeverAutomateUrls(unittest.TestCase):
+    def test_linkedin_in_every_shape(self):
+        for url in ("https://www.linkedin.com/jobs/view/1",
+                    "https://linkedin.com/jobs/view/1",
+                    "https://ae.linkedin.com/jobs/view/1",
+                    "https://LINKEDIN.com/jobs/view/1"):
+            with self.subTest(url=url):
+                allowed, why = browser_mod.is_automatable_url(url)
+                self.assertFalse(allowed, url)
+                self.assertIn("manual-only", why)
+
+    def test_ordinary_boards_are_allowed(self):
+        for url in ("https://egypt.tanqeeb.com/jobs/1.html",
+                    "https://wuzzuf.net/jobs/p/1",
+                    "https://boards.greenhouse.io/a/jobs/1",
+                    ""):
+            with self.subTest(url=url):
+                self.assertTrue(browser_mod.is_automatable_url(url)[0], url)
+
+    def test_the_rule_is_read_from_the_same_config_the_engine_uses(self):
+        """Stated once, so the two cannot disagree about what is banned."""
+        from auto_apply.engine import is_automatable
+
+        self.assertIn("linkedin", browser_mod.never_automate_hosts())
+        self.assertFalse(is_automatable("linkedin")[0])
+        self.assertFalse(
+            browser_mod.is_automatable_url("https://linkedin.com/x")[0]
+        )

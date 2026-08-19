@@ -38,9 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import evaluator as evaluator_mod                                # noqa: E402
 import http_client                                               # noqa: E402
+from config import settings                                      # noqa: E402
 from evaluator import (                                          # noqa: E402
-    GeminiError, GeminiEvaluator, QuotaExhausted, RESPONSE_SCHEMA,
-    SYSTEM_INSTRUCTION, _retry_delay_from,
+    PRIMARY_MODEL, GeminiError, GeminiEvaluator, QuotaExhausted,
+    RESPONSE_SCHEMA, RateLimiter, SYSTEM_INSTRUCTION, _retry_delay_from,
 )
 from models import Evaluation, JobPost                           # noqa: E402
 
@@ -73,19 +74,40 @@ class FakeSession:
 
 
 @contextmanager
-def scripted(responses):
-    """Replace the HTTP session and neutralise every backoff sleep."""
+def scripted(responses, pace: float = 0.0):
+    """Replace the HTTP session and neutralise every sleep.
+
+    `pace` sets the rate limiter's floor and defaults to ZERO. The limiter
+    sleeps through the same `time.sleep` these tests record, so leaving it at
+    its production 3.5s would fold pacing delays into the backoff assertions
+    and make "was this retried correctly?" unanswerable. The limiter's own
+    behaviour is tested directly in TestRateLimiter instead.
+    """
     session = FakeSession(responses)
     original_session = http_client.session
     original_sleep = evaluator_mod.time.sleep
+    original_pace = evaluator_mod.RateLimiter._sleep
+    original_gemini = dict(settings.raw.get("gemini", {}) or {})
+    paced: list[float] = []
     slept: list[float] = []
     http_client.session = lambda: session
     evaluator_mod.time.sleep = slept.append
+    # The limiter has its own sleep seam, so pacing can be neutralised without
+    # hiding the backoff these tests are actually about.
+    evaluator_mod.RateLimiter._sleep = staticmethod(paced.append)
+    settings.raw["gemini"] = dict(original_gemini,
+                                  min_request_interval_seconds=pace,
+                                  # Headroom to widen into: a ceiling equal to
+                                  # the floor makes penalise() a no-op.
+                                  max_request_interval_seconds=max(pace * 10,
+                                                                   30.0))
     try:
         yield session, slept
     finally:
         http_client.session = original_session
         evaluator_mod.time.sleep = original_sleep
+        evaluator_mod.RateLimiter._sleep = original_pace
+        settings.raw["gemini"] = original_gemini
 
 
 def _ok(evaluations):
@@ -556,3 +578,278 @@ class TestSelftest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+class TestPrimaryModelEnforcement(unittest.TestCase):
+    """One model, deliberately. The rubric is calibrated against it."""
+
+    def test_the_primary_is_gemini_3_5_flash(self):
+        self.assertEqual(PRIMARY_MODEL, "gemini-3.5-flash")
+
+    def test_it_leads_the_chain_as_configured(self):
+        with scripted([]):
+            self.assertEqual(GeminiEvaluator().models[0], PRIMARY_MODEL)
+
+    def test_a_config_that_demotes_it_is_corrected_and_warned_about(self):
+        """A stale config must not quietly move the whole pipeline onto a
+        different model's scoring behaviour."""
+        original = dict(settings.raw.get("gemini", {}) or {})
+        settings.raw["gemini"] = dict(
+            original, model_chain=["gemini-2.5-flash", PRIMARY_MODEL])
+        try:
+            with self.assertLogs("evaluator", level="WARNING") as captured:
+                evaluator = GeminiEvaluator()
+        finally:
+            settings.raw["gemini"] = original
+        self.assertEqual(evaluator.models[0], PRIMARY_MODEL)
+        self.assertIn(PRIMARY_MODEL, "\n".join(captured.output))
+
+    def test_the_primary_is_never_duplicated_when_promoted(self):
+        original = dict(settings.raw.get("gemini", {}) or {})
+        settings.raw["gemini"] = dict(
+            original, model_chain=["gemini-2.5-flash", PRIMARY_MODEL])
+        try:
+            models = GeminiEvaluator().models
+        finally:
+            settings.raw["gemini"] = original
+        self.assertEqual(models.count(PRIMARY_MODEL), 1)
+
+    def test_an_empty_chain_falls_back_to_the_primary_not_an_old_model(self):
+        original = dict(settings.raw.get("gemini", {}) or {})
+        settings.raw["gemini"] = dict(original, model_chain=[])
+        try:
+            self.assertEqual(GeminiEvaluator().models, [PRIMARY_MODEL])
+        finally:
+            settings.raw["gemini"] = original
+
+    def test_the_primary_is_used_when_it_answers(self):
+        with scripted([_ok([_verdict(0)])]) as (session, _):
+            GeminiEvaluator().evaluate_batch([_job(1)], CV)
+        self.assertIn(PRIMARY_MODEL, session.requests[0]["url"])
+
+    def test_a_transient_429_does_NOT_move_off_the_primary(self):
+        """Only a HARD failure may change model. A rate limit is not one --
+        switching on it would silently rescore the run on a different rubric."""
+        with scripted([FakeResponse(429, {}), _ok([_verdict(0)])]) as (s, _):
+            evaluator = GeminiEvaluator()
+            evaluator.evaluate_batch([_job(1)], CV)
+        self.assertTrue(all(PRIMARY_MODEL in r["url"] for r in s.requests),
+                        [r["url"] for r in s.requests])
+        self.assertEqual(evaluator._preferred, PRIMARY_MODEL)
+
+    def test_leaving_the_primary_is_logged_as_an_error_not_a_shrug(self):
+        """It used to be one WARNING among many, so a run that finished on a
+        different model looked identical to one that did not."""
+        with scripted([FakeResponse(404, {}, "gone"), _ok([_verdict(0)])]):
+            with self.assertLogs("evaluator", level="ERROR") as captured:
+                GeminiEvaluator().evaluate_batch([_job(1)], CV)
+        joined = "\n".join(captured.output)
+        self.assertIn("PRIMARY MODEL FAILED HARD", joined)
+        self.assertIn(PRIMARY_MODEL, joined)
+
+
+class TestRateLimiter(unittest.TestCase):
+    """Prevention, not cure: the 429 should never happen in the first place."""
+
+    def _limiter(self, **kwargs):
+        limiter = RateLimiter(**kwargs)
+        limiter.slept = []
+        limiter._sleep = limiter.slept.append
+        return limiter
+
+    def test_the_first_request_is_not_delayed(self):
+        limiter = self._limiter(min_interval=3.5)
+        self.assertEqual(limiter.acquire(), 0)
+        self.assertEqual(limiter.slept, [])
+
+    def test_subsequent_requests_are_spaced(self):
+        limiter = self._limiter(min_interval=3.5)
+        limiter.acquire()
+        delay = limiter.acquire()
+        self.assertAlmostEqual(delay, 3.5, delta=0.2)
+        self.assertEqual(len(limiter.slept), 1)
+
+    def test_a_429_widens_the_gap_for_every_later_request(self):
+        """Otherwise the next batch walks into the same wall."""
+        limiter = self._limiter(min_interval=4.0)
+        self.assertAlmostEqual(limiter.penalise(), 6.0, delta=0.01)
+        self.assertAlmostEqual(limiter.penalise(), 9.0, delta=0.01)
+        self.assertEqual(limiter.throttle_events, 2)
+
+    def test_the_gap_is_capped(self):
+        limiter = self._limiter(min_interval=4.0, max_interval=10.0)
+        for _ in range(20):
+            limiter.penalise()
+        self.assertLessEqual(limiter.interval, 10.0)
+
+    def test_a_clean_streak_eases_the_pace_back_down(self):
+        """One transient rate limit must not slow the whole rest of the run."""
+        limiter = self._limiter(min_interval=4.0, recovery_after=3)
+        limiter.penalise()
+        widened = limiter.interval
+        for _ in range(3):
+            limiter.reward()
+        self.assertLess(limiter.interval, widened)
+
+    def test_it_never_eases_below_the_floor(self):
+        limiter = self._limiter(min_interval=4.0, recovery_after=1)
+        for _ in range(50):
+            limiter.reward()
+        self.assertAlmostEqual(limiter.interval, 4.0, delta=0.01)
+
+    def test_concurrent_callers_are_spaced_from_each_other(self):
+        """A per-thread limiter would let N threads each send politely at the
+        same instant -- which is exactly the burst the quota counts."""
+        import threading
+
+        limiter = self._limiter(min_interval=2.0)
+        delays = []
+        lock = threading.Lock()
+
+        def worker():
+            delay = limiter.acquire()
+            with lock:
+                delays.append(delay)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # Four callers spaced 2s apart: 0, 2, 4, 6.
+        self.assertAlmostEqual(max(delays), 6.0, delta=0.5)
+        self.assertEqual(len(delays), 4)
+
+    def test_a_zero_interval_disables_pacing_entirely(self):
+        limiter = self._limiter(min_interval=0.0)
+        for _ in range(5):
+            limiter.acquire()
+        self.assertEqual(limiter.slept, [])
+
+    def test_the_snapshot_reports_what_pacing_cost(self):
+        limiter = self._limiter(min_interval=1.0)
+        limiter.acquire()
+        limiter.acquire()
+        limiter.penalise()
+        snapshot = limiter.snapshot()
+        self.assertGreater(snapshot["waited_seconds"], 0)
+        self.assertEqual(snapshot["throttle_events"], 1.0)
+
+    def test_the_evaluator_paces_every_request_including_retries(self):
+        with scripted([FakeResponse(429, {}), _ok([_verdict(0)])],
+                      pace=2.0) as (session, _):
+            evaluator = GeminiEvaluator()
+            paced = []
+            evaluator.limiter._sleep = paced.append
+            evaluator.evaluate_batch([_job(1)], CV)
+        self.assertEqual(len(session.requests), 2)
+        self.assertTrue(paced, "the retry was sent without pacing")
+
+    def test_a_429_widens_the_evaluators_own_limiter(self):
+        with scripted([FakeResponse(429, {}), _ok([_verdict(0)])],
+                      pace=2.0) as (_session, _slept):
+            evaluator = GeminiEvaluator()
+            evaluator.limiter._sleep = lambda _d: None
+            before = evaluator.limiter.interval
+            evaluator.evaluate_batch([_job(1)], CV)
+        self.assertGreater(evaluator.limiter.interval, before)
+
+
+class TestQuotaCooldown(unittest.TestCase):
+    """A spent daily allowance must be paid for ONCE, not once per draft.
+
+    `draft_answers` builds a fresh evaluator for every application, so without
+    a process-wide memory each one re-walks the chain from the top and pays the
+    full retry ladder again. Measured live once the allowance was gone: eight
+    minutes per draft, every draft, to reach the same conclusion.
+    """
+
+    def setUp(self):
+        GeminiEvaluator.reset_quota_cooldowns()
+        self.addCleanup(GeminiEvaluator.reset_quota_cooldowns)
+
+    def _exhaust(self, evaluator):
+        retries = [FakeResponse(429, {})] * evaluator.max_retries
+
+        def responses(models):
+            return retries * models
+
+        return responses
+
+    def test_a_quota_failure_benches_the_model(self):
+        with scripted([FakeResponse(429, {})] * 4):
+            evaluator = GeminiEvaluator()
+            evaluator.models = ["only"]
+            with self.assertRaises(QuotaExhausted):
+                evaluator.evaluate_batch([_job(1)], CV)
+        self.assertTrue(GeminiEvaluator._benched("only"))
+
+    def test_a_benched_model_is_not_tried_again(self):
+        """The whole point: the second draft must not repeat the ladder."""
+        with scripted([FakeResponse(429, {})] * 4):
+            first = GeminiEvaluator()
+            first.models = ["spent", "working"]
+            # `spent` burns its retries, then `working` has no response left
+            # and returns the default 200 envelope.
+            try:
+                first.evaluate_batch([_job(1)], CV)
+            except Exception:
+                pass
+        self.assertTrue(GeminiEvaluator._benched("spent"))
+
+        with scripted([_ok([_verdict(0)])]) as (session, _):
+            second = GeminiEvaluator()
+            second.models = ["spent", "working"]
+            second.evaluate_batch([_job(1)], CV)
+        self.assertEqual(len(session.requests), 1, "the benched model was retried")
+        self.assertIn("working", session.requests[0]["url"])
+
+    def test_the_bench_is_shared_across_evaluator_instances(self):
+        GeminiEvaluator._bench("shared-model")
+        self.assertTrue(GeminiEvaluator()._benched("shared-model"))
+
+    def test_an_expired_bench_lets_the_model_back_in(self):
+        """A daemon must pick the model up again when the allowance resets."""
+        GeminiEvaluator._bench("temporarily-out", seconds=-1)
+        self.assertFalse(GeminiEvaluator._benched("temporarily-out"))
+
+    def test_benching_everything_does_not_stop_the_run(self):
+        """A stale cooldown must never be the reason no work happens at all."""
+        GeminiEvaluator._bench("a")
+        GeminiEvaluator._bench("b")
+        with scripted([_ok([_verdict(0)])]) as (session, _):
+            evaluator = GeminiEvaluator()
+            evaluator.models = ["a", "b"]
+            [ev] = evaluator.evaluate_batch([_job(1)], CV)
+        self.assertEqual(ev.match_score, 88)
+        self.assertTrue(session.requests, "nothing was attempted at all")
+
+    def test_skipping_a_benched_model_is_logged(self):
+        GeminiEvaluator._bench("spent")
+        with scripted([_ok([_verdict(0)])]):
+            with self.assertLogs("evaluator", level="INFO") as captured:
+                evaluator = GeminiEvaluator()
+                evaluator.models = ["spent", "working"]
+                evaluator.evaluate_batch([_job(1)], CV)
+        self.assertIn("out of quota", "\n".join(captured.output))
+
+    def test_a_non_quota_failure_does_not_bench_anything(self):
+        """A retired model is a different problem from a spent allowance, and
+        benching on 404 would hide a config error behind a 15-minute silence."""
+        with scripted([FakeResponse(404, {}, "gone"), _ok([_verdict(0)])]):
+            evaluator = GeminiEvaluator()
+            evaluator.models = ["retired", "working"]
+            evaluator.evaluate_batch([_job(1)], CV)
+        self.assertFalse(GeminiEvaluator._benched("retired"))
+
+    def test_the_bench_message_says_how_long(self):
+        with scripted([FakeResponse(429, {})] * 4):
+            with self.assertLogs("evaluator", level="ERROR") as captured:
+                evaluator = GeminiEvaluator()
+                evaluator.models = [PRIMARY_MODEL]
+                try:
+                    evaluator.evaluate_batch([_job(1)], CV)
+                except Exception:
+                    pass
+        self.assertIn("benched for", "\n".join(captured.output))

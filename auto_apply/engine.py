@@ -367,7 +367,7 @@ def prepare_application(
 
     from auto_apply.browser import (
         browser_page, detect_ats, has_saved_session, inspect_form,
-        looks_like_application_form,
+        looks_like_application_form, open_application_form,
     )
     from auto_apply.profile_builder import platform_for_source
 
@@ -385,11 +385,28 @@ def prepare_application(
             # (correctly) refuses, leaving a draft that can never be submitted.
             with browser_page(session_key) as page:
                 page.goto(ev.direct_link, wait_until="domcontentloaded")
-                fields = inspect_form(page)
-                ats = detect_ats(page)
-                form_ok, form_note = looks_like_application_form(fields)
+                # The description is read from the LANDING page, before any
+                # click: that is where the posting's own text lives, and the
+                # application view usually replaces it with a bare form.
                 if not job_description:
                     job_description = page.inner_text("body")[:6000]
+                # Click through to the real form FIRST. On an aggregator the
+                # landing page has no application form at all -- only a button
+                # -- so inspecting it here finds the site search and the draft
+                # is born unsubmittable.
+                # The click can open a NEW TAB, so the page to inspect is
+                # whatever comes back -- not necessarily the one we started on.
+                apply_page, opened, open_note = open_application_form(page)
+                fields = inspect_form(apply_page)
+                ats = detect_ats(apply_page)
+                form_ok, form_note = looks_like_application_form(fields)
+                if opened:
+                    form_note = f"{form_note} ({open_note})"
+                elif "never automated" in open_note:
+                    # A refusal, not a detection failure. Say which it is:
+                    # "no form here" and "this one is LinkedIn's" need
+                    # completely different responses from the reader.
+                    form_ok, form_note = False, open_note
         except Exception as exc:
             log.warning("Could not inspect the application form: %s", exc)
             form_note = f"inspection failed: {exc}"
@@ -521,7 +538,7 @@ def submit_application(
     from auto_apply.browser import (
         MULTI_STEP_ATS, attach_cv, browser_page, capture_evidence, click_next,
         click_submit, detect_ats, detect_captcha, fill_field, has_submit,
-        inspect_form, looks_like_application_form,
+        inspect_form, looks_like_application_form, open_application_form,
     )
     from auto_apply.profile_builder import platform_for_source
 
@@ -543,6 +560,21 @@ def submit_application(
         # at this gate before session state existed.
         with browser_page(session_key) as page:
             page.goto(app["job_url"], wait_until="domcontentloaded")
+            # Submission starts from the JOB url, not from wherever drafting
+            # ended up, so the same click has to happen again. Without it the
+            # submit-time re-check inspects the landing page and refuses a
+            # draft that was perfectly valid.
+            apply_page, opened, open_note = open_application_form(page)
+            if opened:
+                log.info("Application view opened: %s", open_note)
+            elif "never automated" in open_note:
+                raise ApplyError(
+                    "Refusing to submit: " + open_note
+                    + ". Apply by hand here: " + str(app["job_url"])
+                )
+            # Everything from here works on the page the apply flow actually
+            # landed on, which may be a new tab on the employer's own site.
+            page = apply_page
             fields = inspect_form(page)
             ats = detect_ats(page)
             if ats:

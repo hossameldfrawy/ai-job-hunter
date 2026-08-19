@@ -55,13 +55,33 @@ engine:
   prefilter_min_score: 2
 
 gemini:
-  # Tried in order; first model that answers wins. Verified live 2026-08-19.
+  # gemini-3.5-flash is THE model this project uses. The scoring rubric in
+  # evaluator.SYSTEM_INSTRUCTION is calibrated against it, so a run that
+  # quietly finishes on a different model produces scores that are not
+  # comparable with the rest of the database.
+  #
+  # The rest of the chain is a LAST RESORT, reached only when 3.5-flash fails
+  # hard: retired, refusing the key, or out of quota after every retry. The
+  # primary is forced to the head of this list at startup regardless of the
+  # order written here.
   model_chain:
     - gemini-3.5-flash
     - gemini-2.5-flash
     - gemini-3.5-flash-lite
   temperature: 0.15
   max_output_tokens: 8192
+
+  # -- Rate limiting --------------------------------------------------------
+  # Minimum gap between API requests, shared across every worker thread.
+  # Prevention rather than cure: a run that leaned on backoff alone spent
+  # 34s + 57s + 57s + 58s on a single batch before giving up on the model.
+  # Spacing requests a few seconds apart costs a fraction of that and the 429
+  # never happens. Widens automatically (x1.5) on any 429 and eases back after
+  # a clean streak, so neither a fixed-too-fast nor a fixed-too-slow value is
+  # baked in.
+  min_request_interval_seconds: 3.5
+  max_request_interval_seconds: 30
+
   # Retry/backoff for 429 (rate limit) and 5xx (transient).
   max_retries: 4
   backoff_base_seconds: 2.5
