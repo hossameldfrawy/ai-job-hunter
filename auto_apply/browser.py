@@ -212,11 +212,96 @@ def storage_state_path(platform: str) -> Path:
 
 
 def has_saved_session(platform: str) -> bool:
+    """Is there a session file at all? Cheap, and deliberately shallow.
+
+    `session_status` is the one to ask whether it actually signs you IN.
+    """
     path = storage_state_path(platform)
     try:
         return path.exists() and path.stat().st_size > 2
     except OSError:
         return False
+
+
+#: Cookie names that indicate an authenticated session rather than analytics.
+#:
+#: Needed because "a session file exists" is nearly worthless as a signal. A
+#: browser that merely LOADED a board's landing page saves dozens of cookies --
+#: Bing, Clarity, DoubleClick, AppNexus -- and a file full of those looks
+#: exactly like a successful login by size. Measured on this machine: the
+#: Talent.com state held six cookies, every one of them analytics
+#: (`NEXT_LOCALE`, `statsig.stable_id`, `utm_source`), while Tanqeeb held
+#: `token` and `user_id` and Wuzzuf held `LiToken` and `ci_sessions`. Reporting
+#: all three as "signed in" is the false confidence that sends someone hunting
+#: for a form bug that is really a missing login.
+#:
+#: Bare "uid" is deliberately absent: it matches inside `uet_nuuid`, which is a
+#: Microsoft advertising cookie.
+AUTH_COOKIE_HINTS: tuple[str, ...] = (
+    "token", "session", "sess", "auth", "login", "user_id", "userid",
+    "remember", "jwt", "identity", "passport", "credential",
+)
+
+
+def _own_cookies(cookies: list[dict[str, Any]],
+                 hosts: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Cookies set by the BOARD itself, not by a tracker embedded on it."""
+    if not hosts:
+        return list(cookies)
+    out = []
+    for cookie in cookies:
+        domain = str(cookie.get("domain", "")).lstrip(".").lower()
+        if any(domain == h or domain.endswith("." + h) for h in hosts):
+            out.append(cookie)
+    return out
+
+
+def session_status(platform: str,
+                   hosts: tuple[str, ...] = ()) -> tuple[bool, str]:
+    """Does this saved session actually sign us in? (ok, human explanation).
+
+    Never raises: a status panel that crashes on a malformed file is worse than
+    one that says the file is malformed.
+    """
+    import json as _json
+    import time as _time
+
+    path = storage_state_path(platform)
+    if not path.exists():
+        return False, "no saved login"
+    try:
+        state = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "state file unreadable — re-run --register"
+
+    cookies = [c for c in (state.get("cookies") or []) if isinstance(c, dict)]
+    if not cookies:
+        return False, "file has no cookies — re-run --register"
+
+    own = _own_cookies(cookies, hosts)
+    if not own:
+        return False, f"{len(cookies)} third-party cookies only — NOT signed in"
+
+    now = _time.time()
+
+    def live(cookie: dict[str, Any]) -> bool:
+        expires = cookie.get("expires")
+        try:
+            expires = float(expires)
+        except (TypeError, ValueError):
+            return True                     # no expiry recorded: session cookie
+        return expires < 0 or expires > now
+
+    auth = [c for c in own
+            if any(hint in str(c.get("name", "")).lower()
+                   for hint in AUTH_COOKIE_HINTS)]
+    if not auth:
+        return False, (f"{len(own)} cookies but no auth token — NOT signed in")
+    if not any(live(c) for c in auth):
+        return False, "session expired — re-run --register"
+
+    names = ", ".join(sorted({str(c.get("name")) for c in auth})[:3])
+    return True, f"signed in ({len(own)} cookies: {names})"
 
 
 def save_storage_state(context: Any, platform: str) -> str:

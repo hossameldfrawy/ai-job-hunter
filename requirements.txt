@@ -45,3 +45,10 @@ cryptography>=42,<47
 google-api-python-client>=2.100,<3
 google-auth-httplib2>=0.2,<1
 google-auth-oauthlib>=1.2,<2
+
+# Mission Control dashboard (scripts/monitor.py). Both are OPTIONAL: the
+# dashboard falls back to plain ANSI without `rich`, and reports process
+# health as unknown without `psutil`. Pinned here because a deployment that
+# cannot see whether the listener is alive is a deployment that fails silently.
+rich>=13,<15
+psutil>=5.9,<8

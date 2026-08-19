@@ -91,6 +91,57 @@ says so rather than failing silently.
 
 ---
 
+## Running it: one double-click
+
+```
+Launch_Job_Hunter.bat          <- double-click this
+```
+
+It checks Python and the dependencies that matter, starts both services under
+detached supervisors if they are not already up, and opens **Mission Control**:
+
+```
+ MODE      Autonomous daemon — every 60 min        last run 2026-08-19 (ok)
+
+┌── Saved board sessions ──────────┐ ┌── Channels ─────────────────────────┐
+│ ● Tanqeeb    signed in (token…)  │ │ ● Telegram listener  active         │
+│ ● Wuzzuf     signed in (LiToken) │ │ ○ WhatsApp inbound   off (no relay) │
+│ ○ Talent.com no auth token       │ │ ● WhatsApp outbound  CallMeBot      │
+│ ○ Bayt       no saved login      │ │ ● Gmail OAuth2       token present  │
+└──────────────────────────────────┘ └─────────────────────────────────────┘
+ Scanned 1,827 | Evaluated 256 | Matches ≥80% 7 | Pending 3 | Submitted 0
+
+ WAITING ON YOU
+ [DRAFT #4]  شركة صحرا للمقاولات — IT Support Technician    review_pending
+ reply:  done <id>  |  edit <id> salary: …  |  موافق <id>
+
+ LIVE ACTIVITY  (streaming, UTF-8)
+ listener  HITL listener attached as KRIZA_7
+```
+
+| Want to | Run |
+|---|---|
+| Open the dashboard again | `scripts\start_hunter_dashboard.bat` |
+| One snapshot, no live loop | `python scripts\monitor.py --once` |
+| Stop everything | `powershell -File scripts\stop_hunter.ps1` |
+| Start at every logon | `powershell -File scripts\register_autostart_task.ps1 -WithHunter` |
+| Undo autostart | `powershell -File scripts\register_autostart_task.ps1 -Remove` |
+
+**Ctrl-C closes the dashboard, not the bot.** The services run under detached
+supervisors that restart them on crash; only `stop_hunter.ps1` stops them.
+
+The dashboard is **read-only by construction** — it opens both databases with
+`mode=ro`, which SQLite enforces, so it can neither corrupt state nor take a
+write lock away from a daemon mid-run.
+
+**"Signed in" means an auth cookie, not a file.** A browser that merely loaded
+a board's landing page saves dozens of cookies (Bing, Clarity, DoubleClick), so
+judging by file size calls every board signed in. The panel looks for a
+session/token cookie on the board's *own* domain — which is why Talent.com
+above reads "no auth token" while Tanqeeb reads "signed in".
+
+---
+
 ## Quick start
 
 ```bash
@@ -219,10 +270,12 @@ console:
 
 ```powershell
 # run it here, Ctrl-C to stop
-powershell -ExecutionPolicy Bypass -File scriptsun_listener.ps1
+powershell -ExecutionPolicy Bypass -File scripts
+un_listener.ps1
 
 # or detached -- closing the window leaves it running
-powershell -ExecutionPolicy Bypass -File scriptsun_listener.ps1 -Detached
+powershell -ExecutionPolicy Bypass -File scripts
+un_listener.ps1 -Detached
 
 # or at every logon, surviving a reboot (see the script's header for the
 # exact schtasks line)
