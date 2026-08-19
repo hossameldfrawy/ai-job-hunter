@@ -4,6 +4,28 @@
 #  Secrets and are NEVER stored in this file.
 # ==========================================================================
 
+# -- Master CV: resolution order --------------------------------------------
+# The CV is personal data, so the cloud never reads a file -- it reads the
+# CV_TEXT secret. These paths are for LOCAL runs and for generating that secret.
+#
+# Resolution is: CV_TEXT env  ->  MASTER_CV_B64 env  ->  CV_PATH env  ->  the
+# list below, in order  ->  cached extraction. The first source that yields
+# usable text wins, so a missing primary file falls through silently instead of
+# failing the run.
+#
+# `~` expands to your home directory, which keeps the username out of a public
+# repository while still resolving correctly on this machine.
+cv:
+  paths:
+    - "~/OneDrive/Desktop/NEW SHAPTER/Hossam_Eldefrawy_CV.pdf"   # primary
+    - "~/OneDrive/Desktop/NEW SHAPTER/Hossam Eldefrawy CV.pdf"   # fallback
+    - "assets/master_cv.pdf"                                     # repo-local
+  # Where `python setup_wizard.py --extract-cv` writes the sanitised text.
+  export_path: "secrets/CV_TEXT.txt"
+  # GitHub rejects a secret larger than 64 KB. The exporter refuses to write
+  # past this and tells you rather than producing a secret that cannot be set.
+  max_secret_bytes: 65536
+
 engine:
   # Alert only when Gemini scores a job at/above this. 0-100.
   match_threshold: 75
@@ -67,6 +89,19 @@ profile:
     - genesys
     - avaya
     - cisco voice
+    - rtp
+    - codec
+    - codecs
+    - sip trunk
+    - voice gateway
+    # -- Arabic core (matched after orthographic folding: أ/إ/آ->ا, ة->ه, ى->ي)
+    - مهندس اتصالات
+    - سنترالات
+    - سنترال
+    - اتصالات
+    - الاتصالات
+    - هاتف
+    - تليفونات
 
   secondary_keywords:
     - it support
@@ -93,6 +128,41 @@ profile:
     - implementation engineer
     - field engineer
     - product support
+    - linux administrator
+    - linux
+    - system engineer
+    - infrastructure engineer
+    - service delivery
+    - support engineer
+    - support specialist
+    - support analyst
+    - support officer
+    - desktop support
+    - deskside support
+    - end user support
+    - infrastructure support
+    - it operations
+    - odoo functional
+    - odoo technical
+    - erp consultant
+    # -- Arabic adjacent
+    - دعم فني
+    - الدعم الفني
+    - مساندة فنية
+    - شبكات
+    - مهندس شبكات
+    - تقنية معلومات
+    - تكنولوجيا المعلومات
+    - نظم المعلومات
+    - مهندس نظم
+    - اودو
+    - نقاط بيع
+    - كاشير
+    - لينكس
+    - سيرفرات
+    - خوادم
+    - برمجة
+    - مبرمج
 
   # Instant-disqualify. Cheap way to kill the noise that floods job feeds.
   negative_keywords:
@@ -144,6 +214,27 @@ profile:
     - cairo
     - remote
     - worldwide
+    # -- Arabic place names
+    - الرياض
+    - جدة
+    - الدمام
+    - دبي
+    - ابوظبي
+    - الشارقة
+    - الدوحة
+    - مسقط
+    - الكويت
+    - المنامة
+    - القاهرة
+    - الاسكندرية
+    - مصر
+    - السعودية
+    - الامارات
+    - قطر
+    - عمان
+    - البحرين
+    - الخليج
+    - الشرق الاوسط
 
 # -- SOURCE 1: LinkedIn public guest endpoint (no login, no cookies) --------
 # Highest-signal source. Verified returning fresh GCC roles.
@@ -152,27 +243,44 @@ linkedin:
   # Restrict to postings from the last N seconds (604800 = 7 days).
   recency_seconds: 604800
   pages_per_query: 2          # 10 results per page
+  # Requests spent fetching FULL descriptions for the best cards each run.
+  # Each costs ~2.5s (host throttle), so this is the main runtime dial.
+  enrich_budget: 22
+  # ~14 queries x ~3 locations x 2 pages ~= 84 requests ~= 3.5 min. LinkedIn is
+  # the slowest source; trim `locations` here first if runs get too long.
   queries:
+    # -- core VoIP / telephony ------------------------------------------
     - keywords: "VoIP Engineer"
       locations: ["United Arab Emirates", "Saudi Arabia", "Qatar", "Egypt"]
-    - keywords: "SIP Engineer OR Telephony Engineer"
+    - keywords: "SIP OR RTP OR Telephony Engineer"
       locations: ["United Arab Emirates", "Saudi Arabia", "Kuwait"]
-    - keywords: "IT Application Support Engineer"
-      locations: ["United Arab Emirates", "Saudi Arabia", "Qatar", "Egypt"]
+    - keywords: "Asterisk OR Issabel OR FreePBX"
+      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
     - keywords: "Unified Communications Engineer"
-      locations: ["United Arab Emirates", "Saudi Arabia"]
-    - keywords: "PBX Asterisk Issabel"
-      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
-    - keywords: "IT Support Engineer"
-      locations: ["Dubai, United Arab Emirates", "Riyadh, Saudi Arabia"]
-    - keywords: "Odoo Support Consultant"
-      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
+      locations: ["United Arab Emirates", "Saudi Arabia", "Qatar"]
     - keywords: "Contact Center Engineer"
       locations: ["United Arab Emirates", "Qatar", "Saudi Arabia"]
-    - keywords: "Technical Support Engineer Telecom"
-      locations: ["Oman", "Bahrain", "Qatar"]
+    - keywords: "Telecom Network Engineer"
+      locations: ["Oman", "Bahrain", "Kuwait", "Qatar"]
+    # -- application / IT support ----------------------------------------
+    - keywords: "IT Application Support Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Qatar", "Egypt"]
+    - keywords: "IT Support Engineer"
+      locations: ["Dubai, United Arab Emirates", "Riyadh, Saudi Arabia", "Oman"]
+    - keywords: "Technical Support Engineer"
+      locations: ["Kuwait", "Bahrain", "Oman", "Qatar"]
+    - keywords: "Service Desk OR Help Desk Engineer"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Egypt"]
+    # -- systems / Linux ---------------------------------------------------
+    - keywords: "Linux System Administrator"
+      locations: ["United Arab Emirates", "Saudi Arabia", "Egypt"]
+    - keywords: "System Engineer Infrastructure"
+      locations: ["Qatar", "Kuwait", "Bahrain"]
+    # -- ERP / POS ---------------------------------------------------------
+    - keywords: "Odoo Functional OR Technical Consultant"
+      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
     - keywords: "POS Support Engineer"
-      locations: ["United Arab Emirates", "Egypt"]
+      locations: ["United Arab Emirates", "Egypt", "Saudi Arabia"]
 
 # -- SOURCE 2: Telegram public channels (t.me/s/ web preview, zero auth) ----
 # VERIFIED LIVE on 2026-08-19. Add your own channels here -- run
@@ -267,7 +375,42 @@ talent:
     - "Odoo support"
     - "contact center engineer"
 
-# -- SOURCE 6: Search-engine proxy for boards that block direct scraping ----
+# -- SOURCE 6: Tanqeeb -- the Arab world's largest bot-accessible aggregator --
+# The most valuable GCC/Egypt source in the system, and the only one that
+# searches natively in ARABIC. Verified live 2026-08-19 across all seven
+# subdomains; Arabic queries return real results ("دعم فني" -> اخصائي دعم فنى).
+#
+# Two quirks are handled in scrapers/tanqeeb.py, both silent failure modes:
+#   * the search parameter is `keywords` (PLURAL) -- every other spelling
+#     returns HTTP 200 with the WRONG 20 jobs;
+#   * a zero-result search returns generic filler rather than nothing, so
+#     results are checked against the query before being emitted.
+# Keep terms SHORT: multi-word queries are ANDed and usually match nothing.
+tanqeeb:
+  enabled: true
+  max_per_query: 20
+  recency_days: 14
+  countries: [egypt, saudi, uae, qatar, kuwait, oman, bahrain]
+  terms:
+    # English
+    - "it support"
+    - "application support"
+    - "technical support"
+    - "network engineer"
+    - "system administrator"
+    - "odoo"
+    - "linux"
+    - "telecom"
+    - "voip"
+    - "call center"
+    # Arabic -- these reach postings the English terms never surface
+    - "دعم فني"
+    - "مهندس شبكات"
+    - "سنترالات"
+    - "تقنية معلومات"
+    - "نقاط بيع"
+
+# -- SOURCE 7: Search-engine proxy for boards that block direct scraping ----
 # Reaches Bayt / GulfTalent / Naukrigulf / Wuzzuf through Google News RSS,
 # which is the ONLY free path to them. Read the honest trade-off first:
 #   * links are opaque news.google.com redirects -- tappable from WhatsApp and
@@ -290,7 +433,7 @@ search_proxy:
     - site: wuzzuf.net
       terms: ["VoIP", "Odoo", "IT support"]
 
-# -- SOURCE 7: Plain RSS job feeds ------------------------------------------
+# -- SOURCE 8: Plain RSS job feeds ------------------------------------------
 rss:
   enabled: true
   feeds:
@@ -301,7 +444,7 @@ rss:
     - name: Jobicy
       url: https://jobicy.com/?feed=job_feed
 
-# -- SOURCE 8: Facebook public recruitment posts (best-effort) --------------
+# -- SOURCE 9: Facebook public recruitment posts (best-effort) --------------
 # Facebook aggressively blocks unauthenticated scraping. Without a cookie
 # this falls back to search-engine indexing of public FB job posts.
 facebook:

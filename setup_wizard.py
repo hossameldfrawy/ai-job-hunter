@@ -254,22 +254,31 @@ def check_sources() -> bool:
 # ---------------------------------------------------------------------------
 def export_cv_secret() -> Path | None:
     """Write the CV out in the form the cloud deployment wants."""
-    from cv_profile import load_cv
+    from cv_profile import CVError, export_secret, load_cv
 
-    SECRETS_DIR.mkdir(exist_ok=True)
-    (SECRETS_DIR / ".gitignore").write_text("*\n", encoding="utf-8")
+    try:
+        cv = load_cv()
+        text_path, size = export_secret()
+    except CVError as exc:
+        fail(str(exc))
+        return None
 
-    cv = load_cv()
-    text_path = SECRETS_DIR / "CV_TEXT.txt"
-    text_path.write_text(cv.text, encoding="utf-8")
-    ok(f"CV text written to {text_path} ({cv.chars} chars)")
+    ok(f"CV text written to {text_path}")
+    info(f"source: {cv.source} | {cv.chars} chars | {size:,} bytes "
+         f"({100 * size / GITHUB_SECRET_LIMIT:.0f}% of the 64 KB secret limit)")
 
-    pdf = Path(settings.cv_path) if settings.cv_path else None
-    if pdf and pdf.exists() and pdf.suffix.lower() == ".pdf":
+    # The base64-PDF route is only offered when it would actually fit. For a
+    # typical CV it does not, which is exactly why CV_TEXT is the primary path.
+    pdf = next(
+        (p for p in settings.cv_paths if p.exists() and p.suffix.lower() == ".pdf"),
+        None,
+    )
+    if pdf:
         encoded = base64.b64encode(pdf.read_bytes()).decode("ascii")
         if len(encoded) > GITHUB_SECRET_LIMIT:
-            warn(f"Base64 PDF is {len(encoded) / 1024:.0f} KB, over GitHub's "
-                 f"{GITHUB_SECRET_LIMIT // 1024} KB secret limit -- use CV_TEXT.")
+            warn(f"Base64 of {pdf.name} is {len(encoded) / 1024:.0f} KB, over "
+                 f"GitHub's {GITHUB_SECRET_LIMIT // 1024} KB secret limit.")
+            info("Use CV_TEXT above -- it is the supported path for the cloud.")
         else:
             b64_path = SECRETS_DIR / "MASTER_CV_B64.txt"
             b64_path.write_text(encoded, encoding="utf-8")

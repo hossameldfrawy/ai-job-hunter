@@ -10,8 +10,15 @@ Resolution order -- first hit wins:
   1. CV_TEXT        -- plain text, pasted straight into a secret (most robust:
                        no PDF parser needed at runtime at all)
   2. MASTER_CV_B64  -- base64 of the PDF, stored as a secret
-  3. CV_PATH        -- a local PDF/TXT/MD file (local dev, or a private repo)
+  3. cv.paths       -- a chain of local files tried in order (config.yml).
+                       The primary is the underscored filename; a spaced-name
+                       copy is the fallback, so renaming one does not break
+                       local runs.
   4. assets/cv_profile.json -- cached extraction from a previous run
+
+`export_secret()` writes the sanitised text to secrets/CV_TEXT.txt and refuses
+to exceed GitHub's 64 KB per-secret limit -- a secret that cannot be set is
+worse than a loud failure.
 """
 
 from __future__ import annotations
@@ -121,18 +128,82 @@ def _from_env_b64() -> CVProfile | None:
 
 
 def _from_path() -> CVProfile | None:
-    if not settings.cv_path:
+    """Walk the configured path chain and take the first file that yields text.
+
+    Each candidate can fail in three different ways -- missing, unreadable, or
+    present but un-extractable (a scanned image PDF). All three fall through to
+    the next candidate; only exhausting the whole chain is an error.
+    """
+    candidates = settings.cv_paths
+    if not candidates:
         return None
-    path = Path(settings.cv_path)
-    if not path.exists():
-        log.warning("CV_PATH points at a file that does not exist: %s", path)
-        return None
-    data = path.read_bytes()
-    if path.suffix.lower() == ".pdf":
-        text = _clean(_extract_pdf(data))
-    else:
-        text = _clean(data.decode("utf-8", errors="replace"))
-    return CVProfile(text=text, source=f"file:{path.name}", chars=len(text))
+
+    tried: list[str] = []
+    for index, path in enumerate(candidates, 1):
+        label = f"{index}/{len(candidates)} {path.name}"
+        if not path.exists():
+            tried.append(f"{label}: not found")
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            tried.append(f"{label}: unreadable ({exc.__class__.__name__})")
+            continue
+
+        try:
+            if path.suffix.lower() == ".pdf":
+                text = _clean(_extract_pdf(data))
+            else:
+                text = _clean(data.decode("utf-8", errors="replace"))
+        except CVError as exc:
+            tried.append(f"{label}: no extractable text")
+            log.warning("CV candidate %s could not be parsed: %s", path.name, exc)
+            continue
+
+        if len(text) < 120:
+            tried.append(f"{label}: only {len(text)} chars")
+            continue
+
+        if index > 1:
+            log.info(
+                "CV primary path unavailable; using fallback %s. Tried: %s",
+                path.name, "; ".join(tried),
+            )
+        return CVProfile(text=text, source=f"file:{path.name}", chars=len(text))
+
+    log.warning("No usable CV file in the chain. Tried: %s", "; ".join(tried))
+    return None
+
+
+def export_secret(path: Path | None = None) -> tuple[Path, int]:
+    """Write the sanitised CV text out for use as the CV_TEXT secret.
+
+    Returns (path, byte_size). Raises CVError if the result would exceed
+    GitHub's per-secret limit, because `gh secret set` would reject it anyway
+    and the failure is far more confusing at that point.
+    """
+    profile = load_cv()
+    target = path or settings.cv_export_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Anything written under secrets/ must be unstageable, always.
+    gitignore = target.parent / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*" + chr(10), encoding="utf-8")
+
+    payload = profile.text.strip() + chr(10)
+    size = len(payload.encode("utf-8"))
+    limit = settings.cv_max_secret_bytes
+    if size > limit:
+        raise CVError(
+            f"The extracted CV is {size / 1024:.1f} KB, over the "
+            f"{limit / 1024:.0f} KB GitHub secret limit. Shorten the CV, or set "
+            f"cv.max_secret_bytes in config.yml if you are deploying somewhere "
+            f"with a higher cap."
+        )
+    target.write_text(payload, encoding="utf-8")
+    log.info("Wrote %s (%d bytes, %.0f%% of the secret budget).",
+             target, size, 100 * size / limit)
+    return target, size
 
 
 def _from_cache() -> CVProfile | None:

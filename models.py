@@ -27,7 +27,23 @@ _TRACKING_PARAMS = {
 }
 
 _WS = re.compile(r"\s+")
-_NON_ALNUM = re.compile(r"[^a-z0-9؀-ۿ ]+")
+
+# Arabic script blocks worth keeping: base (0600-06FF), Supplement (0750-077F)
+# and Extended-A (08A0-08FF). Presentation forms are folded away by NFKD before
+# this ever runs.
+ARABIC_RANGE = "؀-ۿݐ-ݿࢠ-ࣿ"
+_NON_ALNUM = re.compile(rf"[^a-z0-9{ARABIC_RANGE} ]+")
+
+# Orthographic variants NFKD does NOT fold, but which readers treat as the same
+# letter. Without this, "اخصائي" and "أخصائي" -- both of which appear verbatim in
+# real Gulf postings -- are different strings, and half the Arabic matches are
+# silently missed.
+_ARABIC_FOLD = str.maketrans({
+    "ٱ": "ا",   # alef wasla     -> alef
+    "ة": "ه",   # teh marbuta    -> heh
+    "ى": "ي",   # alef maksura   -> yeh
+    "ـ": "",         # tatweel (kashida) is pure decoration
+})
 
 # Boilerplate that recruiters bolt onto every title and that breaks matching.
 _TITLE_NOISE = re.compile(
@@ -38,15 +54,19 @@ _TITLE_NOISE = re.compile(
 
 
 def normalise_text(value: str | None) -> str:
-    """Lowercase, strip accents/punctuation, collapse whitespace.
+    """Lowercase, fold Arabic orthography, strip punctuation, collapse spaces.
 
-    Keeps the Arabic block (U+0600-U+06FF) intact because a large share of Gulf
-    and Egyptian postings are Arabic and would otherwise normalise to "".
+    Arabic is preserved (and normalised) rather than stripped, because a large
+    share of Gulf and Egyptian postings are written in it and would otherwise
+    normalise to "" -- silently deleting a whole language from the pipeline.
     """
     if not value:
         return ""
     value = unicodedata.normalize("NFKD", str(value))
+    # NFKD + combining-strip already folds أ إ آ -> ا, ئ -> ي, ؤ -> و and every
+    # haraka; _ARABIC_FOLD covers the three it leaves behind.
     value = "".join(c for c in value if not unicodedata.combining(c))
+    value = value.translate(_ARABIC_FOLD)
     value = value.casefold()
     value = _NON_ALNUM.sub(" ", value)
     return _WS.sub(" ", value).strip()

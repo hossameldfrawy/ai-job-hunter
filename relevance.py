@@ -16,7 +16,7 @@ import re
 from functools import lru_cache
 from typing import Any, Iterable
 
-from models import JobPost, normalise_text
+from models import ARABIC_RANGE, JobPost, normalise_text
 
 # Weights
 W_PRIMARY = 3      # core VoIP/telephony skills
@@ -33,18 +33,57 @@ _TOO_SENIOR = re.compile(
 )
 
 
+_LATIN_CH = re.compile(r"[a-z0-9]", re.I)
+_ARABIC_CH = re.compile(f"[{ARABIC_RANGE}]")
+
+
+def _guard(char: str, *, lookbehind: bool) -> str:
+    """Build a script-appropriate word boundary for one edge of a term.
+
+    `\\b` is the obvious tool and the wrong one here. Python's `\\b` is defined
+    against `\\w`, which includes Arabic, so `\\bدعم\\b` behaves inconsistently
+    once the surrounding text mixes scripts, punctuation and RTL marks.
+
+    Instead each edge asserts against the script of the adjacent character of
+    the TERM itself:
+      * a Latin edge must not touch another Latin letter/digit -- which is what
+        stops `sip` matching inside `gossip`;
+      * an Arabic edge must not touch another Arabic letter -- which is what
+        stops `دعم` matching inside a longer word;
+      * a punctuation/symbol edge gets no guard at all, because demanding one
+        would break terms like `3cx` or `c++`.
+    """
+    if _LATIN_CH.fullmatch(char):
+        body = "a-z0-9"
+    elif _ARABIC_CH.fullmatch(char):
+        body = ARABIC_RANGE
+    else:
+        return ""
+    return f"(?<![{body}])" if lookbehind else f"(?![{body}])"
+
+
 @lru_cache(maxsize=4096)
 def _compile_terms(terms: tuple[str, ...]) -> tuple[re.Pattern[str], ...]:
-    """Word-boundary patterns, so 'sip' does not match 'gossip'."""
+    """Bilingual word-boundary patterns (English + Arabic).
+
+    Terms are pushed through `normalise_text` FIRST, because that is what the
+    haystack goes through in `score_text`. Skipping this silently breaks every
+    Arabic term containing a folded letter -- `تقنية معلومات` (teh marbuta) would
+    be compiled with ة while the text it is searching has already become ه, so
+    it could never match its own subject. English terms are unaffected, which is
+    exactly why the bug is invisible until someone tests the Arabic side.
+    """
     out = []
-    for term in terms:
-        term = term.strip().lower()
+    for raw in terms:
+        term = normalise_text(raw)
         if not term:
             continue
         escaped = re.escape(term)
         # Multi-word terms tolerate flexible whitespace.
         escaped = escaped.replace(r"\ ", r"\s+")
-        out.append(re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", re.I))
+        prefix = _guard(term[0], lookbehind=True)
+        suffix = _guard(term[-1], lookbehind=False)
+        out.append(re.compile(f"{prefix}{escaped}{suffix}", re.I | re.U))
     return tuple(out)
 
 

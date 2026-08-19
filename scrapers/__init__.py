@@ -21,6 +21,7 @@ from scrapers.linkedin import LinkedInScraper
 from scrapers.rss_feeds import RssScraper
 from scrapers.search_proxy import SearchProxyScraper
 from scrapers.talent import TalentScraper
+from scrapers.tanqeeb import TanqeebScraper
 from scrapers.telegram_user_client import TelegramUserClientScraper
 from scrapers.telegram_web import TelegramWebScraper
 
@@ -29,7 +30,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "BaseScraper", "ScrapeResult", "build_scrapers", "run_all",
     "LinkedInScraper", "TelegramWebScraper", "TelegramUserClientScraper",
-    "TalentScraper", "JobApiScraper", "RssScraper", "SearchProxyScraper",
+    "TalentScraper", "TanqeebScraper", "JobApiScraper", "RssScraper",
+    "SearchProxyScraper",
     "FacebookScraper",
 ]
 
@@ -39,6 +41,7 @@ REGISTRY: dict[str, type[BaseScraper]] = {
     "telegram": TelegramWebScraper,
     "telegram_user": TelegramUserClientScraper,
     "talent": TalentScraper,
+    "tanqeeb": TanqeebScraper,
     "job_apis": JobApiScraper,
     "search_proxy": SearchProxyScraper,
     "rss": RssScraper,
@@ -63,7 +66,12 @@ def build_scrapers(settings: Any, db: Any = None) -> list[BaseScraper]:
             continue
         cfg = settings.source(key)
         try:
-            if cls is LinkedInScraper:
+            if cls is TanqeebScraper:
+                scraper = cls(cfg, timeout)
+                # Enrichment ranks candidates before spending detail requests.
+                scraper.profile = profile
+                built.append(scraper)
+            elif cls is LinkedInScraper:
                 # Ranks cards against the profile before spending requests on
                 # full descriptions, so it needs the profile block.
                 built.append(cls(cfg, timeout, profile=profile))

@@ -64,12 +64,15 @@ gh secret set WHATSAPP_PHONE   --body "+201234567890"   # <- YOUR number
 gh secret set CV_TEXT          < secrets/CV_TEXT.txt
 ```
 
+`CALLMEBOT_API_KEY` is accepted as an alias for `CALLMEBOT_APIKEY`, so either
+spelling works and a typo cannot silently disable alerts.
+
 | Secret | Required | Notes |
 |---|:--:|---|
 | `GEMINI_API_KEY` | yes | https://aistudio.google.com/apikey |
 | `CALLMEBOT_APIKEY` | yes | From the CallMeBot activation reply |
 | `WHATSAPP_PHONE` | yes | International format, leading `+` |
-| `CV_TEXT` | yes* | Plain-text CV. **Preferred** |
+| `CV_TEXT` | yes* | Plain-text CV. **Preferred.** Generate with `python setup_wizard.py --extract-cv`; it refuses to write past 64 KB |
 | `MASTER_CV_B64` | no | base64 PDF. Only if under GitHub's 64 KB secret cap — a 57 KB PDF becomes 76 KB and will **not** fit, so use `CV_TEXT` |
 | `TELEGRAM_API_ID` | no | Unlocks your joined **private** Telegram groups |
 | `TELEGRAM_API_HASH` | no | Pairs with the api_id |
@@ -106,6 +109,21 @@ If the session ever stops working (you revoked it, or Telegram expired it), the
 run logs `The Telegram session is invalid, expired or was revoked` and carries
 on with the other sources. Re-run `python auth_telegram.py` and update the
 secret.
+
+### 2c. Runtime and cadence
+
+A full sweep takes about **6 minutes**: LinkedIn dominates it (92 paged
+requests behind a 2.5 s per-host throttle), with Tanqeeb, talent.com and the
+Telegram client running concurrently underneath.
+
+The schedule ships at `*/30`. To go to `*/15`, edit the cron in the workflow --
+but note Gemini's free tier is metered per day as well as per minute. Steady
+state is roughly 100 calls/day at `*/30` and 200 at `*/15`; the first day also
+burns through the initial backlog. Start at `*/30`, watch `python main.py
+--stats`, and tighten once it looks calm.
+
+To cut runtime instead, trim `linkedin.queries[].locations` or lower
+`linkedin.enrich_budget` in `config.yml` -- those are the two dials that matter.
 
 ### 3. Start it
 

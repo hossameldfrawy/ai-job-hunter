@@ -123,6 +123,44 @@ class Settings:
         return int(self.engine.get("http_timeout", 25))
 
     @property
+    def cv_paths(self) -> list[Path]:
+        """Candidate CV files, highest priority first.
+
+        CV_PATH (if set) always wins; after that the `cv.paths` list from
+        config.yml is tried in order. `~` and $VARS are expanded, and relative
+        paths resolve against the project root.
+        """
+        raw: list[str] = []
+        if _env("CV_PATH"):
+            raw.append(_env("CV_PATH"))
+        raw.extend(str(x) for x in (self.raw.get("cv", {}).get("paths") or []))
+        if not raw:
+            raw.append(str(ROOT / "assets" / "master_cv.pdf"))
+
+        out: list[Path] = []
+        seen: set[str] = set()
+        for item in raw:
+            path = Path(os.path.expandvars(item)).expanduser()
+            if not path.is_absolute():
+                path = ROOT / path
+            key = str(path).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+        return out
+
+    @property
+    def cv_export_path(self) -> Path:
+        target = Path(
+            self.raw.get("cv", {}).get("export_path") or "secrets/CV_TEXT.txt"
+        )
+        return target if target.is_absolute() else ROOT / target
+
+    @property
+    def cv_max_secret_bytes(self) -> int:
+        return int(self.raw.get("cv", {}).get("max_secret_bytes") or 65536)
+
+    @property
     def telegram_session_path(self) -> Path:
         """Where the local .session file lives (interactive/desktop use)."""
         return Path(_env("TELEGRAM_SESSION_PATH") or (ROOT / "secrets" / "job_hunter"))
@@ -200,7 +238,10 @@ def load_settings(config_path: Path | None = None) -> Settings:
 
     s = Settings(
         gemini_api_key=_env("GEMINI_API_KEY"),
-        callmebot_apikey=_env("CALLMEBOT_APIKEY"),
+        # Both spellings are accepted: the docs and several tutorials use
+        # CALLMEBOT_API_KEY, and a silently-unset secret is a nasty way to
+        # discover a typo.
+        callmebot_apikey=_env("CALLMEBOT_APIKEY") or _env("CALLMEBOT_API_KEY"),
         whatsapp_phone=_env("WHATSAPP_PHONE"),
         cv_text_env=_env("CV_TEXT"),
         cv_b64_env=_env("MASTER_CV_B64"),

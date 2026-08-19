@@ -26,14 +26,14 @@ It runs entirely on GitHub's infrastructure. **Your computer can be off.**
 ```
   SOURCES                    FILTERING                   AI + DELIVERY
   ─────────                  ─────────                   ─────────────
-  LinkedIn guest API  ─┐
+  LinkedIn (7 GCC)    ─┐
   Telegram public      │
   Telegram YOUR GROUPS │     age gate                    Gemini scores
-  talent.com (GCC)     ├──▶  deduplication  ──▶  ~7%  ─▶ each posting  ─┐
-  6 free job APIs      │     lexical pre-filter          against your   │
-  Google News proxy    │                                 CV (0-100)     │
-  RSS feeds           ─┘                                                │
-                                                                        ▼
+  Tanqeeb (AR + EN)    ├──▶  deduplication  ──▶  ~7%  ─▶ each posting  ─┐
+  talent.com (GCC)     │     bilingual                   against your   │
+  6 free job APIs      │     lexical pre-filter          CV (0-100)     │
+  Google News proxy    │                                                │
+  RSS feeds           ─┘                                                ▼
                                                           score ≥ 75 → WhatsApp
 ```
 
@@ -49,7 +49,8 @@ postings that are both new and plausible.
 | **LinkedIn** | Public logged-out guest endpoint | none | Best source. Fresh, structured, includes full descriptions |
 | **Telegram (public)** | `t.me/s/<channel>` web preview | none | Works for any public channel. Arabic posts handled |
 | **Telegram (your groups)** | MTProto user client (Telethon) | api_id + session | Reads the **private groups, supergroups and restricted channels you have joined** -- the web preview cannot see any of these |
-| **talent.com** | Regional HTML (ae/sa/qa/kw/om/bh/eg) | none | Most productive GCC-native board that serves bots |
+| **Tanqeeb** | Regional HTML, 7 Arab subdomains | none | **Searches natively in Arabic.** The largest Arab-world aggregator that still serves bots; detail pages expose full `JobPosting` JSON-LD |
+| **talent.com** | Regional HTML (ae/sa/qa/kw/om/bh/eg) | none | Second-most productive GCC-native board |
 | **Job APIs** | arbeitnow, remoteok, jobicy, himalayas, remotive, themuse | none | Clean JSON, skews remote/global |
 | **Bayt, GulfTalent, Naukrigulf, Wuzzuf** | Google News RSS proxy | none | These boards return **HTTP 403** to bots. The proxy is the only free path; links are Google redirects |
 | **RSS** | Any feed you add | none | Low maintenance |
@@ -112,6 +113,64 @@ profile:
 
 **Getting too many alerts?** Raise `match_threshold` to 80–85.
 **Getting too few?** Lower it to 70, and add keywords to `secondary_keywords`.
+
+### Master CV resolution
+
+The CV is resolved through a fallback chain, so a renamed or missing file
+degrades instead of failing the run:
+
+```
+CV_TEXT secret  ->  MASTER_CV_B64 secret  ->  CV_PATH env  ->  cv.paths chain  ->  cache
+```
+
+`cv.paths` in `config.yml` lists the local candidates in order — the underscored
+filename first, the spaced one as fallback, then the repo-local copy. Each can
+fail three ways (missing, unreadable, or a scanned PDF with no extractable
+text); all three fall through to the next candidate.
+
+```bash
+python setup_wizard.py --extract-cv    # writes secrets/CV_TEXT.txt
+```
+
+The exporter refuses to write past **64 KB**, because that is GitHub's
+per-secret limit and `gh secret set` would reject it far less clearly. Your CV
+exports to ~5 KB, about 8% of the budget. (The base64-PDF route is offered only
+when it fits — for this CV it is 84 KB, so `CV_TEXT` is the supported path.)
+
+### Bilingual matching (Arabic + English)
+
+A large share of Gulf and Egyptian postings are written in Arabic, and naive
+string matching misses almost all of them. Three things make the Arabic side
+actually work:
+
+**Orthographic folding.** The same word is spelled several ways in real
+postings. `normalise_text` folds them into one form before anything is compared:
+
+| Written as | Folds to | Why |
+|---|---|---|
+| `أخصائي` `اخصائي` `إخصائي` | `اخصايي` | alef variants (NFKD) |
+| `تقنية` | `تقنيه` | teh marbuta → heh |
+| `فنى` | `فني` | alef maksura → yeh |
+| `مُهَنْدِس` | `مهندس` | harakat stripped |
+| `ســـنترالات` | `سنترالات` | tatweel removed |
+
+This also protects deduplication: two boards spelling the same Arabic role
+differently produce **one** fingerprint, so you get one alert, not two.
+
+**Script-aware word boundaries.** `` is defined against `\w`, which includes
+Arabic, and behaves inconsistently once a line mixes scripts, punctuation and
+RTL marks. Instead each edge of a term asserts against the script of its own
+adjacent character — so `sip` cannot match inside `gossip`, `شبكات` cannot match
+inside `الشبكاتيون`, and `3cx` still matches because a symbol edge gets no guard.
+
+**Terms are normalised before compiling.** This one is easy to get wrong and
+impossible to notice: the haystack is normalised, so a pattern built from the
+raw term `تقنية معلومات` (with ة) could never match text that had already become
+`تقنيه`. English terms are unaffected, which is exactly why the bug hides. There
+is a regression test for it.
+
+Arabic keywords live alongside the English ones in `config.yml` under
+`profile:`, and Tanqeeb is queried in both languages.
 
 ### Watching your own Telegram groups
 
@@ -193,7 +252,7 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python discover_channels.py` | Audit public Telegram channels |
 | `python auth_telegram.py` | One-time Telegram login (private groups) |
 | `python check_telegram.py` | Verify the Telegram client, list your groups |
-| `python tests/test_pipeline.py` | Offline test suite (66 tests, no network) |
+| `python -m unittest discover -s tests` | Offline test suite (97 tests, no network) |
 
 ---
 
@@ -216,6 +275,8 @@ scrapers/               One module per source
   ├─ telegram_user_client.py  MTProto user client: your joined private
   │                     groups, poll + live event modes
   ├─ talent.py          talent.com regional boards
+  ├─ tanqeeb.py         Tanqeeb: 7 Arab subdomains, Arabic search,
+  │                     JSON-LD description enrichment
   ├─ job_apis.py        Six free JSON APIs
   ├─ search_proxy.py    Google News RSS for 403-blocked boards
   ├─ rss_feeds.py       Generic RSS/Atom

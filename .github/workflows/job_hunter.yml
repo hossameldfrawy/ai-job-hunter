@@ -40,6 +40,12 @@ on:
   schedule:
     # Every 30 minutes. GitHub queues scheduled jobs under load, so treat this
     # as "at least every 30 min", not a hard real-time guarantee.
+    #
+    # For a 15-minute cadence use "*/15 * * * *". Before you do, note that a
+    # full sweep takes ~6 min, and that Gemini's free tier is metered per DAY as
+    # well as per minute: at */30 the steady state is ~100 calls/day, at */15 it
+    # is ~200. Both normally fit, but the FIRST day also burns through the
+    # backlog, so start at */30 and tighten once `--stats` looks calm.
     - cron: "*/30 * * * *"
 
   workflow_dispatch:
@@ -75,7 +81,9 @@ jobs:
 
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # Both spellings are read by config.py, so either secret name works.
       CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+      CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
       WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
       CV_TEXT: ${{ secrets.CV_TEXT }}
       MASTER_CV_B64: ${{ secrets.MASTER_CV_B64 }}
@@ -109,7 +117,9 @@ jobs:
         run: |
           missing=""
           [ -z "$GEMINI_API_KEY" ]   && missing="$missing GEMINI_API_KEY"
-          [ -z "$CALLMEBOT_APIKEY" ] && missing="$missing CALLMEBOT_APIKEY"
+          if [ -z "$CALLMEBOT_APIKEY" ] && [ -z "$CALLMEBOT_API_KEY" ]; then
+            missing="$missing CALLMEBOT_APIKEY"
+          fi
           [ -z "$WHATSAPP_PHONE" ]   && missing="$missing WHATSAPP_PHONE"
           if [ -z "$CV_TEXT" ] && [ -z "$MASTER_CV_B64" ]; then
             missing="$missing CV_TEXT(or MASTER_CV_B64)"
