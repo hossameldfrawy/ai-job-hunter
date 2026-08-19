@@ -336,7 +336,21 @@ telegram_user:
   # Which of your chats to read. Empty include_chats = EVERY group/channel you
   # have joined. Entries match a chat title substring, an @username, or a
   # numeric chat id.
-  include_chats: []
+  # Measured 2026-08-19 with `check_telegram.py --scan 168 --suggest`:
+  # of 46 chats that passed the type filter, exactly 3 produced anything in a
+  # full week. Narrowing to those cuts the dialog sweep and the flood-wait
+  # risk with no loss of yield.
+  #
+  # TRADE-OFF: with this list set, a NEW group you join is ignored until you
+  # add it here. Re-run --suggest occasionally, or empty this list to go back
+  # to watching everything.
+  include_chats:
+    - "Software & IT Jobs in Egypt"   # 7 hiring posts/wk, 10 tech hits -- the real one
+    - "Ahmed mohammed"                # 6/wk, but mostly courses and scholarships;
+                                      # it did surface a US Embassy help-desk role
+    - "سهم مصر"                        # 1/wk, and that was an economics bulletin
+                                      # matching "أنظمة/شبكات" by accident. Drop it
+                                      # if it never yields a real vacancy.
   exclude_chats:
     - "saved messages"
   include_groups: true         # groups + supergroups
