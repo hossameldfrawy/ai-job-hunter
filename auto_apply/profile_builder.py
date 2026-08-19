@@ -223,7 +223,14 @@ def provision(platform: Platform, store: SecureStore,
         # your real username only after signup, and overwriting it with a guess
         # leaves a vault entry that cannot log anyone in.
         username=existing.get("username") or profile.username,
-        password=profile.password,
+        # A password already in the vault WINS over the derived one.
+        #
+        # The derived password is a sensible default for a board with no
+        # account yet. It is not a reason to overwrite the real password of an
+        # account that already exists -- and re-deriving over one would leave a
+        # vault entry that cannot log in, silently, until the next apply run
+        # failed for a reason that looked like anything but this.
+        password=existing.get("password") or profile.password,
         # Likewise the status: a re-sync must not un-finish an account that has
         # already been created.
         profile_status=existing.get("profile_status") or "provisioned",

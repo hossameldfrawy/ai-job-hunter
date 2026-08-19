@@ -1424,3 +1424,246 @@ class TestInspectionSurvivesNavigation(unittest.TestCase):
         inspect_form(page)
         self.assertEqual(page.calls, 1)
         self.assertEqual(page.settled, [])
+
+
+class TestBotWallDetection(unittest.TestCase):
+    """The check whose absence cost a whole debugging pass.
+
+    Cloudflare answers an automation-driven browser with HTTP 403 and a
+    holding page carrying no form, no inputs and no buttons. Every downstream
+    check then reports its own symptom -- "no native submit control on the
+    login form", "not an application form", "0 fields" -- and every one of
+    those sends the reader hunting for a selector that was never missing.
+
+    Measured on wuzzuf.net/login: 403, 0 inputs, 0 buttons, 0 forms, headless
+    AND headed. The same URL in an ordinary Chrome cleared in seconds.
+    """
+
+    class WallPage:
+        def __init__(self, title="", body="", raises=False):
+            self._title, self._body, self._raises = title, body, raises
+            self.waits = 0
+
+        def title(self):
+            if self._raises:
+                raise RuntimeError("page is gone")
+            return self._title
+
+        def inner_text(self, _selector):
+            if self._raises:
+                raise RuntimeError("page is gone")
+            return self._body
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+
+    def test_the_cloudflare_interstitial_is_recognised(self):
+        page = self.WallPage(
+            title="Just a moment...",
+            body="wuzzuf.net Performing security verification")
+        self.assertEqual(browser_mod.detect_bot_wall(page), "just a moment")
+
+    def test_every_marker_is_matched_case_insensitively(self):
+        for marker in browser_mod.BOT_WALL_MARKERS:
+            with self.subTest(marker=marker):
+                page = self.WallPage(title=marker.upper())
+                self.assertEqual(browser_mod.detect_bot_wall(page), marker)
+
+    def test_a_real_page_is_not_a_wall(self):
+        page = self.WallPage(title="WUZZUF",
+                             body="EXPLORE SAVED APPLICATIONS")
+        self.assertEqual(browser_mod.detect_bot_wall(page), "")
+
+    def test_a_page_that_cannot_be_read_is_not_guessed_at(self):
+        """A dead page is a different problem; claiming a wall would hide it."""
+        self.assertEqual(
+            browser_mod.detect_bot_wall(self.WallPage(raises=True)), "")
+
+    def test_the_word_security_in_ordinary_prose_is_not_a_wall(self):
+        page = self.WallPage(title="Network Security Engineer - WUZZUF",
+                             body="We are hiring a security engineer.")
+        self.assertEqual(browser_mod.detect_bot_wall(page), "")
+
+
+class TestWaitingOutTheWall(unittest.TestCase):
+    """A real browser passes these in seconds, so waiting is worth doing --
+    but an automation browser generally never does, so it must be bounded."""
+
+    class ClearingPage(TestBotWallDetection.WallPage):
+        def __init__(self, clears_after):
+            super().__init__(title="Just a moment...")
+            self._clears_after = clears_after
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+            if self.waits >= self._clears_after:
+                self._title = "WUZZUF"
+
+    def test_a_challenge_that_clears_is_waited_out(self):
+        page = self.ClearingPage(clears_after=2)
+        self.assertTrue(browser_mod.wait_out_bot_wall(page, timeout_ms=20000))
+
+    def test_a_page_with_no_challenge_does_not_wait_at_all(self):
+        page = TestBotWallDetection.WallPage(title="WUZZUF")
+        self.assertTrue(browser_mod.wait_out_bot_wall(page))
+        self.assertEqual(page.waits, 0, "it slept for a page that was ready")
+
+    def test_a_challenge_that_never_clears_gives_up(self):
+        page = TestBotWallDetection.WallPage(title="Just a moment...")
+        self.assertFalse(browser_mod.wait_out_bot_wall(page, timeout_ms=6000))
+        self.assertLessEqual(page.waits, 3, "it waited past its own budget")
+
+    def test_giving_up_says_what_blocked_it(self):
+        page = TestBotWallDetection.WallPage(title="Just a moment...")
+        with self.assertLogs("auto_apply.browser", level="WARNING") as caught:
+            browser_mod.wait_out_bot_wall(page, timeout_ms=4000)
+        self.assertIn("anti-bot", "\n".join(caught.output))
+
+
+class TestLoginSubmitControls(unittest.TestCase):
+    """Wuzzuf's own login form, and the controls that submit it."""
+
+    REQUESTED = ('button:has-text("Sign In")', 'button:has-text("Log In")',
+                 'button[type="submit"]', ".btn-primary")
+
+    def test_the_expected_submit_controls_are_all_tried(self):
+        for selector in self.REQUESTED:
+            with self.subTest(selector=selector):
+                self.assertIn(selector, browser_mod.LOGIN_SUBMIT_SELECTORS)
+
+    def test_a_precise_control_is_tried_before_a_broad_one(self):
+        """`.btn-primary` can match some unrelated CTA; it must lose to the
+        form's own submit button whenever both are on the page."""
+        order = browser_mod.LOGIN_SUBMIT_SELECTORS
+        self.assertLess(order.index('button[type="submit"]'),
+                        order.index(".btn-primary"))
+
+    def test_each_requested_control_actually_submits(self):
+        for selector in self.REQUESTED:
+            with self.subTest(selector=selector):
+                page = TestLoginWithPassword.LoginPage(
+                    TestLoginWithPassword.LOGIN_FIELDS,
+                    controls=(selector,), after=[])
+                with TestLoginWithPassword()._inspect(page):
+                    ok, detail = browser_mod.login_with_password(
+                        page, "h@example.com", "pw")
+                self.assertTrue(ok, detail)
+                self.assertEqual(page.clicked, [selector])
+
+    def test_enter_submits_when_there_is_no_button_at_all(self):
+        """Plenty of boards bind submit to the form, or render the control as
+        a styled <div> we will not click blind. Enter goes through the form's
+        own submit path either way."""
+        page = TestLoginWithPassword.LoginPage(
+            TestLoginWithPassword.LOGIN_FIELDS, controls=(), after=[])
+        pressed = []
+
+        def press(selector, key):
+            pressed.append((selector, key))
+            page.submitted = True
+
+        page.press = press
+        with TestLoginWithPassword()._inspect(page):
+            ok, detail = browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertTrue(ok, detail)
+        self.assertEqual(pressed, [("#pw", "Enter")])
+
+    def test_enter_is_not_used_when_a_button_worked(self):
+        page = TestLoginWithPassword.LoginPage(
+            TestLoginWithPassword.LOGIN_FIELDS,
+            controls=('button[type="submit"]',), after=[])
+        pressed = []
+        page.press = lambda selector, key: pressed.append(selector)
+        with TestLoginWithPassword()._inspect(page):
+            browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertEqual(pressed, [],
+                         "it pressed Enter on an already-sent form")
+
+    def test_an_oauth_button_is_still_never_pressed(self):
+        page = TestLoginWithPassword.LoginPage(
+            TestLoginWithPassword.LOGIN_FIELDS,
+            controls=(".btn-primary",), social={".btn-primary"}, after=[])
+        pressed = []
+
+        def press(selector, key):
+            pressed.append(selector)
+            page.submitted = True
+
+        page.press = press
+        with TestLoginWithPassword()._inspect(page):
+            browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertEqual(page.clicked, [], "an OAuth button was pressed")
+        self.assertEqual(pressed, ["#pw"], "it did not fall back to Enter")
+
+    def test_how_it_submitted_is_reported(self):
+        page = TestLoginWithPassword.LoginPage(
+            TestLoginWithPassword.LOGIN_FIELDS,
+            controls=('button[type="submit"]',), after=[])
+        with TestLoginWithPassword()._inspect(page):
+            _ok, detail = browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertIn('button[type="submit"]', detail)
+
+
+class TestSignInWallIsReportedAsItself(unittest.TestCase):
+    """The point of the whole change: name the 403, not its symptom."""
+
+    class WalledPage(TestBotWallDetection.WallPage):
+        def __init__(self):
+            super().__init__(title="Just a moment...",
+                             body="Performing security verification")
+            self.filled = []
+
+        def fill(self, *a, **k):
+            self.filled.append(a)
+
+        def query_selector_all(self, _selector):
+            return []
+
+    def test_a_walled_login_says_it_was_blocked(self):
+        page = self.WalledPage()
+        ok, detail = browser_mod.login_with_password(
+            page, "a@b.c", "pw", timeout_ms=1000)
+        self.assertFalse(ok)
+        self.assertIn("anti-bot", detail)
+        self.assertNotIn("no native submit control", detail)
+
+    def test_no_credentials_are_typed_into_a_holding_page(self):
+        page = self.WalledPage()
+        browser_mod.login_with_password(page, "a@b.c", "pw", timeout_ms=1000)
+        self.assertEqual(page.filled, [])
+
+    def test_the_message_says_what_to_do_instead(self):
+        _ok, detail = browser_mod.login_with_password(
+            self.WalledPage(), "a@b.c", "pw", timeout_ms=1000)
+        self.assertIn("--capture-session", detail)
+
+
+class TestCaptureSessionIsWiredUp(unittest.TestCase):
+    """Attaching to the human's own Chrome: the honest way past a wall no
+    automation browser is served through."""
+
+    def test_the_cli_exposes_it(self):
+        import main
+
+        self.assertTrue(hasattr(main, "cmd_capture_session"))
+
+    def test_an_unknown_board_is_refused_before_any_browser_opens(self):
+        launched = []
+        original = browser_mod.attach_to_chrome
+        browser_mod.attach_to_chrome = lambda *a, **k: launched.append(1)
+        try:
+            saved, _detail = browser_mod.capture_session("NotARealBoard")
+        finally:
+            browser_mod.attach_to_chrome = original
+        self.assertFalse(saved)
+        self.assertEqual(launched, [], "it opened a browser for a bad name")
+
+    def test_the_launch_hint_names_the_flag_that_matters(self):
+        self.assertIn("--remote-debugging-port=9222",
+                      browser_mod.CHROME_LAUNCH_HINT)
+
+    def test_the_hint_says_to_close_chrome_first(self):
+        """The flag is silently ignored when a Chrome is already running, and
+        that failure looks exactly like the tool being broken."""
+        self.assertIn("Close every Chrome window first",
+                      browser_mod.CHROME_LAUNCH_HINT)

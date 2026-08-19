@@ -422,6 +422,28 @@ def cmd_apply(db, limit):
     return 0
 
 
+def cmd_capture_session(platform: str) -> int:
+    """Copy a signed-in session out of the human's own Chrome.
+
+    The escape hatch for a board that will not serve its login page to an
+    automation-launched browser at all. Nothing here defeats a challenge or
+    reads a stored secret: we drive the browser the human is already signed
+    in to, and keep the cookies that browser was legitimately given.
+    """
+    from auto_apply.browser import capture_session
+
+    print(f"\nCAPTURING THE {platform.upper()} SESSION FROM YOUR CHROME")
+    try:
+        saved, detail = capture_session(platform)
+    except RuntimeError as exc:
+        print(f"\n{exc}")
+        return 1
+    print(f"\n{'OK' if saved else 'NOT SAVED'}: {detail}")
+    if saved:
+        print("\nNext:  python main.py --refresh-drafts")
+    return 0 if saved else 1
+
+
 def cmd_refresh_drafts(db):
     """Re-inspect every pending draft's page and update its submittability.
 
@@ -775,6 +797,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="list drafted/submitted applications")
     mode.add_argument("--refresh-drafts", action="store_true",
                       help="re-inspect pending drafts' forms (no AI cost)")
+    mode.add_argument("--capture-session", metavar="BOARD",
+                      help="copy a signed-in session from your own Chrome")
     mode.add_argument("--approve", type=int, metavar="ID",
                       help="approve a draft and submit it")
     mode.add_argument("--decline", type=int, metavar="ID",
@@ -839,6 +863,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_applications()
         if args.refresh_drafts:
             return cmd_refresh_drafts(db)
+        if args.capture_session:
+            return cmd_capture_session(args.capture_session)
         if args.provision:
             return cmd_provision()
         if args.vault:

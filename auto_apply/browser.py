@@ -16,6 +16,7 @@ bot is not repeatedly hammering sign-in forms.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -589,6 +590,130 @@ def is_social_login(element: Any) -> bool:
     return any(marker in blob for marker in SOCIAL_LOGIN_MARKERS)
 
 
+BOT_WALL_MARKERS: tuple[str, ...] = (
+    "just a moment",
+    "performing security verification",
+    "checking your browser",
+    "verify you are not a bot",
+    "attention required",
+    "ddos protection by",
+    "enable javascript and cookies to continue",
+)
+
+LOGIN_SUBMIT_SELECTORS: tuple[str, ...] = (
+    # The form's own control first, then the labelled ones, then the broad
+    # class-name guesses. Order is the priority: a precise match must win
+    # before `.btn-primary` gets a chance to hit some unrelated CTA.
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Sign In")',
+    'button:has-text("Log In")',
+    'button:has-text("Login")',
+    'button:has-text("Sign in and apply")',
+    'button:has-text("تسجيل الدخول")',
+    'button:has-text("دخول")',
+    'form button:not([type="button"])',
+    ".btn-primary",
+    ".btn-login",
+)
+
+
+def detect_bot_wall(page: Any) -> str:
+    """Name the anti-bot interstitial standing in front of the real page.
+
+    This exists because its absence cost a whole debugging pass. Cloudflare
+    answers an automation-driven browser with HTTP 403 and a holding page that
+    contains NO form, NO inputs and NO buttons. Every downstream check then
+    faithfully reports its own symptom -- "no native submit control on the
+    login form", "not an application form", "0 fields" -- and every one of
+    those sends you hunting for a selector that was never missing.
+
+    Measured on wuzzuf.net/login: status 403, 0 inputs, 0 buttons, 0 forms,
+    in both headless and headed automation. The same URL in the user's
+    ordinary Chrome cleared in seconds and redirected to /home.
+
+    Returns the marker that matched, or "" when the real page is through.
+    """
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    try:
+        body = (page.inner_text("body") or "").lower()[:2000]
+    except Exception:
+        body = ""
+    haystack = f"{title} {body}"
+    for marker in BOT_WALL_MARKERS:
+        if marker in haystack:
+            return marker
+    return ""
+
+
+def wait_out_bot_wall(page: Any, timeout_ms: int = 20000) -> bool:
+    """Give a challenge the chance to clear itself. True once the page is real.
+
+    A real browser passes these in a few seconds, so waiting is worth doing
+    before concluding anything. An automation browser generally never passes,
+    which is why this is bounded and its failure is reported rather than
+    retried forever.
+    """
+    marker = detect_bot_wall(page)
+    if not marker:
+        return True
+    waited = 0
+    while waited < timeout_ms:
+        try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            break
+        waited += 2000
+        if not detect_bot_wall(page):
+            log.info("The %s check cleared after %ds.", marker, waited // 1000)
+            return True
+    log.warning("Blocked by an anti-bot check (%r) after %ds.",
+                marker, timeout_ms // 1000)
+    return False
+
+
+def _press_click(element: Any) -> bool:
+    """Click, falling back to a DOM dispatch for off-canvas controls."""
+    try:
+        element.click(timeout=3000)
+        return True
+    except Exception:
+        pass
+    try:
+        element.evaluate("node => node.click()")
+        return True
+    except Exception:
+        return False
+
+
+def _submit_login(page: Any, password_field: FormField) -> str:
+    """Press the login form's own submit control. Returns what was done.
+
+    Falls back to Enter in the password box: plenty of boards render their
+    submit as a styled <div> or bind the handler to the form rather than to a
+    button, and Enter goes through the form's own submit path either way.
+    """
+    for selector in LOGIN_SUBMIT_SELECTORS:
+        try:
+            elements = page.query_selector_all(selector) or []
+        except Exception:
+            continue
+        for element in elements:
+            if is_social_login(element) or not _is_clickable(element):
+                continue
+            if _press_click(element):
+                return f"pressed {selector}"
+
+    try:
+        page.press(password_field.selector, "Enter")
+        return "pressed Enter in the password box"
+    except Exception:
+        return ""
+
+
 def login_with_password(page: Any, email: str, password: str,
                         timeout_ms: int = 8000) -> tuple[bool, str]:
     """Sign in with the NATIVE email + password form. Never via OAuth.
@@ -597,6 +722,18 @@ def login_with_password(page: Any, email: str, password: str,
     completed is reported, never raised, because the caller's next move is to
     hand the browser to the human either way.
     """
+    # Before anything else, is there even a page here? An anti-bot holding
+    # page has no form on it, and reporting "no submit control" for one sends
+    # the reader looking for a selector instead of at the 403.
+    if not wait_out_bot_wall(page):
+        marker = detect_bot_wall(page)
+        return False, (
+            f"blocked by an anti-bot check ({marker!r}) -- the login form is "
+            f"never served to this browser, so there is nothing to fill in. "
+            f"Sign in with your normal Chrome, then run: "
+            f"python main.py --capture-session <board>"
+        )
+
     fields = inspect_form(page)
     by_kind = {f.kind: f for f in fields}
     email_field = by_kind.get("email") or by_kind.get("username")
@@ -611,34 +748,118 @@ def login_with_password(page: Any, email: str, password: str,
 
     # Submit with the form's OWN control, filtered so a "Continue with Google"
     # button next to it can never be the one that gets pressed.
-    for selector in SUBMIT_SELECTORS + ('button:has-text("Log in")',
-                                        'button:has-text("Sign in")',
-                                        'button:has-text("تسجيل الدخول")'):
+    how = _submit_login(page, password_field)
+    if not how:
+        return False, "no native submit control on the login form"
+
+    for settle in ("networkidle", "domcontentloaded"):
         try:
-            elements = page.query_selector_all(selector) or []
+            page.wait_for_load_state(settle, timeout=timeout_ms)
+            break
         except Exception:
             continue
-        for element in elements:
-            if is_social_login(element) or not _is_clickable(element):
-                continue
+    try:
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    # A challenge can appear on the POST as easily as on the GET.
+    wait_out_bot_wall(page, timeout_ms=10000)
+
+    remaining = {f.kind for f in inspect_form(page)}
+    if "password" in remaining:
+        return False, (f"{how}, but the password form is still showing -- "
+                       f"wrong credentials, or a verification step")
+    return True, f"signed in with email and password ({how})"
+
+
+DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+
+CHROME_LAUNCH_HINT = r"""Start Chrome with remote debugging enabled:
+  1. Close every Chrome window first -- the flag is ignored otherwise.
+  2. Run:  & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+  3. Sign in to the board in that window if you are not already signed in.
+Then run this command again."""
+
+
+@contextmanager
+def attach_to_chrome(cdp_url: str = DEFAULT_CDP_URL) -> Iterator[Any]:
+    """Attach to the human's OWN running Chrome instead of launching one.
+
+    This exists because some boards will not serve their login page to an
+    automation-launched browser at all. Wuzzuf answers Playwright's Chromium
+    with a Cloudflare 403 and an empty holding page -- headless and headed
+    alike -- while the same URL in the user's ordinary Chrome clears in
+    seconds and lands on /home, already signed in.
+
+    Attaching sidesteps the whole problem honestly: the session we use is the
+    one the human already established in their own browser, so there is no
+    challenge to defeat and no credential store to rummage through. Chrome
+    must have been started with --remote-debugging-port; see CHROME_LAUNCH_HINT.
+    """
+    if not playwright_available():
+        raise RuntimeError("Playwright is not installed.")
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        try:
+            browser = pw.chromium.connect_over_cdp(cdp_url, timeout=10000)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No Chrome is listening on {cdp_url} "
+                f"({type(exc).__name__}).{os.linesep}{CHROME_LAUNCH_HINT}"
+            ) from exc
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        try:
+            yield context
+        finally:
+            # Detach only. The window belongs to the human -- closing it would
+            # take their browser down with it.
             try:
-                element.click(timeout=3000)
-            except Exception:
-                continue
-            try:
-                page.wait_for_load_state("networkidle", timeout=timeout_ms)
+                browser.close()
             except Exception:
                 pass
+
+
+def capture_session(platform: str, url: str = "",
+                    cdp_url: str = DEFAULT_CDP_URL) -> tuple[bool, str]:
+    """Copy a signed-in session out of the human's Chrome into our state file.
+
+    Returns (saved, what happened). The board is visited in the attached
+    browser so the cookies are certainly fresh and certainly past whatever
+    challenge stands in front of it.
+    """
+    from auto_apply.profile_builder import find_platform
+
+    known = find_platform(platform)
+    target = url or (known.url if known else "")
+    if not target:
+        return False, f"I do not know a board called {platform!r}."
+
+    with attach_to_chrome(cdp_url) as context:
+        page = context.new_page()
+        try:
+            page.goto(target, wait_until="domcontentloaded")
+            if not wait_out_bot_wall(page, timeout_ms=30000):
+                return False, ("the anti-bot check did not clear even in your "
+                               "own Chrome -- try loading the board manually "
+                               "in that window first")
             try:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
             except Exception:
                 pass
-            remaining = {f.kind for f in inspect_form(page)}
-            if "password" in remaining:
-                return False, ("the password form is still showing -- wrong "
-                               "credentials, or a verification step")
-            return True, "signed in with email and password"
-    return False, "no native submit control on the login form"
+            written = save_storage_state(context, platform)
+            count = len(context.cookies() or [])
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    status = session_status(platform)
+    return True, (f"Saved {count} cookie(s) from your Chrome to {written}. "
+                  f"{status}")
 
 
 def never_automate_hosts() -> tuple[str, ...]:
