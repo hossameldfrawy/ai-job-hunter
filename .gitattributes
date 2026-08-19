@@ -1,0 +1,3 @@
+# Deploy scripts run on Linux. A CRLF shebang there is not a style issue --
+# `#!/usr/bin/env bash` is a bad interpreter and the script will not run.
+*.sh text eol=lf
