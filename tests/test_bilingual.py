@@ -277,5 +277,95 @@ class TestSecretExportLimit(unittest.TestCase):
             cv_profile.load_cv = original
 
 
+class TestFailedEvaluationsAreRetried(unittest.TestCase):
+    """A posting the AI never actually judged must not be retired.
+
+    Postings are recorded as seen BEFORE Gemini runs, which is what makes a
+    mid-run crash safe. But when a batch fails for a transport reason -- an
+    exhausted daily quota, a dead model -- those postings were never judged, and
+    leaving them recorded would silently discard them forever. `db.forget()`
+    puts them back in the queue.
+    """
+
+    def setUp(self):
+        from db import Database
+
+        self.db = Database(Path(tempfile.mkdtemp()) / "retry.db")
+        self.jobs = [
+            JobPost(source="tanqeeb:saudi", title=f"IT Support Engineer {i}",
+                    company="Acme", location="Riyadh",
+                    url=f"https://example.com/{i}")
+            for i in range(5)
+        ]
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_forgotten_jobs_come_back_as_new(self):
+        fresh, _ = self.db.partition_new(self.jobs)
+        self.db.record_seen(fresh)
+        self.assertEqual(len(self.db.partition_new(self.jobs)[0]), 0)
+
+        self.db.forget([j.fingerprint for j in self.jobs[:3]])
+        again, _ = self.db.partition_new(self.jobs)
+        self.assertEqual(len(again), 3, "un-seen postings were not re-queued")
+
+    def test_alerted_jobs_are_never_forgotten(self):
+        """Safety rail: forgetting a job we already messaged about would
+        re-alert the user on the next run."""
+        fresh, _ = self.db.partition_new(self.jobs)
+        self.db.record_seen(fresh)
+        self.db.record_alert(self.jobs[0].fingerprint, "callmebot", "sent")
+
+        self.db.forget([j.fingerprint for j in self.jobs])
+        again, _ = self.db.partition_new(self.jobs)
+        surviving = {j.fingerprint for j in again}
+        self.assertNotIn(self.jobs[0].fingerprint, surviving,
+                         "an already-alerted job was un-seen and would re-alert")
+        self.assertEqual(len(again), 4)
+
+    def test_forget_handles_empty_input(self):
+        self.assertEqual(self.db.forget([]), 0)
+        self.assertEqual(self.db.forget(["", None]), 0)  # type: ignore[list-item]
+
+
+class TestQuotaExhaustion(unittest.TestCase):
+    """An exhausted daily quota must fail fast, not stall the whole run."""
+
+    def test_quota_error_is_its_own_type(self):
+        from evaluator import GeminiError, QuotaExhausted
+
+        self.assertTrue(issubclass(QuotaExhausted, GeminiError))
+
+    def test_remaining_batches_short_circuit(self):
+        """Once the quota is gone, later batches must not each wait out four
+        60-second backoffs -- that is ~20 minutes against a 25-minute timeout."""
+        from evaluator import GeminiEvaluator, QuotaExhausted
+
+        evaluator = GeminiEvaluator()
+        calls = {"n": 0}
+
+        def boom(batch, cv_text):
+            calls["n"] += 1
+            raise QuotaExhausted("HTTP 429: quota exceeded")
+
+        evaluator.evaluate_batch = boom  # type: ignore[assignment]
+        evaluator.batch_size = 2
+        evaluator.concurrency = 1
+
+        jobs = [
+            JobPost(source="test", title=f"Engineer {i}", company="Acme",
+                    location="Dubai", url=f"https://example.com/{i}")
+            for i in range(10)
+        ]
+        results = evaluator.evaluate(jobs, "cv text")
+
+        self.assertEqual(len(results), 10, "every posting must still get a verdict")
+        self.assertTrue(all(r.error == "quota_exhausted" for r in results))
+        self.assertTrue(evaluator.quota_exhausted)
+        self.assertEqual(calls["n"], 1,
+                         "only the FIRST batch should have hit the API")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

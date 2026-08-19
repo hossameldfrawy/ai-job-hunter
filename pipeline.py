@@ -50,6 +50,7 @@ class RunReport:
     prefilter_disqualified: int = 0
     over_cap: int = 0
     evaluated: int = 0
+    evaluation_failures: int = 0
     matched: int = 0
     alerts_sent: int = 0
     alerts_failed: int = 0
@@ -266,10 +267,23 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
         report.gemini_calls = evaluator.calls_made
         report.gemini_tokens = evaluator.tokens_used
         report.evaluated = len(evaluations)
+        # A posting that FAILED to be evaluated must not stay retired. It was
+        # recorded as seen before the AI ran (which is what makes a mid-run
+        # crash safe), so anything that errored for a transport reason -- an
+        # exhausted quota, a dead model -- is un-seen here and retried next run.
+        # `not_a_real_vacancy` is a genuine verdict and stays recorded.
         failed = [e for e in evaluations if e.error and e.error != "not_a_real_vacancy"]
+        if failed:
+            report.evaluation_failures = len(failed)
+            db.forget([e.fingerprint for e in failed])
         if failed and len(failed) == len(evaluations):
             report.status = "degraded"
             report.errors.append(f"Gemini failed on every batch: {failed[0].error}")
+        if getattr(evaluator, "quota_exhausted", False):
+            report.status = "degraded"
+            report.errors.append(
+                "Gemini daily quota exhausted; unevaluated postings deferred."
+            )
 
     # -- 6. threshold + dispatch -------------------------------------------
     threshold = settings.match_threshold

@@ -37,10 +37,19 @@ It runs entirely on GitHub's infrastructure. **Your computer can be off.**
                                                           score ≥ 75 → WhatsApp
 ```
 
-A representative live run: **1,730 postings scraped → 120 evaluated by AI →
-5 alerts sent.** The funnel exists because Gemini's free tier is metered; the
-cheap filters do the bulk elimination so the expensive stage only ever sees
-postings that are both new and plausible.
+A representative live run:
+
+```
+2,771 scraped  →  2,097 recent  →  963 never seen  →  315 candidates
+                                                       →  120 evaluated  →  alerts
+```
+
+Every stage is counted in `run_report.json`, so you can always see where a
+posting was lost. The funnel exists because Gemini's free tier is metered per
+minute *and* per day: the cheap filters do the bulk elimination so the expensive
+stage only ever sees postings that are both new and plausible. Anything over the
+per-run cap is **deferred, not discarded** — those postings are deliberately left
+unrecorded so the next run picks them up.
 
 ### Sources, and how honest each one is
 

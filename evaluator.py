@@ -138,6 +138,15 @@ class GeminiError(RuntimeError):
     pass
 
 
+class QuotaExhausted(GeminiError):
+    """The API keeps refusing with 429 -- the daily allowance is gone.
+
+    Distinct from a transient rate-limit because the response is different:
+    a transient 429 clears within its retryDelay, an exhausted daily quota
+    does not clear for hours. Retrying into it burns the entire run.
+    """
+
+
 def _retry_delay_from(payload: dict[str, Any]) -> float | None:
     """Google returns a RetryInfo block on 429; honour it instead of guessing."""
     try:
@@ -169,6 +178,9 @@ class GeminiEvaluator:
         self._counter_lock = threading.Lock()
         self.calls_made = 0
         self.tokens_used = 0
+        # Set once the daily quota is clearly gone, so the remaining batches
+        # fail instantly instead of each waiting out four 60-second backoffs.
+        self._quota_gone = threading.Event()
 
     # -- transport ----------------------------------------------------------
     def _post(self, model: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +230,8 @@ class GeminiEvaluator:
 
             raise GeminiError(last)
 
+        if "429" in last:
+            raise QuotaExhausted(last)
         raise GeminiError(f"exhausted retries -- {last}")
 
     def _generate(self, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -395,8 +409,19 @@ class GeminiEvaluator:
         done = 0
 
         def work(batch: list[JobPost]) -> list[Evaluation]:
+            if self._quota_gone.is_set():
+                return self._failed_batch(batch, "quota_exhausted")
             try:
                 return self.evaluate_batch(batch, cv_text)
+            except QuotaExhausted as exc:
+                if not self._quota_gone.is_set():
+                    self._quota_gone.set()
+                    log.error(
+                        "Gemini quota is exhausted (%s). Skipping the remaining "
+                        "batches -- those postings stay unevaluated and will be "
+                        "retried on the next run.", str(exc)[:120],
+                    )
+                return self._failed_batch(batch, "quota_exhausted")
             except GeminiError as exc:
                 log.error("Batch failed: %s", exc)
                 return self._failed_batch(batch, str(exc))
@@ -426,6 +451,10 @@ class GeminiEvaluator:
             len(results), self.calls_made, self.tokens_used,
         )
         return results
+
+    @property
+    def quota_exhausted(self) -> bool:
+        return self._quota_gone.is_set()
 
     # -- diagnostics --------------------------------------------------------
     def selftest(self) -> tuple[bool, str]:

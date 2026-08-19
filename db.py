@@ -238,6 +238,33 @@ class Database:
                 rows,
             )
 
+    def forget(self, fingerprints: Sequence[str]) -> int:
+        """Un-see postings so a later run can try them again.
+
+        Used when an evaluation failed for a TRANSPORT reason (quota exhausted,
+        model down) rather than on merit. Those postings were recorded as seen
+        before the AI ran -- which is what makes a mid-run crash safe -- but
+        leaving them recorded would retire jobs nobody ever actually looked at.
+        Never call this for a job that genuinely scored low.
+        """
+        fingerprints = [f for f in fingerprints if f]
+        if not fingerprints:
+            return 0
+        removed = 0
+        with self._tx() as c:
+            for i in range(0, len(fingerprints), 400):
+                chunk = fingerprints[i : i + 400]
+                placeholders = ",".join("?" * len(chunk))
+                cur = c.execute(
+                    f"DELETE FROM seen_jobs WHERE fingerprint IN ({placeholders}) "
+                    f"AND notified = 0",
+                    chunk,
+                )
+                removed += cur.rowcount or 0
+        if removed:
+            log.info("Un-saw %d posting(s) so the next run can retry them.", removed)
+        return removed
+
     def record_seen(self, jobs: Iterable[JobPost]) -> int:
         """Insert postings as seen. Idempotent."""
         now = iso(utc_now())
