@@ -652,6 +652,123 @@ def refresh_draft(app_id: int, store: SecureStore,
     return changed, f"#{app_id} {state}: {payload['form_note'][:120]}"
 
 
+class _JobFacts:
+    """The little a draft prompt needs about a job, rebuilt from the DB row."""
+
+    def __init__(self, app: dict[str, Any]):
+        self.company_name = str(app.get("company") or "")
+        self.role_title = str(app.get("role") or "")
+        self.location = str(app.get("location") or "")
+        self.salary = ""
+        self.why_matched = ""
+
+
+def answer_open_questions(
+    app: dict[str, Any], fields: list[Any], store: SecureStore,
+) -> tuple[dict[str, str], list[str]]:
+    """Answer the questions that only exist once the form is actually open.
+
+    A draft made before its form was reachable carries an EMPTY answer map.
+    Filling nothing and pressing submit sends a BLANK application under the
+    user's name -- the same looks-like-success failure as submitting a search
+    widget, and a much worse one to explain to an employer.
+
+    Draft #9 was in exactly that state: five real screening questions, zero
+    answers, form_ok=True. Its stored answers had been drafted blind against
+    the STANDARD set, and two of them were non-answers in as many words --
+    "My CV does not state my notice period, so a human candidate should fill
+    this in." Typing that into an employer's form is worse than not applying.
+
+    Returns (selector -> answer, questions no confident answer exists for).
+    """
+    payload = json.loads(app.get("submitted_payload_json") or "{}")
+    values: dict[str, str] = dict(payload.get("fields", {}))
+    draft = payload.get("draft", {}) or {}
+
+    from auto_apply.browser import is_question_control
+
+    # Same predicate the submit-time completeness check uses, so a field can
+    # never be "not worth answering" here and "blank, refuse" there.
+    answerable = [f for f in fields
+                  if is_question_control(f) and not values.get(f.selector)]
+    if not answerable:
+        return values, []
+
+    # Reuse what the draft already answered, matched by topic. Free, and it
+    # keeps a human's in-line edits rather than regenerating over them.
+    existing = {
+        str(a.get("question", "")).strip(): str(a.get("answer", ""))
+        for a in draft.get("answers", []) if isinstance(a, dict)
+    }
+    confident = {
+        str(a.get("question", "")).strip()
+        for a in draft.get("answers", [])
+        if isinstance(a, dict) and a.get("confident")
+    }
+
+    still_open = []
+    for f in answerable:
+        reused = match_screening_answer(f.label, existing)
+        if reused and any(q in confident and existing.get(q) == reused
+                          for q in existing):
+            values[f.selector] = reused
+        else:
+            still_open.append(f)
+
+    fresh: dict[str, dict[str, Any]] = {}
+    if still_open:
+        log.info("Drafting answers for %d question(s) the form only shows "
+                 "once it is open.", len(still_open))
+        new = draft_answers(_JobFacts(app), "", [f.label for f in still_open])
+        for a in new.get("answers", []):
+            if isinstance(a, dict):
+                fresh[str(a.get("question", "")).strip().lower()] = a
+        # Keep them, so a retry costs no tokens and the user can edit them.
+        merged = list(draft.get("answers", [])) + [
+            a for a in new.get("answers", []) if isinstance(a, dict)
+        ]
+        draft["answers"] = merged
+        payload["draft"] = draft
+
+    unanswered: list[str] = []
+    for f in still_open:
+        got = fresh.get(f.label.strip().lower(), {})
+        answer = str(got.get("answer", "")).strip()
+        if f.input_type == "radio" and f.options:
+            answer = _closest_option(answer, f.options)
+        if answer and got.get("confident"):
+            values[f.selector] = answer
+        else:
+            unanswered.append(f.label)
+
+    payload["fields"] = values
+    store.update_application_draft(app_id_of(app), payload=payload)
+    return values, unanswered
+
+
+def app_id_of(app: dict[str, Any]) -> int:
+    return int(app.get("id") or 0)
+
+
+def _closest_option(answer: str, options: list[str]) -> str:
+    """Snap a written answer onto one of the offered choices.
+
+    "Yes, I am comfortable working on-site" has to become exactly "Yes" or the
+    radio never gets picked and the question submits blank.
+    """
+    low = (answer or "").strip().lower()
+    if not low:
+        return ""
+    for option in options:
+        if low == option.strip().lower():
+            return option
+    for option in options:
+        opt = option.strip().lower()
+        if opt and (low.startswith(opt) or opt in low.split()[:3]):
+            return option
+    return ""
+
+
 def submit_application(
     app_id: int, store: SecureStore, notifier: Any, dry_run: bool = False
 ) -> bool:
@@ -698,7 +815,8 @@ def submit_application(
     from auto_apply.browser import (
         MULTI_STEP_ATS, attach_cv, browser_page, capture_evidence, click_next,
         click_submit, detect_ats, detect_captcha, fill_field, has_submit,
-        inspect_form, looks_like_application_form, open_application_form,
+        has_value as _has_value, inspect_form, is_question_control,
+        looks_like_application_form, open_application_form, submission_landed,
     )
     from auto_apply.profile_builder import platform_for_source
 
@@ -743,7 +861,8 @@ def submit_application(
             # Re-check at submit time, not just at draft time: the page may have
             # changed, and clicking "submit" on a search widget would run a
             # search and report it as a submitted application.
-            usable, note = looks_like_application_form(fields)
+            usable, note = looks_like_application_form(
+                fields, str(getattr(page, "url", "") or ""))
             if not usable:
                 raise ApplyError(
                     "Refusing to submit: " + note
@@ -784,6 +903,26 @@ def submit_application(
                     "in: %s); submitting without an attachment.", tried,
                 )
 
+            # ANSWER WHAT THE FORM ACTUALLY ASKS.
+            #
+            # The draft's answer map is built from the fields visible when it
+            # was drafted. When the form was behind a login or a hop then, the
+            # map is EMPTY -- and filling nothing before pressing submit sends
+            # a blank application in the user's name.
+            field_values, unanswered = answer_open_questions(app, fields, store)
+            log.info("Answer map covers %d field(s): %s",
+                     len(field_values), sorted(field_values))
+            if unanswered:
+                asked = "\n".join(f"  - {q}" for q in unanswered[:8])
+                raise ApplyError(
+                    "Refusing to submit: no confident answer for "
+                    f"{len(unanswered)} of this form's questions, and a made-up "
+                    "answer to a screening question is a claim made in your "
+                    f"name:\n{asked}\n"
+                    f"Answer them with:  edit {app_id} <question>: <answer>\n"
+                    f"or apply by hand here: {app['job_url']}"
+                )
+
             def fill_visible(page_fields: list[Any]) -> int:
                 count = 0
                 for f in page_fields:
@@ -796,6 +935,25 @@ def submit_application(
             filled = fill_visible(fields)
             log.info("Filled %d/%d field(s) on the first page.",
                      filled, len(fields))
+
+            # EVERY QUESTION, OR NONE.
+            #
+            # "Filled 2/6" was logged and the run carried on to submit -- three
+            # screening questions blank, in an application sent under the
+            # user's name. A field we meant to answer and could not is a
+            # failure, not a detail: the selector went stale, or the answer
+            # never made it into the map.
+            missed = [
+                f for f in fields
+                if is_question_control(f) and not _has_value(page, f)
+            ]
+            if missed:
+                listed = "\n".join(f"  - {f.label[:90]}" for f in missed[:8])
+                raise ApplyError(
+                    f"Refusing to submit: {len(missed)} of this form's "
+                    f"questions are still blank after filling:\n{listed}\n"
+                    f"Apply by hand here: {app['job_url']}"
+                )
 
             # MULTI-STEP FORMS. Workday, Taleo, iCIMS and SmartRecruiters are
             # wizards: the submit button does not exist until the last page.
@@ -838,6 +996,22 @@ def submit_application(
 
             page.wait_for_load_state("networkidle", timeout=30000)
             shot = capture_evidence(page, f"app{app_id}_{app.get('company','')}")
+
+            # DID IT ACTUALLY GO THROUGH?
+            #
+            # Clicking submit proves a click happened, nothing more. The first
+            # attempt at #9 pressed the board's search button, landed on a page
+            # of unrelated job listings, screenshotted it as evidence and
+            # recorded the application as delivered. The screenshot is only
+            # evidence if someone checks what is IN it -- so check.
+            landed, why = submission_landed(page)
+            if not landed:
+                raise ApplyError(
+                    f"Refusing to record this as submitted: {why}. "
+                    f"The click did not reach a confirmation. "
+                    f"Evidence: {shot or '(none)'} -- "
+                    f"apply by hand here: {app['job_url']}"
+                )
 
         store.set_application_status(app_id, STATUS_SUBMITTED, screenshot_path=shot)
         if notifier:

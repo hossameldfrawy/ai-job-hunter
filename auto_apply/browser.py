@@ -1250,6 +1250,67 @@ def _open_application_once(
     return page, False, "no apply control found on this page"
 
 
+_QUESTION_BLOCK_JS = """
+n => {
+  let el = n;
+  while (el.parentElement && el.parentElement.tagName !== 'FORM'
+         && el.parentElement.tagName !== 'BODY') {
+    el = el.parentElement;
+  }
+  let sib = el.previousElementSibling;
+  for (let i = 0; i < 4 && sib; i++) {
+    const t = (sib.innerText || '').replace(/Use Previous answers/gi, ' ')
+                                   .replace(/\\s+/g, ' ').trim();
+    if (t.length > 8) return t;
+    sib = sib.previousElementSibling;
+  }
+  return '';
+}
+"""
+
+
+def _question_label(handle: Any) -> str:
+    """The question a control belongs to, when the control says nothing itself.
+
+    Verified live on Wuzzuf's screening form: its four textareas have no name,
+    no id, and the same placeholder ("Write your answer here.."), and the
+    question sits in a SIBLING of each textarea's wrapper -- not in a <label>,
+    and not in any ancestor, whose text is just the character counter.
+
+    Without this every question reads identically, and the dedup in
+    `inspect_form` then collapses four distinct questions into one. Draft #9
+    reported "2 questions" for a form that asks five.
+    """
+    try:
+        text = handle.evaluate(_QUESTION_BLOCK_JS) or ""
+    except Exception:
+        return ""
+    text = " ".join(text.split())
+    if len(text) < 12 or not any(c.isalpha() for c in text):
+        return ""
+    return text[:300]
+
+
+def _radio_options(handle: Any) -> list[str]:
+    """The choices in this radio's group, so the answer can be one of them."""
+    try:
+        return [
+            " ".join(str(o).split())[:60]
+            for o in handle.evaluate(
+                """n => {
+                     if (!n.name) return [];
+                     const group = document.getElementsByName(n.name);
+                     return [...group].map(r =>
+                       (r.closest('label') || r.parentElement || {}).innerText
+                       || r.value || '');
+                   }"""
+            ) or []
+            if str(o).strip()
+        ][:20]
+    except Exception:
+        return []
+
+
 def inspect_form(page: Any, root_selector: str = "form") -> list[FormField]:
     """Describe every fillable field on the page.
 
@@ -1298,9 +1359,21 @@ def inspect_form(page: Any, root_selector: str = "form") -> list[FormField]:
                     continue
 
                 label = _label_for(page, handle)
+                # A screening question is usually written NEXT TO its box
+                # rather than in a <label> for it. Prefer that when the
+                # control's own label says nothing useful.
+                if tag == "textarea" or itype == "radio":
+                    better = _question_label(handle)
+                    if better and len(better) > len(label):
+                        label = better
                 kind = _classify(label)
                 name = handle.get_attribute("name") or handle.get_attribute("id") or ""
-                key = f"{tag}:{name}:{label[:40]}"
+                # Dedup on IDENTITY, not on appearance. Four unnamed textareas
+                # sharing one placeholder are four different questions; keying
+                # them by tag+name+label collapsed them into one and silently
+                # dropped three of a form's five questions.
+                key = (f"{tag}:{name}:{label[:40]}" if name
+                       else f"{tag}:{index}:{pos}")
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1316,7 +1389,8 @@ def inspect_form(page: Any, root_selector: str = "form") -> list[FormField]:
                 elif itype == "file":
                     input_type, options = "file", []
                 elif itype in ("checkbox", "radio"):
-                    input_type, options = itype, []
+                    input_type = itype
+                    options = _radio_options(handle) if itype == "radio" else []
                 else:
                     input_type, options = "text", []
 
@@ -1352,6 +1426,112 @@ _SEARCH_FIELD_HINTS = (
     "keyword", "search", "query", "q=", "state", "province", "category",
     "sort", "filter", "newsletter", "subscribe", "login", "sign in",
 )
+
+
+#: Wording a board uses once it has actually taken an application.
+SUBMITTED_MARKERS: tuple[str, ...] = (
+    "application submitted", "successfully applied", "already applied",
+    "thank you for applying", "thanks for applying", "we received your",
+    "application received", "your application has been", "applied on",
+    "تم إرسال طلبك", "تم التقديم", "شكرا لتقديمك",
+)
+
+#: Wording that means we are looking at a page of search results instead.
+_SEARCH_RESULT_MARKERS: tuple[str, ...] = (
+    "showing 1 -", "browse new jobs", "filters", "0 filters selected",
+    "jobs in egypt and the mena region",
+)
+
+
+def submission_landed(page: Any) -> tuple[bool, str]:
+    """Whether the page we ended on is a confirmation. (ok, why not).
+
+    A click is not a submission. Draft #9's first attempt pressed the board's
+    search button, ended on a list of unrelated jobs, and captured that as
+    proof of delivery -- so the evidence now has to say what it shows.
+    """
+    try:
+        text = " ".join((page.inner_text("body") or "").split()).lower()
+    except Exception:
+        return False, "the page could not be read after submitting"
+
+    for marker in SUBMITTED_MARKERS:
+        if marker in text:
+            return True, marker
+
+    for marker in _SEARCH_RESULT_MARKERS:
+        if marker in text:
+            return False, (f"this is a job search results page ({marker!r}), "
+                           f"not a confirmation")
+
+    # Still showing the questions means the form did not go anywhere.
+    if any(is_question_control(f) for f in inspect_form(page)):
+        return False, "the form's questions are still on screen"
+
+    return False, "no confirmation wording on the page"
+
+
+def has_value(page: Any, field_: FormField) -> bool:
+    """Whether this control actually holds an answer now.
+
+    Checked against the live DOM rather than against our own map, because the
+    two disagreeing is the whole problem: a stale selector fills nothing and
+    reports success on the map it was built from.
+    """
+    try:
+        if field_.input_type == "radio":
+            match = re.search(r'\[name="([^"]+)"\]', field_.selector)
+            if not match:
+                return False
+            return bool(page.evaluate(
+                "name => [...document.getElementsByName(name)]"
+                ".some(r => r.checked)", match.group(1)))
+        handle = page.query_selector(field_.selector)
+        if handle is None:
+            return False
+        if field_.input_type == "checkbox":
+            return bool(handle.is_checked())
+        return bool((handle.input_value() or "").strip())
+    except Exception:
+        return False
+
+
+#: Kinds that are a QUESTION PUT TO THE CANDIDATE rather than a profile fact
+#: the system already knows. These need an answer drafted for them; `email` or
+#: `full_name` do not.
+SCREENING_KINDS: tuple[str, ...] = (
+    "unknown", "cover_letter", "notice_period", "salary",
+    "years_experience", "experience", "availability",
+)
+
+
+def is_question_control(field_: FormField) -> bool:
+    """A screening question, as opposed to the site's own chrome.
+
+    Deliberately wider than `FormField.is_question`, which only counts
+    `unknown` and `cover_letter`. The moment labelling improved enough to
+    classify Wuzzuf's questions as `notice_period` and `salary`, they stopped
+    counting as questions at all -- so nothing drafted answers for them and
+    nothing noticed they were blank. "Filled 2/6" went to submit.
+    """
+    if is_search_field(field_):
+        return False
+    if field_.input_type in ("radio", "select", "textarea"):
+        return True
+    return (field_.kind in SCREENING_KINDS
+            and field_.input_type in ("text", "textarea"))
+
+
+def is_search_field(field_: FormField) -> bool:
+    """True for the site's own search/filter box.
+
+    Its chrome sits on the application page too, and an unnamed text input is
+    otherwise indistinguishable from a screening question -- so the submit
+    flow asked Gemini to answer "Search jobs, companies.." and then refused
+    the whole application for having no confident answer to it.
+    """
+    haystack = f"{field_.selector} {field_.label}".lower()
+    return any(hint in haystack for hint in _SEARCH_FIELD_HINTS)
 
 
 def looks_like_application_form(fields: list[FormField],
@@ -1479,6 +1659,37 @@ def detect_captcha(page: Any) -> tuple[bool, str]:
     return False, ""
 
 
+_PICK_RADIO_JS = """
+([name, want]) => {
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const target = norm(want);
+  if (!target) return false;
+  const group = [...document.getElementsByName(name)];
+  for (const r of group) {
+    const label = norm(((r.closest('label') || r.parentElement || {}).innerText)
+                       || r.value || '');
+    if (label === target || label.startsWith(target) || target.startsWith(label)) {
+      r.click();
+      return true;
+    }
+  }
+  return false;
+}
+"""
+
+
+def _check_radio(page: Any, field_: FormField, value: str) -> bool:
+    """Pick the option in a radio group whose label matches the answer."""
+    match = re.search(r'\[name="([^"]+)"\]', field_.selector)
+    if not match:
+        return False
+    try:
+        return bool(page.evaluate(_PICK_RADIO_JS, [match.group(1), value]))
+    except Exception as exc:
+        log.debug("Could not pick a radio option for %s: %s", field_.label, exc)
+        return False
+
+
 def fill_field(page: Any, field_: FormField, value: str) -> bool:
     """Fill one field. Returns False rather than raising on any failure."""
     if not value:
@@ -1488,7 +1699,12 @@ def fill_field(page: Any, field_: FormField, value: str) -> bool:
             page.select_option(field_.selector, label=value, timeout=8000)
         elif field_.input_type == "file":
             page.set_input_files(field_.selector, value, timeout=15000)
-        elif field_.input_type in ("checkbox", "radio"):
+        elif field_.input_type == "radio":
+            # The selector names the GROUP, so it matches every option in it.
+            # Checking it blind picks whichever comes first -- on a Yes/No
+            # question that is a coin toss recorded as the candidate's answer.
+            return _check_radio(page, field_, value)
+        elif field_.input_type == "checkbox":
             page.check(field_.selector, timeout=8000)
         else:
             page.fill(field_.selector, value, timeout=8000)
@@ -1515,8 +1731,69 @@ SUBMIT_SELECTORS: tuple[str, ...] = (
 )
 
 
+#: Tried BEFORE the generic list: the application's own wording.
+APPLICATION_SUBMIT_SELECTORS: tuple[str, ...] = (
+    'button:has-text("Submit application")',
+    'button:has-text("Submit my application")',
+    'button:has-text("إرسال الطلب")',
+    'button:has-text("تقديم الطلب")',
+)
+
+#: Text that must never be taken for "submit this application".
+#:
+#: "Save and Apply later" is the dangerous one: it contains "Apply", so
+#: `button:has-text("Apply")` matched it, and pressing it saves a DRAFT on the
+#: board while looking exactly like a successful submission.
+_NOT_SUBMIT: tuple[str, ...] = (
+    "search", "بحث", "filter", "تصفية",
+    "use previous answers",
+    "save and apply later", "save for later", "save draft",
+    "cancel", "إلغاء", "back", "previous",
+)
+
+#: True when EVERY control in this element's form is a search input -- i.e.
+#: the element is the site search's own submit button. The board's search bar
+#: sits on the application page too, and its button is an unlabelled magnifier
+#: icon, so neither a text check nor a `button[type="submit"]` match can tell
+#: it apart from the application's real submit control.
+_IN_SEARCH_FORM_JS = """
+n => {
+  const form = n.closest('form');
+  if (!form) return false;
+  const controls = [...form.querySelectorAll('input, textarea, select')]
+      .filter(c => !['hidden','submit','button'].includes(c.type));
+  if (!controls.length) return false;
+  return controls.every(c => {
+    const s = ((c.name || '') + ' ' + (c.placeholder || '') + ' ' +
+               (c.getAttribute('aria-label') || '')).toLowerCase();
+    return /search|keyword|query|^q$|\\bq\\b/.test(s);
+  });
+}
+"""
+
+
+def _in_search_form(element: Any) -> bool:
+    try:
+        return bool(element.evaluate(_IN_SEARCH_FORM_JS))
+    except Exception:
+        return False
+
+
+def _submit_text_ok(element: Any) -> bool:
+    try:
+        text = " ".join((element.inner_text() or "").split()).lower()
+    except Exception:
+        return True
+    return not any(bad in text for bad in _NOT_SUBMIT)
+
+
 def click_submit(page: Any, timeout_ms: int = 5000) -> str:
-    """Press the form's own submit control. Returns the selector, or "".
+    """Press the APPLICATION's own submit control. Returns the selector, or "".
+
+    Every filter here was paid for. Submitting draft #9 with a blind
+    `page.click('button[type="submit"]')` pressed the job board's SEARCH
+    button, ran a search for nothing, screenshotted the results page as
+    evidence, and recorded the application as delivered. Nothing raised.
 
     Shared between registration and application on purpose: they were two
     separate lists that had already drifted -- the application flow knew the
@@ -1524,13 +1801,23 @@ def click_submit(page: Any, timeout_ms: int = 5000) -> str:
     Arabic-rendered signup page had no submit button as far as the bot was
     concerned.
     """
-    for selector in SUBMIT_SELECTORS:
+    for selector in APPLICATION_SUBMIT_SELECTORS + SUBMIT_SELECTORS:
         try:
-            page.click(selector, timeout=timeout_ms)
-            log.info("Submitted via %s", selector)
-            return selector
+            elements = page.query_selector_all(selector) or []
         except Exception:
             continue
+        for element in elements:
+            if not _is_clickable(element):
+                continue
+            if not _submit_text_ok(element) or _in_search_form(element):
+                continue
+            try:
+                element.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            if _press_click(element):
+                log.info("Submitted via %s", selector)
+                return selector
     return ""
 
 

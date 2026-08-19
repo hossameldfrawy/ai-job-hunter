@@ -80,22 +80,83 @@ PROFILE = CandidateProfile(
 )
 
 
+class _FakeInput:
+    def __init__(self, value):
+        self._value = value
+
+    def input_value(self):
+        return self._value
+
+    def is_checked(self):
+        return bool(self._value)
+
+
+class _FakeControl:
+    """A submit control as `click_submit` examines them now: visible, not the
+    site search's button, not "Save and Apply later"."""
+
+    def __init__(self, page, selector):
+        self._page, self._selector = page, selector
+
+    def inner_text(self):
+        return "Submit"
+
+    def is_visible(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, _name):
+        return None
+
+    def scroll_into_view_if_needed(self, **kwargs):
+        return None
+
+    def evaluate(self, _script, *args):
+        return False
+
+    def click(self, **kwargs):
+        self._page.clicked.append(self._selector)
+        # Only a SUBMIT counts as submitting. Clicking "Apply Now" to open the
+        # form is navigation, and conflating the two would let a test pass
+        # that had merely clicked its way onto the page.
+        if "submit" in self._selector.lower():
+            self._page.submitted = True
+
+
 class FakePage:
     def __init__(self):
         self.visited: list[str] = []
         self.clicked: list[str] = []
         self.uploaded: list[tuple[str, str]] = []
+        # The submit flow re-reads the live DOM to confirm every question was
+        # answered and that the board actually acknowledged the application.
+        self.values: dict[str, str] = {}
+        self.submitted = False
 
     def goto(self, url, **kwargs):
         self.visited.append(url)
+
+    def fill(self, selector, value, timeout=None):
+        self.values[selector] = value
 
     def set_input_files(self, selector, value, timeout=None):
         self.uploaded.append((selector, value))
 
     def query_selector(self, selector):
+        if selector in self.values:
+            return _FakeInput(self.values[selector])
         return object() if "submit" in selector.lower() else None
 
+    def query_selector_all(self, selector):
+        if "submit" not in selector.lower() and "Apply" not in selector:
+            return []
+        return [_FakeControl(self, selector)]
+
     def inner_text(self, _selector):
+        if self.submitted:
+            return "Application submitted"
         return "We need a VoIP engineer with SIP and Asterisk."
 
     def content(self):
@@ -105,6 +166,7 @@ class FakePage:
         if "submit" not in selector.lower() and "Apply" not in selector:
             raise RuntimeError(f"no such element: {selector}")
         self.clicked.append(selector)
+        self.submitted = True
 
     def wait_for_load_state(self, *args, **kwargs):
         pass
@@ -139,6 +201,10 @@ class HitlE2E(unittest.TestCase):
 
         def fake_fill_field(page, field_, value):
             self.filled.append((field_.selector, value))
+            # Leave the value ON the page: the submit flow re-reads the live
+            # DOM to confirm each question was answered, and a stub that only
+            # reports success would fake past that check.
+            page.values[field_.selector] = value
             return True
 
         def fake_capture(page, prefix):
@@ -346,8 +412,12 @@ class TestTheConversationalLoop(HitlE2E):
         self.notifier.clear()
         reply = self.listener.handle_message(f"done {app_id}")
         self.assertFalse(reply.ok)
-        self.assertEqual(self.page.clicked, [],
+        # Trying "Apply Now" to reach a form is fine -- pressing SUBMIT on the
+        # site's search widget is the thing that must never happen.
+        self.assertFalse(self.page.submitted,
                          "a search widget was submitted as an application")
+        self.assertEqual(
+            [c for c in self.page.clicked if "submit" in c.lower()], [])
         self.assertEqual(self.store.get_application(app_id)["status"], "failed")
         self.assertIn("APPLICATION FAILED", self.notifier.last_telegram)
         self.assertIn("APPLICATION FAILED", self.notifier.last_whatsapp)

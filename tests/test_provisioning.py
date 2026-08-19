@@ -82,6 +82,36 @@ class FakeContext:
         self.saved_for: list[str] = []
 
 
+class _FakeSubmit:
+    """One candidate submit control, as `click_submit` now examines them."""
+
+    def __init__(self, page, selector, text="Submit"):
+        self._page, self._selector, self._text = page, selector, text
+
+    def inner_text(self):
+        return self._text
+
+    def is_visible(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, _name):
+        return None
+
+    def scroll_into_view_if_needed(self, **kwargs):
+        return None
+
+    def evaluate(self, script, *args):
+        # `_in_search_form` asks whether this control belongs to the site's
+        # search box. In this fake it never does.
+        return False
+
+    def click(self, **kwargs):
+        self._page.clicked.append(self._selector)
+
+
 class FakePage:
     def __init__(self, markup="<form></form>", submittable=True):
         self.markup = markup
@@ -101,6 +131,14 @@ class FakePage:
         if not self.submittable:
             raise RuntimeError("no such element")
         self.clicked.append(selector)
+
+    def query_selector_all(self, selector):
+        """`click_submit` inspects candidate controls now rather than clicking
+        the first selector blind -- it has to check each one is visible, is not
+        the site search's button, and is not "Save and Apply later"."""
+        if not self.submittable:
+            return []
+        return [_FakeSubmit(self, selector)]
 
     def wait_for_load_state(self, *args, **kwargs):
         pass
@@ -561,8 +599,22 @@ class TestSharedSubmitControl(unittest.TestCase):
     concerned.
     """
 
-    def test_the_first_matching_selector_wins(self):
+    def test_the_applications_own_wording_is_tried_first(self):
+        """Before any generic selector. On Wuzzuf the generic
+        `button[type="submit"]` is the SEARCH box's button, and the
+        application's control is a <button type="button"> reading "Submit
+        application" -- so the generic list finds the wrong one first."""
         page = FakePage()
+        self.assertEqual(click_submit(page),
+                         'button:has-text("Submit application")')
+
+    def test_the_generic_selectors_are_still_reached(self):
+        """A registration form has no "Submit application" on it."""
+        page = FakePage()
+        page.query_selector_all = lambda selector: (
+            [_FakeSubmit(page, selector)]
+            if selector in browser_mod.SUBMIT_SELECTORS else []
+        )
         self.assertEqual(click_submit(page), 'button[type="submit"]')
 
     def test_arabic_submit_labels_are_covered(self):

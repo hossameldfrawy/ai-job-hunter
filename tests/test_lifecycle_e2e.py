@@ -56,6 +56,49 @@ from vault import (                                            # noqa: E402
 # ---------------------------------------------------------------------------
 # Doubles
 # ---------------------------------------------------------------------------
+class _FakeInput:
+    """A control the submit flow can read a value back out of."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def input_value(self):
+        return self._value
+
+    def is_checked(self):
+        return bool(self._value)
+
+
+class _FakeControl:
+    """A submit control, as `click_submit` now examines them: visible, not the
+    site search's button, and not "Save and Apply later"."""
+
+    def __init__(self, page, selector):
+        self._page, self._selector = page, selector
+
+    def inner_text(self):
+        return "Submit"
+
+    def is_visible(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, _name):
+        return None
+
+    def scroll_into_view_if_needed(self, **kwargs):
+        return None
+
+    def evaluate(self, _script, *args):
+        return False              # never inside the search form
+
+    def click(self, **kwargs):
+        self._page.clicked.append(self._selector)
+        self._page.submitted = True
+
+
 class FakePage:
     """Just enough Playwright surface for the two flows that use it."""
 
@@ -64,6 +107,15 @@ class FakePage:
         self.visited: list[str] = []
         self.clicked: list[str] = []
         self.uploaded: list[tuple[str, str]] = []
+        # What each selector now holds. The submit flow re-reads the LIVE page
+        # to check every question was actually answered, because "filled 2/6"
+        # once sailed straight through to a submitted application with three
+        # questions blank.
+        self.values: dict[str, str] = {}
+        self.submitted = False
+
+    def fill(self, selector, value, timeout=None):
+        self.values[selector] = value
 
     def goto(self, url, **kwargs):
         self.visited.append(url)
@@ -78,15 +130,25 @@ class FakePage:
         return "<form><input name='email'></form>"
 
     def query_selector(self, selector):
+        if selector in self.values or self.uploaded:
+            return _FakeInput(self.values.get(selector, ""))
         return object() if "submit" in selector.lower() else None
 
+    def query_selector_all(self, selector):
+        if "submit" not in selector.lower() and "Apply" not in selector:
+            return []
+        return [_FakeControl(self, selector)]
+
     def inner_text(self, _selector):
-        return self.body
+        # Once submitted the board says so -- the flow now refuses to record a
+        # submission it cannot see confirmed on the page.
+        return "Application submitted" if self.submitted else self.body
 
     def click(self, selector, **kwargs):
         if "submit" not in selector.lower() and "Apply" not in selector:
             raise RuntimeError(f"no such element: {selector}")
         self.clicked.append(selector)
+        self.submitted = True
 
     def wait_for_load_state(self, *args, **kwargs):
         pass
@@ -231,6 +293,11 @@ class LifecycleHarness(unittest.TestCase):
 
         def fake_fill_field(page, field_, value):
             self.filled.append((field_.kind, value))
+            # Record it on the PAGE too. The submit flow re-reads the live DOM
+            # to confirm every question was actually answered, so a stub that
+            # reports success without leaving a value behind would fake past
+            # exactly the check that matters.
+            page.values[field_.selector] = value
             return True
 
         def fake_capture(page, prefix):
@@ -538,6 +605,10 @@ class TestFailureIsRecoverable(LifecycleHarness):
             raise RuntimeError("element not found")
 
         self.page.click = no_button
+        # `click_submit` examines candidate controls rather than clicking the
+        # first selector blind, so a page with no submit button has to offer
+        # none -- otherwise it finds one and the test proves nothing.
+        self.page.query_selector_all = lambda selector: []
         self.assertFalse(
             submit_application(app_id, self.v, self.notifier, dry_run=False)
         )
