@@ -1859,3 +1859,231 @@ class TestSpaSettling(unittest.TestCase):
         page = self.Page(fail_states=("networkidle", "load"))
         browser_mod._settle_spa(page)
         self.assertGreaterEqual(page.slept, 2000)
+
+
+class TestSubmitControlIsTheApplications(unittest.TestCase):
+    """What was pressed when draft #9 was "submitted" the first time.
+
+    A blind `page.click('button[type="submit"]')` found the job board's SEARCH
+    button, ran a search for nothing, screenshotted the results as evidence and
+    recorded the application as delivered. Nothing raised.
+    """
+
+    class Control:
+        def __init__(self, text="Submit", in_search_form=False, visible=True):
+            self.text, self._search, self._visible = text, in_search_form, visible
+            self.clicked = False
+
+        def inner_text(self):
+            return self.text
+
+        def is_visible(self):
+            return self._visible
+
+        def is_enabled(self):
+            return True
+
+        def get_attribute(self, _name):
+            return None
+
+        def scroll_into_view_if_needed(self, **kwargs):
+            return None
+
+        def evaluate(self, _script, *args):
+            return self._search
+
+        def click(self, **kwargs):
+            self.clicked = True
+
+    class Page:
+        def __init__(self, controls):
+            self.controls = controls
+
+        def query_selector_all(self, selector):
+            return self.controls.get(selector, [])
+
+    def test_the_search_forms_button_is_never_pressed(self):
+        search = self.Control(text="", in_search_form=True)
+        page = self.Page({'button[type="submit"]': [search]})
+        self.assertEqual(browser_mod.click_submit(page), "")
+        self.assertFalse(search.clicked, "the site search was submitted")
+
+    def test_save_and_apply_later_is_never_pressed(self):
+        """It contains "Apply", so `button:has-text("Apply")` matched it -- and
+        pressing it saves a DRAFT that looks exactly like a submission."""
+        later = self.Control(text="Save and Apply later")
+        page = self.Page({'button:has-text("Apply")': [later]})
+        self.assertEqual(browser_mod.click_submit(page), "")
+        self.assertFalse(later.clicked)
+
+    def test_the_applications_own_button_is_pressed(self):
+        real = self.Control(text="Submit application")
+        page = self.Page({'button:has-text("Submit application")': [real]})
+        self.assertEqual(browser_mod.click_submit(page),
+                         'button:has-text("Submit application")')
+        self.assertTrue(real.clicked)
+
+    def test_the_real_button_wins_over_the_search_button(self):
+        search = self.Control(text="", in_search_form=True)
+        real = self.Control(text="Submit application")
+        page = self.Page({
+            'button[type="submit"]': [search],
+            'button:has-text("Submit application")': [real],
+        })
+        browser_mod.click_submit(page)
+        self.assertTrue(real.clicked)
+        self.assertFalse(search.clicked)
+
+    def test_an_invisible_control_is_skipped(self):
+        hidden = self.Control(text="Submit application", visible=False)
+        page = self.Page({'button:has-text("Submit application")': [hidden]})
+        self.assertEqual(browser_mod.click_submit(page), "")
+
+    def test_every_forbidden_word_is_listed(self):
+        for word in ("search", "save and apply later", "cancel"):
+            with self.subTest(word=word):
+                self.assertIn(word, browser_mod._NOT_SUBMIT)
+
+
+class TestSubmissionIsVerified(unittest.TestCase):
+    """Both directions of getting this wrong happened on the same afternoon.
+
+    A search-results page was recorded as a delivered application. Then the
+    submission that actually WORKED was reported as failed, because Wuzzuf
+    re-renders the answered questions in place instead of showing a banner --
+    its applications list said "Applied 6 minutes ago / Answered 5 out of 5"
+    the whole time.
+    """
+
+    class Page:
+        def __init__(self, text, fields=()):
+            self.text, self._fields = text, list(fields)
+
+        def inner_text(self, _selector):
+            return self.text
+
+    @contextmanager
+    def _inspect(self, page):
+        original = browser_mod.inspect_form
+        browser_mod.inspect_form = lambda p, *a, **k: list(p._fields)
+        try:
+            yield
+        finally:
+            browser_mod.inspect_form = original
+
+    def test_a_confirmation_banner_counts(self):
+        for wording in ("Application submitted", "Thank you for applying",
+                        "Your application has been received"):
+            with self.subTest(wording=wording):
+                page = self.Page(wording)
+                with self._inspect(page):
+                    ok, _why = browser_mod.submission_landed(page)
+                self.assertTrue(ok)
+
+    def test_the_boards_own_record_counts(self):
+        """The exact wording that was on screen while this said 'failed'."""
+        page = self.Page("Applications (2) IT Help Desk Everest properties "
+                         "Applied 6 minutes ago Screening questions "
+                         "Answered 5 out of 5")
+        with self._inspect(page):
+            ok, why = browser_mod.submission_landed(page)
+        self.assertTrue(ok, why)
+
+    def test_a_partly_answered_form_does_not_count(self):
+        page = self.Page("Screening questions Answered 3 out of 5")
+        with self._inspect(page):
+            ok, _why = browser_mod.submission_landed(page)
+        self.assertFalse(ok)
+
+    def test_a_search_results_page_is_named_as_one(self):
+        page = self.Page("Jobs in Egypt and the MENA Region Filters "
+                         "Showing 1 - 15 of 5736")
+        with self._inspect(page):
+            ok, why = browser_mod.submission_landed(page)
+        self.assertFalse(ok)
+        self.assertIn("search results", why)
+
+    def test_questions_still_on_screen_is_not_a_confirmation(self):
+        page = self.Page("What is your notice period?", fields=[
+            _field("unknown", "textarea >> nth=0", "textarea",
+                   "What is your notice period?")])
+        with self._inspect(page):
+            ok, why = browser_mod.submission_landed(page)
+        self.assertFalse(ok)
+        self.assertIn("still on screen", why)
+
+    def test_an_unreadable_page_is_not_a_confirmation(self):
+        class Dead:
+            _fields = ()
+
+            def inner_text(self, _selector):
+                raise RuntimeError("gone")
+
+        with self._inspect(Dead()):
+            ok, _why = browser_mod.submission_landed(Dead())
+        self.assertFalse(ok)
+
+
+class TestRadioAnswersArePicked(unittest.TestCase):
+    """`page.check` on the GROUP selector matches every option in it -- on a
+    Yes/No question that is a coin toss recorded as the candidate's answer."""
+
+    class Page:
+        def __init__(self, picked=True):
+            self.picked = picked
+            self.evaluated = []
+
+        def evaluate(self, script, arg=None):
+            self.evaluated.append(arg)
+            return self.picked
+
+        def query_selector_all(self, _selector):
+            return []
+
+    FIELD = FormField(selector='[name="a6767d69"]', kind="unknown",
+                      input_type="radio", label="Comfortable on-site?",
+                      options=["Yes", "No"])
+
+    def test_the_chosen_option_is_passed_to_the_picker(self):
+        page = self.Page()
+        self.assertTrue(browser_mod.fill_field(page, self.FIELD, "Yes"))
+        self.assertEqual(page.evaluated[0], ['a6767d69', "Yes"])
+
+    def test_an_unselectable_option_reports_failure(self):
+        page = self.Page(picked=False)
+        self.assertFalse(browser_mod.fill_field(page, self.FIELD, "Maybe"))
+
+    def test_a_group_with_no_name_is_not_guessed_at(self):
+        field = FormField(selector="input >> nth=3", kind="unknown",
+                          input_type="radio", label="?")
+        self.assertFalse(browser_mod.fill_field(self.Page(), field, "Yes"))
+
+
+class TestQuestionsAreCounted(unittest.TestCase):
+    """`FormField.is_question` only counts `unknown` and `cover_letter`. The
+    moment labelling improved enough to classify Wuzzuf's questions as
+    `notice_period` and `salary`, they stopped counting as questions -- so
+    nothing drafted answers for them and nothing noticed they were blank.
+    "Filled 2/6" went to submit."""
+
+    def test_a_classified_screening_question_still_counts(self):
+        for kind in ("notice_period", "salary", "years_experience"):
+            with self.subTest(kind=kind):
+                field = _field(kind, "textarea >> nth=0", "textarea", "Q?")
+                self.assertTrue(browser_mod.is_question_control(field))
+
+    def test_a_radio_counts(self):
+        field = _field("unknown", '[name="x"]', "radio", "On-site?")
+        self.assertTrue(browser_mod.is_question_control(field))
+
+    def test_the_site_search_never_counts(self):
+        field = _field("unknown", '[name="q"]', "text",
+                       "Search jobs, companies..")
+        self.assertFalse(browser_mod.is_question_control(field))
+
+    def test_a_profile_fact_is_not_a_question(self):
+        """The system knows these already -- they need filling, not drafting."""
+        for kind in ("email", "phone", "full_name"):
+            with self.subTest(kind=kind):
+                field = _field(kind, f"#{kind}", "text", kind)
+                self.assertFalse(browser_mod.is_question_control(field))

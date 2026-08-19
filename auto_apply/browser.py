@@ -1045,8 +1045,24 @@ def open_application_form(
     current = page
     opened_any = False
 
+    # Settle before looking for anything. The caller has usually just called
+    # goto() and a board that renders client-side has no apply button yet --
+    # which surfaced as the same draft failing with "this looks like the
+    # site's search/filter widget" on one run and submitting fine on the next.
+    _settle_spa(page, timeout_ms)
+
     for _hop in range(max(1, max_hops)):
         current, opened, note = _open_application_once(current, timeout_ms)
+        if not opened and "no apply control" in note:
+            # The control may simply not have rendered yet. This hop has just
+            # signed us in and reloaded, and on a client-rendered board the
+            # button appears a beat later -- which showed up as the SAME draft
+            # reaching its form on one run and reporting "no apply control
+            # found on this page" on the next.
+            _settle_spa(current, timeout_ms)
+            current, opened, retry_note = _open_application_once(
+                current, timeout_ms)
+            note = retry_note if opened else note
         if note:
             notes.append(note)
         if not opened:
@@ -1443,12 +1459,25 @@ _SEARCH_RESULT_MARKERS: tuple[str, ...] = (
 )
 
 
+#: Wording a board uses in its OWN record of an application, as opposed to a
+#: one-off confirmation banner. Both of these were on Wuzzuf's applications
+#: page for a submission this code had just reported as failed.
+_APPLIED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bapplied\s+\d+\s+\w+\s+ago\b"),
+    re.compile(r"\banswered\s+(\d+)\s+out of\s+(\d+)\b"),
+)
+
+
 def submission_landed(page: Any) -> tuple[bool, str]:
     """Whether the page we ended on is a confirmation. (ok, why not).
 
-    A click is not a submission. Draft #9's first attempt pressed the board's
-    search button, ended on a list of unrelated jobs, and captured that as
-    proof of delivery -- so the evidence now has to say what it shows.
+    A click is not a submission -- draft #9's first attempt pressed the board's
+    SEARCH button, ended on a list of unrelated jobs and captured that as proof
+    of delivery. But the opposite error is just as real and cost the same
+    afternoon: the submission that actually WORKED was reported as failed,
+    because Wuzzuf re-renders the answered questions in place rather than
+    showing a banner. Both directions are wrong, so this looks for the board's
+    own record of the application, not just for celebratory wording.
     """
     try:
         text = " ".join((page.inner_text("body") or "").split()).lower()
@@ -1458,6 +1487,14 @@ def submission_landed(page: Any) -> tuple[bool, str]:
     for marker in SUBMITTED_MARKERS:
         if marker in text:
             return True, marker
+
+    for pattern in _APPLIED_PATTERNS:
+        found = pattern.search(text)
+        if not found:
+            continue
+        if found.lastindex == 2 and found.group(1) != found.group(2):
+            continue          # "answered 3 out of 5" is not a submission
+        return True, found.group(0)
 
     for marker in _SEARCH_RESULT_MARKERS:
         if marker in text:
@@ -1666,11 +1703,16 @@ _PICK_RADIO_JS = """
   if (!target) return false;
   const group = [...document.getElementsByName(name)];
   for (const r of group) {
-    const label = norm(((r.closest('label') || r.parentElement || {}).innerText)
-                       || r.value || '');
-    if (label === target || label.startsWith(target) || target.startsWith(label)) {
+    const holder = r.closest('label') || r.parentElement;
+    const label = norm((holder && holder.innerText) || r.value || '');
+    if (label === target || label.startsWith(target) ||
+        target.startsWith(label)) {
       r.click();
-      return true;
+      // A framework-controlled radio ignores a click on the input and only
+      // updates when its LABEL is clicked, so try that too and report what
+      // actually stuck rather than that a click happened.
+      if (!r.checked && holder) holder.click();
+      return r.checked;
     }
   }
   return false;
@@ -1679,15 +1721,34 @@ _PICK_RADIO_JS = """
 
 
 def _check_radio(page: Any, field_: FormField, value: str) -> bool:
-    """Pick the option in a radio group whose label matches the answer."""
+    """Pick the option in a radio group whose label matches the answer.
+
+    Returns whether the option ended up SELECTED, not whether it was clicked:
+    the two differ on a React-rendered form, and the difference is a screening
+    question submitted blank.
+    """
     match = re.search(r'\[name="([^"]+)"\]', field_.selector)
     if not match:
         return False
+    name = match.group(1)
     try:
-        return bool(page.evaluate(_PICK_RADIO_JS, [match.group(1), value]))
+        if page.evaluate(_PICK_RADIO_JS, [name, value]):
+            return True
     except Exception as exc:
         log.debug("Could not pick a radio option for %s: %s", field_.label, exc)
-        return False
+
+    # Last resort: Playwright's own click, which dispatches trusted events.
+    try:
+        for option in page.query_selector_all(f'[name="{name}"]') or []:
+            label = option.evaluate(
+                "n => ((n.closest('label') || n.parentElement || {}).innerText"
+                " || n.value || '').trim()")
+            if (label or "").strip().lower() == (value or "").strip().lower():
+                option.check(timeout=5000)
+                return bool(option.is_checked())
+    except Exception as exc:
+        log.debug("Radio fallback failed for %s: %s", field_.label, exc)
+    return False
 
 
 def fill_field(page: Any, field_: FormField, value: str) -> bool:
