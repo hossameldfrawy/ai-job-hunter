@@ -212,8 +212,19 @@ Scheduled Actions runs cannot hold an open connection — the runner is destroye
 after each execution — so they use poll mode. It covers the same chats, just on
 the 30-minute cadence instead of instantly.
 
-Tune it under `telegram_user:` in `config.yml`. By default it reads every group
-and channel you have joined, skips your 1:1 DMs, and requires a message to
+By default it reads every group and channel you have joined, which is rarely
+what you want: a real dialog list is mostly news, deals and social channels. Let
+it tell you which ones actually pay their way, then narrow it:
+
+```bash
+python check_telegram.py --scan 168 --suggest
+```
+
+That ranks each monitored chat by how many hiring posts it genuinely produced
+over the window and prints an `include_chats:` block to paste into `config.yml`.
+Fewer chats means faster runs and less flood-wait risk, with no loss of coverage.
+
+Tune it under `telegram_user:` in `config.yml`. It skips your 1:1 DMs, and requires a message to
 contain both a hiring word *and* a technical keyword (VoIP, SIP, Issabel,
 Asterisk, IT support, Linux, Odoo, POS, telecom …) before it costs any Gemini
 quota. Narrow it with `include_chats`, or set `require_tech_match: false` to
@@ -261,6 +272,7 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python discover_channels.py` | Audit public Telegram channels |
 | `python auth_telegram.py` | One-time Telegram login (private groups) |
 | `python check_telegram.py` | Verify the Telegram client, list your groups |
+| `python check_telegram.py --scan 168 --suggest` | Rank your chats by hiring output, emit a narrowed `include_chats` |
 | `python -m unittest discover -s tests` | Offline test suite (97 tests, no network) |
 
 ---

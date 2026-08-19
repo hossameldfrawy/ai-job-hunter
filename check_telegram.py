@@ -10,6 +10,9 @@ can see what it would have caught before trusting it to run unattended.
     python check_telegram.py --scan 24    scan the last 24 hours for job posts
     python check_telegram.py --live 60    watch live for 60 seconds
     python check_telegram.py --pipeline   show the JobPost records produced
+    python check_telegram.py --scan 168 --suggest
+                                          rank chats by hiring output and emit
+                                          a narrowed include_chats list
 
 Read-only throughout: it never sends, joins or reacts to anything.
 """
@@ -143,7 +146,7 @@ async def run_checks(args: argparse.Namespace) -> int:
             if len(watched) > args.limit:
                 info(f"... and {len(watched) - args.limit} more")
 
-        if args.dialogs:
+        if args.dialogs and not args.suggest:
             return 0
 
         # -- history scan --------------------------------------------------
@@ -221,6 +224,44 @@ async def run_checks(args: argparse.Namespace) -> int:
                 print(f"  link   : {job.url}")
                 print(f"  prefilter score {score} -> {verdict}")
 
+        # -- suggest a narrower include_chats --------------------------------
+        if args.suggest:
+            header("5. Which chats are actually worth watching")
+            print(f"  {DIM}Ranking your {len(watched)} monitored chats by how many "
+                  f"hiring posts they\n  actually produced in the last {hours}h.{RESET}\n")
+
+            tally: dict[str, dict] = {}
+            for chat, _username, msg in matches:
+                row = tally.setdefault(chat, {"hits": 0, "tech": 0})
+                row["hits"] += 1
+                row["tech"] += len(tech_hits(msg.message or ""))
+
+            productive = sorted(
+                tally.items(), key=lambda kv: (-kv[1]["hits"], -kv[1]["tech"])
+            )
+            if not productive:
+                warn("No chat produced a hiring post in that window.")
+                info("Try a longer window: python check_telegram.py --scan 168 --suggest")
+            else:
+                print(f"  {'HITS':>5}{'TECH':>6}  CHAT")
+                print("  " + "-" * 62)
+                for chat, row in productive:
+                    print(f"  {row['hits']:>5}{row['tech']:>6}  {_short(chat, 48)}")
+
+                idle = len(watched) - len(productive)
+                print()
+                ok(f"{len(productive)} chat(s) produced jobs; {idle} produced nothing")
+                if idle:
+                    info(f"Watching all {len(watched)} costs ~{len(watched) // 3}s per run "
+                         f"and risks flood-waits for no gain.")
+                print(f"\n  {BOLD}Paste this into config.yml under telegram_user:{RESET}\n")
+                print("  include_chats:")
+                for chat, row in productive:
+                    safe = chat.replace('"', "'")
+                    print(f'    - "{safe}"    # {row["hits"]} hiring post(s)')
+                print(f"\n  {DIM}Matching is a case-insensitive substring of the chat "
+                      f"title,\n  so a distinctive fragment is enough.{RESET}")
+
         # -- live watch ------------------------------------------------------
         if args.live:
             header(f"6. Live listener ({args.live}s)")
@@ -270,6 +311,9 @@ def main() -> int:
                    help="watch for new messages for N seconds")
     p.add_argument("--pipeline", action="store_true",
                    help="show the JobPost records the pipeline would receive")
+    p.add_argument("--suggest", action="store_true",
+                   help="rank your chats by hiring output and emit an "
+                        "include_chats list for config.yml")
     p.add_argument("--limit", type=int, default=25,
                    help="max rows to print per section (default 25)")
     p.add_argument("-v", "--verbose", action="store_true", help="list every chat")

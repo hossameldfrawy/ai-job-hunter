@@ -139,6 +139,21 @@ def handle_live_job(
         for ev in evaluations:
             db.record_evaluation(ev)
 
+        # Same rule as the batch path: a posting the AI never actually judged
+        # must not stay retired, or a quota blip during live mode would drop
+        # real jobs on the floor with no trace.
+        transport_failures = [
+            e.fingerprint for e in evaluations
+            if e.error and e.error != "not_a_real_vacancy"
+        ]
+        if transport_failures:
+            db.forget(transport_failures)
+            log.warning(
+                "LIVE: evaluation failed for %r -- re-queued for the next sweep.",
+                job.title[:60],
+            )
+            return False
+
         threshold = settings.match_threshold
         matches = [
             e for e in evaluations if e.match_score >= threshold and not e.error
