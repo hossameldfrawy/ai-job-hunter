@@ -15,3 +15,15 @@ pypdf==5.1.0
 # The cloud runner logged "Telethon is not installed" and silently skipped
 # both, so a scheduled run found 9 real matches and delivered 0 of them.
 Telethon==1.44.0
+
+# -- Phase 2: auto-apply & interview copilot (LOCAL only) -------------------
+# The cloud workflow installs these but never uses them: auto-apply needs a
+# real browser and writes to the private vault, so it does not run on the
+# GitHub Actions schedule. Only the pip install runs there; the ~150MB browser
+# download (`python -m playwright install chromium`) is a local step.
+#
+# NOTE: 1.49.1 cannot build on Python 3.14 -- its pinned greenlet has no cp314
+# wheel. 1.62 supports 3.10 through 3.14, which covers both the 3.12 runner and
+# a 3.14 desktop.
+playwright>=1.49,<2
+cryptography>=42,<47

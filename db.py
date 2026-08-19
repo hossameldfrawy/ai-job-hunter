@@ -481,6 +481,22 @@ class Database:
             log.info("Pruned %d stale records from the dedup store.", removed)
         return removed
 
+    def top_matches_for_apply(self, threshold: int) -> list[dict[str, Any]]:
+        """Best-scoring evaluations, joined to the posting they came from.
+
+        The apply engine needs the URL and the source platform, which live on
+        seen_jobs, not on the evaluation row.
+        """
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(
+                "SELECT e.*, s.url AS url, s.source AS source "
+                "FROM evaluations e "
+                "LEFT JOIN seen_jobs s ON s.fingerprint = e.fingerprint "
+                "WHERE e.match_score >= ? "
+                "ORDER BY e.match_score DESC, e.id DESC LIMIT 200",
+                (int(threshold),),
+            )]
+
     # -- reporting ----------------------------------------------------------
     def stats(self) -> dict[str, Any]:
         with self._lock:

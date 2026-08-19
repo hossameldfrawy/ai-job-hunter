@@ -118,6 +118,68 @@ gh workflow run job_hunter.yml
 
 ---
 
+## Phase 2 — auto-apply & interview copilot
+
+Local only. It needs a real browser and it writes to a private vault, so it
+never runs on the cloud schedule — that stays a pure discovery pipeline.
+
+```bash
+python main.py --register Tanqeeb   # assisted signup: pre-fills, you submit
+python main.py --apply              # draft applications for top matches
+python main.py --applications       # what is drafted / submitted
+python main.py --approve 1          # approve a draft, then submit it
+python main.py --decline 1          # discard it
+python main.py --inbox              # scan the mailbox for interview mail
+python main.py --watch-inbox        # keep scanning
+```
+
+### The vault is a separate database, on purpose
+
+`state/jobs.db` is force-pushed to a **public** branch every run. Credentials,
+cover letters and recruiter mail therefore live in `state/vault.db` — git-ignored,
+never touched by the workflow, encrypted with Fernet. A test asserts the
+workflow never copies it, so a future edit cannot quietly start publishing it.
+
+### Three deliberate limits
+
+**LinkedIn is never automated.** Its enforcement is the strictest of any source
+here and it is also the most productive one; a flagged account would cost far
+more than the applications it saved. LinkedIn matches are alert-only, refused at
+every entry point rather than filtered somewhere downstream.
+
+**Registration is assisted, not automatic.** Signup flows sit behind CAPTCHA and
+phone verification. The browser opens the page, derives a strong per-platform
+password and fills everything from your CV; you solve the CAPTCHA and press
+submit. Same finished profile, none of the ban risk. Accounts you made by hand
+can be vaulted directly.
+
+**Approval is a gate, not a notification.** A draft sits at `review_pending`
+until you approve it by id. Gemini writes the cover letter and the answers, but
+nothing is submitted in your name on the strength of a model's guess at your
+salary expectations. Set `require_approval: false` to change that.
+
+### It refuses to submit into the wrong form
+
+Job pages are full of forms that are not the apply form. On a live Tanqeeb page
+the inspector found the site's **search widget** — filling that and clicking
+submit would have run a search and reported it as a submitted application. So a
+form must show real evidence (a CV upload, a cover-letter box, or two personal
+fields) before anything is submitted; otherwise the draft is kept, the cover
+letter is ready to paste, and you get the link to apply by hand.
+
+### Interview monitor
+
+IMAP over `imap.gmail.com:993`, classified by Gemini into interview /
+assessment / rejection / acknowledgment, cross-referenced against your
+applications, pushed to Telegram with the meeting time and joining link already
+extracted.
+
+It is careful with a real mailbox: fetches use `BODY.PEEK`, so scanning never
+marks anything read, and a cheap local filter runs first — a message that does
+not look job-related is never sent to the AI and never stored.
+
+---
+
 ## Configuration
 
 Two layers, and the split matters:

@@ -506,3 +506,65 @@ notifications:
   digest_on_source_failure: true
   # Don't repeat a failure-triggered digest more often than this.
   digest_failure_cooldown_minutes: 120
+
+# ==========================================================================
+#  PHASE 2 -- auto-apply & interview copilot (LOCAL ONLY)
+#  Needs a real browser and writes to the private vault, so it never runs on
+#  the GitHub Actions schedule. Drive it with `python main.py --apply` etc.
+# ==========================================================================
+auto_apply:
+  enabled: true
+
+  # Only draft applications at or above this score. Higher than the alert
+  # threshold on purpose: an alert costs you a glance, an application costs
+  # your name.
+  min_score: 80
+
+  # LinkedIn is NEVER automated. Its anti-automation enforcement is the
+  # strictest of any board here and a flagged account would cost the single
+  # best source in the whole system. LinkedIn matches are alert-only.
+  never_automate:
+    - linkedin
+
+  # A drafted application waits for explicit approval before submission.
+  # Set false ONLY if you are willing to have Gemini's answers submitted in
+  # your name unreviewed.
+  require_approval: true
+
+  # Seconds to let a page settle before reading its form.
+  page_timeout: 45
+  # Keep the browser visible. Assisted registration REQUIRES this -- you solve
+  # the CAPTCHA. Headless is fine once an account already exists.
+  headed: true
+
+  # Identity overrides. These beat whatever Gemini reads out of the CV, because
+  # the model should not have the last word on your own contact details.
+  identity:
+    email: "hossam.eldefrawy.dev@gmail.com"
+
+  # Boards the assisted registration flow knows how to open.
+  platforms:
+    - name: Tanqeeb
+      url: "https://www.tanqeeb.com/register"
+      login_url: "https://www.tanqeeb.com/login"
+    - name: Wuzzuf
+      url: "https://wuzzuf.net/signup/candidate"
+      login_url: "https://wuzzuf.net/login"
+    - name: Talent.com
+      url: "https://ae.talent.com/register"
+      login_url: "https://ae.talent.com/login"
+
+# -- Inbound interview / status email monitor ------------------------------
+email_monitor:
+  enabled: true
+  imap_host: imap.gmail.com
+  imap_port: 993
+  mailbox: INBOX
+  # Look back this far on the first run; afterwards only new mail is read.
+  lookback_days: 14
+  # Read at most this many unread messages per pass.
+  max_messages: 40
+  # Messages are left UNREAD unless they turn out to be job-related, so the
+  # monitor never disturbs personal mail.
+  mark_seen_when_classified: true
+  poll_interval_minutes: 15

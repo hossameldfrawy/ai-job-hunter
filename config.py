@@ -88,6 +88,11 @@ class Settings:
     telegram_phone: str = ""
     facebook_cookie: str = ""
 
+    # -- Phase 2: auto-apply & interview copilot (local only) ---------------
+    job_email: str = ""            # dedicated job-hunt mailbox
+    job_email_password: str = ""   # Gmail APP password, not the account password
+    apply_base_password: str = ""  # seed for per-platform derived passwords
+
     # -- runtime ------------------------------------------------------------
     db_path: Path = field(default_factory=lambda: ROOT / "state" / "jobs.db")
     dry_run: bool = False
@@ -159,6 +164,10 @@ class Settings:
     @property
     def cv_max_secret_bytes(self) -> int:
         return int(self.raw.get("cv", {}).get("max_secret_bytes") or 65536)
+
+    @property
+    def email_monitor_ready(self) -> bool:
+        return bool(self.job_email and self.job_email_password)
 
     @property
     def telegram_session_path(self) -> Path:
@@ -253,6 +262,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
         telegram_session=_env("TELEGRAM_STRING_SESSION") or _env("TELEGRAM_SESSION"),
         telegram_phone=_env("TELEGRAM_PHONE"),
         facebook_cookie=_env("FACEBOOK_COOKIE"),
+        job_email=_env("JOB_EMAIL"),
+        job_email_password=_env("JOB_EMAIL_APP_PASSWORD"),
+        apply_base_password=_env("APPLY_BASE_PASSWORD"),
         db_path=db_path,
         dry_run=_env_bool("DRY_RUN"),
         log_level=_env("LOG_LEVEL", "INFO").upper(),

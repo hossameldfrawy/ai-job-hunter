@@ -13,6 +13,13 @@ secrets/
 # ── Local state (cloud state lives on the 'bot-state' branch) ────────────
 state/*.db
 state/*.db-journal
+# The vault holds platform passwords, cover letters and recruiter mail. It must
+# never reach the public repo -- unlike jobs.db it is NOT synced to bot-state.
+state/vault.db
+# Playwright persistent profiles: live login cookies for every board.
+state/browser_sessions/
+secrets/vault.key
+screenshots/
 state/*.db-wal
 state/*.db-shm
 run_report.json
