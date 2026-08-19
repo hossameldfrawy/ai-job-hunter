@@ -36,6 +36,8 @@
 
 name: AI Job Hunter
 
+# Deployed 2026-08-19. Runs every 30 minutes with no machine of yours involved.
+
 on:
   schedule:
     # Every 30 minutes. GitHub queues scheduled jobs under load, so treat this
