@@ -14,6 +14,7 @@ AI Job Hunter -- entry point.
     python main.py --provision             vault credentials for every board
     python main.py --vault [--reveal]      show the vault + profile payload
     python main.py --applications          list drafts and their status
+    python main.py --refresh-drafts        re-check pending drafts (no AI cost)
     python main.py --approve <id>          approve a draft, then submit it
     python main.py --decline <id>          discard a draft
     python main.py --listen                approve/edit by replying on Telegram
@@ -421,6 +422,47 @@ def cmd_apply(db, limit):
     return 0
 
 
+def cmd_refresh_drafts(db):
+    """Re-inspect every pending draft's page and update its submittability.
+
+    Costs no Gemini tokens: the cover letter and answers are kept exactly as
+    written, and only what the browser can see is refreshed. That is what makes
+    it safe to run after fixing a login -- the fix can be verified without the
+    daily allowance being the reason it cannot be.
+    """
+    from auto_apply.engine import refresh_draft
+    from notifier import WhatsAppNotifier
+
+    store, notifier = _store(), WhatsAppNotifier(db)
+    try:
+        pending = store.applications_awaiting_review(limit=50)
+        if not pending:
+            print("  Nothing pending to refresh.")
+            return 0
+        print("\n  RE-INSPECTING %d DRAFT(S)" % len(pending))
+        print("  " + "-" * 74)
+        became_ready = 0
+        for app in pending:
+            try:
+                changed, detail = refresh_draft(app["id"], store, notifier)
+            except Exception as exc:
+                detail, changed = f"#{app['id']} failed: {exc}"[:150], False
+            if changed and "SUBMITTABLE" in detail:
+                became_ready += 1
+            print("  " + detail)
+        print()
+        if became_ready:
+            print("  %d draft(s) are now submittable -- reply 'done <id>' on "
+                  "Telegram or WhatsApp." % became_ready)
+        else:
+            print("  No draft became submittable. The reasons above say what "
+                  "each one is waiting on.")
+        print()
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_applications():
     store = _store()
     try:
@@ -731,6 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="draft applications for the best matches")
     mode.add_argument("--applications", action="store_true",
                       help="list drafted/submitted applications")
+    mode.add_argument("--refresh-drafts", action="store_true",
+                      help="re-inspect pending drafts' forms (no AI cost)")
     mode.add_argument("--approve", type=int, metavar="ID",
                       help="approve a draft and submit it")
     mode.add_argument("--decline", type=int, metavar="ID",
@@ -793,6 +837,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stats(db)
         if args.applications:
             return cmd_applications()
+        if args.refresh_drafts:
+            return cmd_refresh_drafts(db)
         if args.provision:
             return cmd_provision()
         if args.vault:

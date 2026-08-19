@@ -369,6 +369,7 @@ def prepare_application(
         browser_page, detect_ats, has_saved_session, inspect_form,
         looks_like_application_form, open_application_form,
     )
+    from auto_apply.profile_builder import platform_for_url
     from auto_apply.profile_builder import platform_for_source
 
     board = platform_for_source(ev.source_platform, ev.direct_link)
@@ -397,6 +398,11 @@ def prepare_application(
                 # The click can open a NEW TAB, so the page to inspect is
                 # whatever comes back -- not necessarily the one we started on.
                 apply_page, opened, open_note = open_application_form(page)
+                # A sign-in wall is not a dead end when the vault holds the
+                # credentials for THAT board. Sign in natively and try again.
+                apply_page, open_note = _sign_in_and_retry(
+                    apply_page, store, open_note
+                )
                 fields = inspect_form(apply_page)
                 ats = detect_ats(apply_page)
                 form_ok, form_note = looks_like_application_form(fields)
@@ -472,6 +478,53 @@ def prepare_application(
     return app_id
 
 
+def _sign_in_and_retry(page: Any, store: SecureStore,
+                       note: str) -> tuple[Any, str]:
+    """If we landed on a sign-in wall, log in with the vault and carry on.
+
+    The board is not refusing the application -- it is refusing an anonymous
+    visitor, which is a completely different problem and one we hold the answer
+    to. Uses the NATIVE email/password form; a "Continue with Google" button
+    would hand the flow to an OAuth consent screen that rejects an
+    automation-driven browser outright.
+
+    Never raises: if the login does not take, the caller carries on with the
+    page it already had and the draft records why.
+    """
+    from auto_apply.browser import (
+        inspect_form, login_with_password, looks_like_application_form,
+        open_application_form,
+    )
+    from auto_apply.profile_builder import platform_for_url
+
+    fields = inspect_form(page)
+    ok, why = looks_like_application_form(fields)
+    if ok or "sign-in" not in why:
+        return page, note
+
+    url = str(getattr(page, "url", "") or "")
+    board = platform_for_url(url)
+    if board is None:
+        return page, f"{note}; hit a sign-in wall on an unrecognised board"
+
+    account = store.get_credentials(board.name)
+    if not account or not account.get("password"):
+        return page, (f"{note}; {board.name} wants a login and the vault has "
+                      f"no credentials for it -- run: python main.py "
+                      f"--register {board.name}")
+
+    signed_in, detail = login_with_password(
+        page, account.get("email") or "", account.get("password") or ""
+    )
+    log.info("Sign-in wall on %s: %s", board.name, detail)
+    if not signed_in:
+        return page, (f"{note}; could not sign in to {board.name} ({detail})")
+
+    # Signed in now, so the apply control may finally lead somewhere.
+    page, _opened, retry_note = open_application_form(page)
+    return page, f"{note}; signed in to {board.name} and retried ({retry_note})"
+
+
 def _experience_label() -> str:
     """"3 years", from the structured CV profile. "" if it cannot be read.
 
@@ -490,6 +543,76 @@ def _experience_label() -> str:
         return ""
     whole = int(years)
     return f"{whole} year{'' if whole == 1 else 's'}"
+
+
+def refresh_draft(app_id: int, store: SecureStore,
+                  notifier: Any = None) -> tuple[bool, str]:
+    """Re-inspect an existing draft's page and update whether it is submittable.
+
+    Deliberately NOT a re-draft. The cover letter and the screening answers are
+    the expensive part -- they cost a Gemini call each, and the daily free-tier
+    allowance is small enough that regenerating them to fix a form-detection
+    problem is a bad trade. Everything the model wrote is kept; only what the
+    BROWSER found is refreshed.
+
+    That matters most exactly when it is most needed: a draft written before a
+    board login existed can be re-checked afterwards without spending a single
+    token, and without the quota being the reason the fix cannot be verified.
+    """
+    from auto_apply.browser import (
+        browser_page, detect_ats, inspect_form, looks_like_application_form,
+        open_application_form,
+    )
+    from auto_apply.profile_builder import platform_for_source
+    from auto_apply.review import DraftCard, dispatch_review, payload_of
+
+    app = store.get_application(app_id)
+    if not app:
+        raise ApplyError(f"No application #{app_id}.")
+    if app["status"] in (STATUS_SUBMITTED, STATUS_DECLINED):
+        return False, f"#{app_id} is {app['status']}; nothing to refresh"
+
+    url = str(app.get("job_url") or "")
+    if not url:
+        return False, f"#{app_id} has no job URL to re-inspect"
+
+    allowed, reason = is_automatable(app.get("platform", ""))
+    if not allowed:
+        return False, reason
+
+    board = platform_for_source(app.get("platform", ""), url)
+    session_key = board.slug if board else (app.get("platform") or "default")
+    payload = payload_of(app)
+
+    was_ok = payload.get("form_ok") is True
+    try:
+        with browser_page(session_key) as page:
+            page.goto(url, wait_until="domcontentloaded")
+            apply_page, _opened, open_note = open_application_form(page)
+            apply_page, open_note = _sign_in_and_retry(apply_page, store,
+                                                       open_note)
+            fields = inspect_form(apply_page)
+            form_ok, form_note = looks_like_application_form(fields)
+            payload["ats"] = detect_ats(apply_page)
+            payload["field_map"] = describe_fields(fields)
+    except Exception as exc:
+        return False, f"#{app_id} could not be re-inspected: {exc}"[:200]
+
+    payload["form_ok"] = form_ok
+    payload["form_note"] = (f"{form_note} ({open_note})" if open_note
+                            else form_note)
+    store.update_application_draft(app_id, payload=payload)
+
+    changed = form_ok != was_ok
+    if changed and notifier is not None:
+        # Only re-card the user when the ANSWER changed. A draft that is still
+        # blocked for the same reason is not news, and re-sending it on every
+        # refresh is how a review channel becomes noise people stop reading.
+        dispatch_review(notifier,
+                        DraftCard.from_row(store.get_application(app_id)))
+
+    state = "SUBMITTABLE" if form_ok else "still blocked"
+    return changed, f"#{app_id} {state}: {payload['form_note'][:120]}"
 
 
 def submit_application(

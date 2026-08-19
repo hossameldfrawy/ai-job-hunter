@@ -593,7 +593,9 @@ auto_apply:
       hosts: ["tanqeeb.com"]
       needs_login: true
     - name: Wuzzuf
-      url: "https://wuzzuf.net/signup/candidate"
+      # /signup/candidate is DEAD -- it returns HTTP 404. Verified live
+      # alongside /register (200) and /signup (302 -> /register).
+      url: "https://wuzzuf.net/register"
       login_url: "https://wuzzuf.net/login"
       hosts: ["wuzzuf.net"]
       needs_login: true

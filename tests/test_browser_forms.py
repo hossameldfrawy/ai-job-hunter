@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -678,8 +679,13 @@ class _FakeControl:
         self._enabled = enabled
         self._raises = raises
 
+        self._attrs: dict[str, str] = {}
+
     def inner_text(self):
         return self._text
+
+    def get_attribute(self, name):
+        return self._attrs.get(name)
 
     def is_visible(self):
         return self._visible
@@ -1174,3 +1180,247 @@ class TestOffCanvasControls(unittest.TestCase):
             _active, opened, _note = browser_mod.open_application_form(page)
         self.assertTrue(opened, "the DOM-dispatch fallback did not fire")
         self.assertTrue(page.clicked)
+
+
+class TestCrossBoardSessionHandoff(unittest.TestCase):
+    """A hop to another board must carry THAT board's login.
+
+    Measured live: a Tanqeeb posting's apply button opens Wuzzuf in a new tab,
+    but the tab belongs to the TANQEEB browser profile and carries only
+    Tanqeeb's cookies. The bot arrived on Wuzzuf anonymous and was shown a
+    registration form -- while a saved Wuzzuf session sat on disk unused.
+    """
+
+    def setUp(self):
+        from config import settings
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self._saved = dict(settings.raw.get("auto_apply", {}) or {})
+        settings.raw["auto_apply"] = dict(self._saved,
+                                          session_dir=str(self.tmp))
+        self.settings = settings
+
+    def tearDown(self):
+        self.settings.raw["auto_apply"] = self._saved
+
+    def _save(self, slug, cookies):
+        import json
+
+        (self.tmp / f"{slug}_state.json").write_text(
+            json.dumps({"cookies": cookies, "origins": []}), encoding="utf-8")
+
+    def test_the_destination_boards_cookies_are_adopted(self):
+        self._save("wuzzuf", [{"name": "LiToken", "value": "x",
+                               "domain": ".wuzzuf.net", "path": "/"}])
+        context = _RecordingContext()
+        adopted = browser_mod.adopt_session_for(
+            context, "https://wuzzuf.net/jobs/p/1")
+        self.assertEqual(adopted, "Wuzzuf")
+        self.assertEqual(len(context.added), 1)
+        self.assertEqual(context.added[0][0]["name"], "LiToken")
+
+    def test_a_board_with_no_saved_session_adopts_nothing(self):
+        context = _RecordingContext()
+        self.assertEqual(
+            browser_mod.adopt_session_for(context, "https://wuzzuf.net/jobs/p/1"),
+            "")
+        self.assertEqual(context.added, [])
+
+    def test_an_unrecognised_domain_adopts_nothing(self):
+        self._save("wuzzuf", [{"name": "LiToken", "value": "x",
+                               "domain": ".wuzzuf.net", "path": "/"}])
+        context = _RecordingContext()
+        self.assertEqual(
+            browser_mod.adopt_session_for(context, "https://acme-corp.com/x"),
+            "")
+
+    def test_a_missing_context_is_survivable(self):
+        self.assertEqual(
+            browser_mod.adopt_session_for(None, "https://wuzzuf.net/x"), "")
+
+    def test_a_context_that_rejects_cookies_does_not_crash_the_flow(self):
+        self._save("wuzzuf", [{"name": "LiToken", "value": "x",
+                               "domain": ".wuzzuf.net", "path": "/"}])
+
+        class Hostile:
+            pages = []
+
+            def add_cookies(self, cookies):
+                raise RuntimeError("invalid cookie")
+
+        self.assertEqual(
+            browser_mod.adopt_session_for(Hostile(), "https://wuzzuf.net/x"), "")
+
+    def test_load_saved_cookies_tolerates_junk(self):
+        (self.tmp / "bad_state.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(browser_mod.load_saved_cookies("bad"), [])
+        self.assertEqual(browser_mod.load_saved_cookies("absent"), [])
+
+
+class _RecordingContext:
+    def __init__(self):
+        self.pages = []
+        self.added = []
+
+    def add_cookies(self, cookies):
+        self.added.append(cookies)
+
+
+class TestNativeLoginNeverUsesOAuth(unittest.TestCase):
+    """A "Continue with Google" button hands the flow to an OAuth consent
+    screen that refuses an automation-driven browser with
+    "Error 400: redirect_uri_mismatch" -- an unrecoverable dead end."""
+
+    def test_social_buttons_are_recognised(self):
+        for text in ("Continue with Google", "Sign in with Facebook",
+                     "Log in with LinkedIn", "Continue with Apple"):
+            with self.subTest(text=text):
+                self.assertTrue(browser_mod.is_social_login(_FakeControl(text)))
+
+    def test_a_native_submit_is_not_mistaken_for_social(self):
+        for text in ("Log in", "Sign in", "Submit", "تسجيل الدخول"):
+            with self.subTest(text=text):
+                self.assertFalse(browser_mod.is_social_login(_FakeControl(text)))
+
+    def test_a_provider_hidden_in_the_class_name_is_caught(self):
+        control = _FakeControl("Continue")
+        control._attrs = {"class": "btn btn-google-oauth"}
+        self.assertTrue(browser_mod.is_social_login(control))
+
+    def test_every_major_provider_is_listed(self):
+        for provider in ("google", "facebook", "linkedin", "apple", "oauth"):
+            with self.subTest(provider=provider):
+                self.assertIn(provider, browser_mod.SOCIAL_LOGIN_MARKERS)
+
+
+class TestLoginWithPassword(unittest.TestCase):
+    class LoginPage:
+        def __init__(self, fields, controls=(), after=None, social=()):
+            self._fields = list(fields)
+            self.controls = tuple(controls)
+            self.after = list(after if after is not None else [])
+            self.social = set(social)
+            self.filled = []
+            self.clicked = []
+            self.submitted = False
+
+        @property
+        def fields(self):
+            return self.after if self.submitted else self._fields
+
+        def fill(self, selector, value, timeout=None):
+            self.filled.append((selector, value))
+
+        def query_selector_all(self, selector):
+            if selector not in self.controls:
+                return []
+            control = _FakeControl("Log in", page=self, selector=selector)
+            if selector in self.social:
+                control._text = "Continue with Google"
+            return [control]
+
+        def _register_click(self, selector):
+            self.clicked.append(selector)
+            self.submitted = True
+
+        def wait_for_load_state(self, state, timeout=None):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    @contextmanager
+    def _inspect(self, page):
+        original = browser_mod.inspect_form
+        browser_mod.inspect_form = lambda p, *a, **k: list(p.fields)
+        try:
+            yield
+        finally:
+            browser_mod.inspect_form = original
+
+    LOGIN_FIELDS = [
+        FormField(selector="#email", kind="email", input_type="text",
+                  label="email"),
+        FormField(selector="#pw", kind="password", input_type="text",
+                  label="password"),
+    ]
+
+    def test_credentials_are_typed_and_the_form_submitted(self):
+        page = self.LoginPage(self.LOGIN_FIELDS,
+                              controls=('button[type="submit"]',), after=[])
+        with self._inspect(page):
+            ok, detail = browser_mod.login_with_password(
+                page, "h@example.com", "s3cret")
+        self.assertTrue(ok, detail)
+        self.assertIn(("#email", "h@example.com"), page.filled)
+        self.assertIn(("#pw", "s3cret"), page.filled)
+
+    def test_a_google_button_is_never_pressed(self):
+        page = self.LoginPage(self.LOGIN_FIELDS,
+                              controls=('button[type="submit"]',),
+                              social={'button[type="submit"]'}, after=[])
+        with self._inspect(page):
+            ok, detail = browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertFalse(ok)
+        self.assertEqual(page.clicked, [], "an OAuth button was clicked")
+
+    def test_a_page_with_no_password_form_is_reported_not_guessed(self):
+        page = self.LoginPage([FormField(selector="#q", kind="unknown",
+                                         input_type="text", label="search")])
+        with self._inspect(page):
+            ok, detail = browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertFalse(ok)
+        self.assertIn("no native email/password form", detail)
+
+    def test_a_login_that_did_not_take_is_detected(self):
+        """The password box still being there is the board saying no."""
+        page = self.LoginPage(self.LOGIN_FIELDS,
+                              controls=('button[type="submit"]',),
+                              after=self.LOGIN_FIELDS)
+        with self._inspect(page):
+            ok, detail = browser_mod.login_with_password(page, "a@b.c", "pw")
+        self.assertFalse(ok)
+        self.assertIn("still showing", detail)
+
+
+class TestInspectionSurvivesNavigation(unittest.TestCase):
+    """Clicking apply starts a navigation, and querying mid-flight raises
+    "Execution context was destroyed". That surfaced as a draft which could
+    not be re-inspected at all -- a timing accident reported as permanent."""
+
+    class Navigating:
+        def __init__(self, fail_times=1):
+            self.fail_times = fail_times
+            self.calls = 0
+            self.settled = []
+
+        def query_selector_all(self, selector):
+            # Only the CONTAINER query is the one under test; inspect_form
+            # then queries this same object again for its inputs.
+            if selector != "form":
+                return []
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise RuntimeError("Execution context was destroyed")
+            return []
+
+        def wait_for_load_state(self, state, timeout=None):
+            self.settled.append(state)
+
+    def test_a_single_navigation_is_retried_through(self):
+        page = self.Navigating(fail_times=1)
+        self.assertEqual(inspect_form(page), [])
+        self.assertEqual(page.calls, 2, "it did not retry")
+        self.assertTrue(page.settled, "it retried without settling first")
+
+    def test_a_page_that_never_settles_gives_up_cleanly(self):
+        page = self.Navigating(fail_times=99)
+        with self.assertLogs("auto_apply.browser", level="WARNING"):
+            self.assertEqual(inspect_form(page), [])
+        self.assertEqual(page.calls, 2, "it retried more than once")
+
+    def test_a_healthy_page_is_not_slowed_by_the_guard(self):
+        page = self.Navigating(fail_times=0)
+        inspect_form(page)
+        self.assertEqual(page.calls, 1)
+        self.assertEqual(page.settled, [])

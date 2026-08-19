@@ -559,6 +559,88 @@ def _is_clickable(element: Any) -> bool:
         return True
 
 
+# Third-party sign-in buttons. These must NEVER be clicked.
+#
+# A "Continue with Google" button hands the flow to Google's OAuth consent
+# screen, which refuses an automation-driven browser with
+# "Error 400: redirect_uri_mismatch" -- an unrecoverable dead end mid-signup.
+# The native email + password form is right there on the same page, and the
+# vault already holds a strong per-board password for it.
+SOCIAL_LOGIN_MARKERS: tuple[str, ...] = (
+    "google", "facebook", "linkedin", "apple", "microsoft", "github",
+    "twitter", "oauth", "sso",
+)
+
+
+def is_social_login(element: Any) -> bool:
+    """True for a third-party sign-in control, which we must not touch."""
+    blob = ""
+    for getter in ("inner_text",):
+        try:
+            blob += " " + (getattr(element, getter)() or "")
+        except Exception:
+            pass
+    for attribute in ("class", "href", "data-provider", "aria-label", "id"):
+        try:
+            blob += " " + (element.get_attribute(attribute) or "")
+        except Exception:
+            pass
+    blob = blob.lower()
+    return any(marker in blob for marker in SOCIAL_LOGIN_MARKERS)
+
+
+def login_with_password(page: Any, email: str, password: str,
+                        timeout_ms: int = 8000) -> tuple[bool, str]:
+    """Sign in with the NATIVE email + password form. Never via OAuth.
+
+    Returns (signed_in, what happened). Fails soft: a login that cannot be
+    completed is reported, never raised, because the caller's next move is to
+    hand the browser to the human either way.
+    """
+    fields = inspect_form(page)
+    by_kind = {f.kind: f for f in fields}
+    email_field = by_kind.get("email") or by_kind.get("username")
+    password_field = by_kind.get("password")
+    if email_field is None or password_field is None:
+        return False, "no native email/password form on this page"
+
+    if not fill_field(page, email_field, email):
+        return False, "could not type the email address"
+    if not fill_field(page, password_field, password):
+        return False, "could not type the password"
+
+    # Submit with the form's OWN control, filtered so a "Continue with Google"
+    # button next to it can never be the one that gets pressed.
+    for selector in SUBMIT_SELECTORS + ('button:has-text("Log in")',
+                                        'button:has-text("Sign in")',
+                                        'button:has-text("تسجيل الدخول")'):
+        try:
+            elements = page.query_selector_all(selector) or []
+        except Exception:
+            continue
+        for element in elements:
+            if is_social_login(element) or not _is_clickable(element):
+                continue
+            try:
+                element.click(timeout=3000)
+            except Exception:
+                continue
+            try:
+                page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+            remaining = {f.kind for f in inspect_form(page)}
+            if "password" in remaining:
+                return False, ("the password form is still showing -- wrong "
+                               "credentials, or a verification step")
+            return True, "signed in with email and password"
+    return False, "no native submit control on the login form"
+
+
 def never_automate_hosts() -> tuple[str, ...]:
     """Domains this project refuses to drive a browser against.
 
@@ -595,6 +677,59 @@ def is_automatable_url(url: str) -> tuple[bool, str]:
                 f"automated: applications there are manual-only, by design"
             )
     return True, ""
+
+
+def load_saved_cookies(platform: str) -> list[dict[str, Any]]:
+    """The cookies in a board's saved session. [] if there are none."""
+    import json as _json
+
+    path = storage_state_path(platform)
+    if not path.exists():
+        return []
+    try:
+        state = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [c for c in (state.get("cookies") or []) if isinstance(c, dict)]
+
+
+def adopt_session_for(context: Any, url: str) -> str:
+    """Inject the saved login of whichever board owns `url`. Returns its name.
+
+    THE PROBLEM THIS SOLVES, measured live:
+
+    A Tanqeeb posting's apply button opens Wuzzuf in a new tab -- but that tab
+    belongs to the TANQEEB browser profile, which carries Tanqeeb's cookies and
+    nothing else. So the bot arrived on Wuzzuf anonymous, was shown a
+    registration form, and reported "not signed in" even though the Wuzzuf
+    session was saved, valid, and sitting on disk unused.
+
+    Aggregators hand off to each other constantly, so the session has to follow
+    the hop. Cookies are added to the CURRENT context rather than reopening the
+    page in another one, because the popup already exists and re-navigating it
+    is cheaper and keeps the referer chain intact.
+    """
+    if context is None or not url:
+        return ""
+    try:
+        from auto_apply.profile_builder import platform_for_url
+    except Exception:
+        return ""
+
+    board = platform_for_url(url)
+    if board is None:
+        return ""
+    cookies = load_saved_cookies(board.slug)
+    if not cookies:
+        return ""
+    try:
+        context.add_cookies(cookies)
+    except Exception as exc:
+        log.debug("Could not adopt the %s session: %s", board.name, exc)
+        return ""
+    log.info("Adopted the saved %s session (%d cookies) for %s",
+             board.name, len(cookies), url[:60])
+    return board.name
 
 
 def open_application_form(
@@ -766,9 +901,23 @@ def _open_application_once(
                 log.warning("Refusing the external application: %s", refusal)
                 return page, False, refusal
 
+            # The tab belongs to THIS board's browser profile, so a hop to a
+            # different board arrives signed out unless its cookies come too.
+            adopted = adopt_session_for(context, popup_url)
+            if adopted:
+                try:
+                    popup.reload(wait_until="domcontentloaded",
+                                 timeout=timeout_ms)
+                    popup.wait_for_timeout(1200)
+                except Exception:
+                    pass
+
             log.info("The application opened in a new tab: %s", popup_url[:90])
-            return popup, True, (f"clicked {selector}; the application opened "
-                                 f"in a new tab at {popup_url[:80]}")
+            detail = (f"clicked {selector}; the application opened in a new "
+                      f"tab at {popup_url[:80]}")
+            if adopted:
+                detail += f" (signed in as your {adopted} account)"
+            return popup, True, detail
 
         after_url = str(getattr(page, "url", "") or "")
         moved = after_url and after_url != before_url
@@ -777,6 +926,14 @@ def _open_application_once(
             if not allowed:
                 log.warning("Refusing the external application: %s", refusal)
                 return page, False, refusal
+            # Same handoff for an in-place redirect to another board.
+            if adopt_session_for(context, after_url):
+                try:
+                    page.reload(wait_until="domcontentloaded",
+                                timeout=timeout_ms)
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
         detail = (f"clicked {selector} and the page moved to {after_url[:80]}"
                   if moved else f"clicked {selector}; the form opened in place")
         log.info("Opened the application view: %s", detail)
@@ -794,7 +951,29 @@ def inspect_form(page: Any, root_selector: str = "form") -> list[FormField]:
     fields: list[FormField] = []
     seen: set[str] = set()
 
-    containers = page.query_selector_all(root_selector) or [page]
+    # Retry once through a navigation.
+    #
+    # Clicking an apply control often starts a navigation, and querying the
+    # page mid-flight raises "Execution context was destroyed". That surfaced
+    # as a draft that could not be re-inspected AT ALL -- a transient timing
+    # accident presented to the user as a permanent failure. Settling and
+    # asking again costs a moment and removes the whole class.
+    containers = None
+    for attempt in range(2):
+        try:
+            containers = page.query_selector_all(root_selector) or [page]
+            break
+        except Exception as exc:
+            if attempt:
+                log.warning("Could not read the page to inspect it: %s", exc)
+                return []
+            for settle in ("domcontentloaded", "networkidle"):
+                try:
+                    page.wait_for_load_state(settle, timeout=8000)
+                except Exception:
+                    continue
+    if containers is None:
+        return []
     for index, container in enumerate(containers):
         try:
             handles = container.query_selector_all(
