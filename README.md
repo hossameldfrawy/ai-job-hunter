@@ -7,17 +7,34 @@ CV with Gemini, and sends you a WhatsApp message the moment something scores
 
 It runs entirely on GitHub's infrastructure. **Your computer can be off.**
 
+Every match arrives on **both** channels, tied together by a short reference:
+
 ```
-🚨 NEW HIGH-MATCH JOB FOUND (Score: 88%)
-🏢 Company: Etisalat
-📍 Location: Dubai, United Arab Emirates
-💼 Role: VoIP Engineer
-🔗 Link: https://ae.linkedin.com/jobs/view/...
-📡 Source: linkedin
-✅ Why You Match: Requires Asterisk/Issabel PBX administration and SIP trunk
-   troubleshooting, which maps directly to your VoIP support work.
-⚠️ Gaps to address: Cisco CCNA Voice certification
+WHATSAPP — light, bilingual, no URL          TELEGRAM — full master card
+──────────────────────────────────           ──────────────────────────────────
+🚨 NEW HIGH-MATCH JOB #101 (95%)             🚨 NEW HIGH-MATCH JOB #101  (95%)
+🏢 Company: Etisalat                         🏢 Company:  Etisalat
+💼 Role: VoIP Support Engineer               💼 Role:     VoIP Support Engineer
+📍 Location: Dubai, UAE                      📍 Location: Dubai, UAE
+💰 Salary: 12,000-15,000 AED per month       💰 Salary:   12,000-15,000 AED
+📡 Source: linkedin                          📡 Source:   linkedin
+
+📝 مهندس دعم شبكات VoIP لإدارة السنترالات    🔗 Link: https://ae.linkedin.com/...
+✅ خبرة ممتازة في Asterisk وIssabel
+⚠️ سنوات الخبرة أقل من المطلوب                ✅ Why you match: Directly matches
+                                                Asterisk and Issabel PBX work.
+🔗 Link: Search Telegram Saved              ⚠️ Gaps: under 2 years experience
+   Messages for #101
+                                             📝 (same Arabic read-out)
+                                             🔎 Reference: #101
 ```
+
+**The WhatsApp card carries no link on purpose.** CallMeBot sends the message
+in a query string and *drops* whatever overflows its URL ceiling rather than
+truncating. Job URLs run past 400 characters and Arabic costs ~5.6 URL
+characters each — carrying both would blow the budget and lose the alert
+silently. Dropping the link buys back the room the Arabic needs, and `#101`
+gets you to the full card in Telegram.
 
 ---
 

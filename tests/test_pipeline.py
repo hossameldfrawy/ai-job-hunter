@@ -275,29 +275,59 @@ class TestAlertFormatting(unittest.TestCase):
         base.update(kw)
         return Evaluation(**base)
 
-    def test_contains_every_required_field(self):
-        msg = self.notifier.format_alert(self._eval())
-        for needle in ["88%", "Etisalat", "Dubai", "VoIP Engineer",
-                       "linkedin.com/jobs/view/1", "Why You Match"]:
+    def test_whatsapp_card_carries_metadata_but_no_url(self):
+        """The WhatsApp card is deliberately link-free: job URLs are long,
+        encode badly, and CallMeBot drops what overflows its query string."""
+        ev = self._eval(ref_id=101)
+        msg = self.notifier.format_whatsapp_card(ev, telegram_delivered=True)
+        for needle in ["88%", "Etisalat", "Dubai", "VoIP Engineer", "#101"]:
             self.assertIn(needle, msg)
+        self.assertNotIn("http", msg, "the WhatsApp card must carry no URL")
+        self.assertIn("Saved Messages", msg)
+
+    def test_telegram_card_carries_the_clickable_link(self):
+        ev = self._eval(ref_id=101)
+        msg = self.notifier.format_telegram_card(ev)
+        self.assertIn("linkedin.com/jobs/view/1", msg)
+        self.assertIn("#101", msg)
+        self.assertIn("Why you match", msg)
+
+    def test_both_cards_share_one_reference(self):
+        ev = self._eval(ref_id=207)
+        self.assertIn("#207", self.notifier.format_whatsapp_card(ev))
+        self.assertIn("#207", self.notifier.format_telegram_card(ev))
 
     def test_uses_whatsapp_single_asterisk_bold(self):
-        msg = self.notifier.format_alert(self._eval())
+        msg = self.notifier.format_whatsapp_card(self._eval(ref_id=101))
         self.assertIn("*Company:*", msg)
         self.assertNotIn("**", msg, "markdown ** does not render in WhatsApp")
 
+    def test_whatsapp_card_falls_back_to_the_url_if_telegram_failed(self):
+        """A pointer to a card that was never delivered is a dead end."""
+        ev = self._eval(ref_id=101)
+        msg = self.notifier.format_whatsapp_card(ev, telegram_delivered=False)
+        self.assertIn("linkedin.com/jobs/view/1", msg)
+        self.assertNotIn("Saved Messages", msg)
+
     def test_long_content_fits_the_url_budget(self):
-        msg = self.notifier.format_alert(self._eval(
-            why_matched="x" * 3000,
-            skill_gaps=["y" * 400, "z" * 400],
+        msg = self.notifier.format_whatsapp_card(self._eval(
+            ref_id=101,
+            arabic_summary="ا" * 400,
+            why_matched_ar="ب" * 400,
+            gaps_ar="ج" * 400,
         ))
         self.assertLessEqual(len(msg), 1000)
-        # The link must survive truncation -- it is the whole point of the alert.
-        self.assertIn("linkedin.com/jobs/view/1", msg)
+        self.assertIn("#101", msg, "the reference must survive shrinking")
+        self.assertIn("Etisalat", msg, "metadata must survive shrinking")
 
-    def test_missing_link_is_explicit(self):
-        msg = self.notifier.format_alert(self._eval(direct_link=""))
-        self.assertIn("no direct link", msg)
+    def test_salary_is_shown_when_present_and_omitted_when_not(self):
+        with_pay = self.notifier.format_whatsapp_card(
+            self._eval(ref_id=101, salary="12,000 SAR monthly")
+        )
+        self.assertIn("12,000 SAR", with_pay)
+        self.assertNotIn("Salary", self.notifier.format_whatsapp_card(
+            self._eval(ref_id=101, salary="")
+        ))
 
     def test_response_classification(self):
         ok, _ = WhatsAppNotifier._classify("<p>Message queued.</p>")

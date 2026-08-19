@@ -199,19 +199,67 @@ class JobPost:
         return d
 
 
+# Words that start a CONTINUATION rather than a new item, e.g.
+# "Requires 2+ years, whereas the candidate has one" is ONE gap, not two.
+_GAP_CONTINUATION = re.compile(
+    r"^(?:whereas|while|which|who|whilst|although|though|but|and|or|so|"
+    r"as|since|because|however|therefore|thus|plus|also)\b",
+    re.I,
+)
+
+
+def _split_gaps(raw: str) -> list[str]:
+    """Turn a comma-separated gap string into discrete items.
+
+    Gemini is asked for a comma-separated list and mostly obliges, but it also
+    writes explanatory clauses -- "Requires 2+ years of experience, whereas the
+    candidate has slightly over 1 year". Splitting that naively yields a
+    fragment that reads as its own bullet and looks like a bug in the alert.
+    Fragments beginning with a conjunction are therefore folded back into the
+    item they belong to.
+    """
+    parts = [p.strip() for p in raw.split(",")]
+    merged: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        # A continuation, or a stray lower-case tail, belongs to the previous item.
+        if merged and (_GAP_CONTINUATION.match(part) or part[:1].islower()):
+            merged[-1] = f"{merged[-1]}, {part}"
+        else:
+            merged.append(part)
+    return merged
+
+
 @dataclass(slots=True)
 class Evaluation:
-    """Gemini's verdict on one JobPost."""
+    """Gemini's verdict on one JobPost.
+
+    Carries both languages because the two delivery channels serve different
+    purposes: the WhatsApp card is a bilingual at-a-glance summary with no URL
+    (CallMeBot chokes on long ones and blocks cloud IPs), while the Telegram
+    card is the full technical record including the clickable link. `ref_id`
+    is the short human-quotable handle that ties the two together.
+    """
 
     fingerprint: str
     company_name: str = "Unknown"
     role_title: str = "Unknown"
     location: str = "Unknown"
+    salary: str = ""
     match_score: int = 0
     source_platform: str = "unknown"
     direct_link: str = ""
+    # English -- the full technical reasoning, used on the Telegram card.
     why_matched: str = ""
     skill_gaps: list[str] = field(default_factory=list)
+    # Arabic -- deliberately terse. The WhatsApp card has room for roughly 195
+    # Arabic characters in total once percent-encoded, so these are capped hard.
+    arabic_summary: str = ""
+    why_matched_ar: str = ""
+    gaps_ar: str = ""
+    # Short incremental reference (#101, #102 ...), assigned at alert time.
+    ref_id: int = 0
     model: str = ""
     error: str = ""
 
@@ -231,9 +279,9 @@ class Evaluation:
         except (TypeError, ValueError):
             score = 0
 
-        gaps = payload.get("skill_gaps") or []
+        gaps = payload.get("skill_gaps") or payload.get("gaps_en") or []
         if isinstance(gaps, str):
-            gaps = [g.strip() for g in gaps.split(",") if g.strip()]
+            gaps = _split_gaps(gaps)
         gaps = [str(g).strip() for g in gaps if str(g).strip()][:6]
 
         return cls(
@@ -241,12 +289,16 @@ class Evaluation:
             company_name=_s("company_name", job.company or "Unknown"),
             role_title=_s("role_title", job.title or "Unknown"),
             location=_s("location", job.location or "Unknown"),
+            salary=_s("salary")[:80],
             match_score=max(0, min(100, score)),
             # The model must never invent these two:
             source_platform=job.source,
             direct_link=job.url or _s("direct_link"),
-            why_matched=_s("why_matched")[:600],
+            why_matched=(_s("why_matched") or _s("why_matched_en"))[:600],
             skill_gaps=gaps,
+            arabic_summary=_s("arabic_summary")[:200],
+            why_matched_ar=_s("why_matched_ar")[:200],
+            gaps_ar=_s("gaps_ar")[:160],
             model=model,
         )
 

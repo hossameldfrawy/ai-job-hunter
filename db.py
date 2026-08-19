@@ -32,7 +32,7 @@ from models import Evaluation, JobPost, iso, utc_now
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS evaluations (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_eval_fp ON evaluations(fingerprint);
+
+-- Short, human-quotable handles (#101, #102 ...). The WhatsApp card carries no
+-- URL, so it points here: "search Saved Messages for #101".
+CREATE TABLE IF NOT EXISTS job_refs (
+    ref_id      INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refs_fp ON job_refs(fingerprint);
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,9 +137,31 @@ class Database:
                 self._conn.rollback()
                 raise
 
+    #: columns added after v1; existing cloud databases are upgraded in place
+    _ADDED_COLUMNS = {
+        "evaluations": [
+            ("salary", "TEXT"),
+            ("arabic_summary", "TEXT"),
+            ("why_matched_ar", "TEXT"),
+            ("gaps_ar", "TEXT"),
+            ("ref_id", "INTEGER"),
+        ],
+    }
+
     def _migrate(self) -> None:
         with self._tx() as c:
             c.executescript(_SCHEMA)
+            # The live database is restored from the bot-state branch on every
+            # cloud run, so it predates these columns. ALTER TABLE ADD COLUMN is
+            # cheap and idempotent once guarded by a PRAGMA check.
+            for table, columns in self._ADDED_COLUMNS.items():
+                existing = {
+                    r["name"] for r in c.execute(f"PRAGMA table_info({table})")
+                }
+                for name, coltype in columns:
+                    if name not in existing:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
+                        log.info("Migrated %s: added column %s.", table, name)
             c.execute(
                 "INSERT INTO meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -288,6 +319,65 @@ class Database:
             )
         return len(rows)
 
+    # -- short reference ids ------------------------------------------------
+    def assign_ref_id(self, fingerprint: str) -> int:
+        """Return the short human-quotable id (#101, #102 ...) for a posting.
+
+        The WhatsApp card deliberately carries no URL -- CallMeBot blocks cloud
+        IPs and chokes on long percent-encoded links -- so it points at the
+        Telegram card instead: "search Saved Messages for #101". That only works
+        if the id is STABLE, so this is idempotent: the same posting always
+        resolves to the same number, however many times it is asked for.
+
+        Numbering starts at 101 purely so the ids never look like a count.
+        """
+        if not fingerprint:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ref_id FROM job_refs WHERE fingerprint=?", (fingerprint,)
+            ).fetchone()
+            if row:
+                return int(row["ref_id"])
+
+        with self._tx() as c:
+            row = c.execute("SELECT MAX(ref_id) AS m FROM job_refs").fetchone()
+            nxt = max(101, int((row["m"] or 100) + 1))
+            try:
+                c.execute(
+                    "INSERT INTO job_refs(ref_id, fingerprint, created_at) "
+                    "VALUES (?,?,?)",
+                    (nxt, fingerprint, iso(utc_now())),
+                )
+            except sqlite3.IntegrityError:
+                # Raced with another writer; the other one won, so read it back.
+                existing = c.execute(
+                    "SELECT ref_id FROM job_refs WHERE fingerprint=?", (fingerprint,)
+                ).fetchone()
+                return int(existing["ref_id"]) if existing else 0
+        return nxt
+
+    def ref_id_for(self, fingerprint: str) -> int:
+        """Look up an id without allocating one. 0 if never alerted."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ref_id FROM job_refs WHERE fingerprint=?", (fingerprint,)
+            ).fetchone()
+        return int(row["ref_id"]) if row else 0
+
+    def lookup_ref(self, ref_id: int) -> dict[str, Any] | None:
+        """Resolve #101 back to the posting, so an id stays answerable later."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT r.ref_id, r.fingerprint, r.created_at, s.title, s.company, "
+                "       s.location, s.url, s.source, s.match_score "
+                "FROM job_refs r LEFT JOIN seen_jobs s "
+                "  ON s.fingerprint = r.fingerprint "
+                "WHERE r.ref_id = ?",
+                (int(ref_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
     # -- evaluations --------------------------------------------------------
     def record_evaluation(self, ev: Evaluation) -> None:
         now = iso(utc_now())
@@ -295,12 +385,15 @@ class Database:
             c.execute(
                 "INSERT INTO evaluations "
                 "(fingerprint,match_score,company_name,role_title,location,"
-                " why_matched,skill_gaps,model,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                " why_matched,skill_gaps,model,created_at,"
+                " salary,arabic_summary,why_matched_ar,gaps_ar,ref_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ev.fingerprint, ev.match_score, ev.company_name, ev.role_title,
                     ev.location, ev.why_matched,
                     json.dumps(ev.skill_gaps, ensure_ascii=False), ev.model, now,
+                    ev.salary, ev.arabic_summary, ev.why_matched_ar, ev.gaps_ar,
+                    ev.ref_id or None,
                 ),
             )
             c.execute(

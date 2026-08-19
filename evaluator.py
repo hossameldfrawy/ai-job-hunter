@@ -69,26 +69,61 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                     "company_name": {"type": "STRING"},
                     "role_title": {"type": "STRING"},
                     "location": {"type": "STRING"},
+                    "salary": {
+                        "type": "STRING",
+                        "description": (
+                            "Pay exactly as the posting states it, with currency "
+                            "and period: '25,000-35,000 EGP / month'. If no figure "
+                            "is given return an EMPTY STRING -- never guess a "
+                            "market rate, because an invented salary is worse "
+                            "than no salary."
+                        ),
+                    },
                     "match_score": {
                         "type": "INTEGER",
                         "description": "0-100 fit against the candidate's CV.",
                     },
-                    "why_matched": {
+                    "why_matched_en": {
                         "type": "STRING",
                         "description": (
-                            "One or two sentences naming the SPECIFIC overlapping "
-                            "skills. No generic praise."
+                            "ENGLISH, one or two sentences naming the SPECIFIC "
+                            "overlapping technologies. No generic praise."
                         ),
                     },
-                    "skill_gaps": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"},
-                        "description": "Concrete requirements the CV does not evidence.",
+                    "gaps_en": {
+                        "type": "STRING",
+                        "description": (
+                            "ENGLISH, comma-separated concrete requirements the CV "
+                            "does not evidence. Empty string if none."
+                        ),
+                    },
+                    "arabic_summary": {
+                        "type": "STRING",
+                        "description": (
+                            "ARABIC. What the role actually is, ONE short line. "
+                            "HARD LIMIT 70 characters: it renders on a WhatsApp "
+                            "card with a strict size budget."
+                        ),
+                    },
+                    "why_matched_ar": {
+                        "type": "STRING",
+                        "description": (
+                            "ARABIC. Why this candidate fits, ONE short line. "
+                            "HARD LIMIT 70 characters."
+                        ),
+                    },
+                    "gaps_ar": {
+                        "type": "STRING",
+                        "description": (
+                            "ARABIC. The main missing requirement(s), ONE short "
+                            "line. HARD LIMIT 55 characters. Empty if none."
+                        ),
                     },
                 },
                 "required": [
                     "job_index", "is_real_job", "company_name", "role_title",
-                    "location", "match_score", "why_matched", "skill_gaps",
+                    "location", "salary", "match_score", "why_matched_en",
+                    "gaps_en", "arabic_summary", "why_matched_ar", "gaps_ar",
                 ],
             },
         }
@@ -96,11 +131,8 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     "required": ["evaluations"],
 }
 
-SYSTEM_INSTRUCTION = """\
-You are a precise technical recruiter screening job postings for ONE specific \
-candidate. You will be given the candidate's CV and a numbered batch of job \
-postings, some scraped from messy sources (Telegram messages, RSS snippets) \
-that may be in Arabic or English.
+
+SYSTEM_INSTRUCTION = """You are a precise technical recruiter screening job postings for ONE specific candidate. You will be given the candidate's CV and a numbered batch of job postings, some scraped from messy sources (Telegram messages, RSS snippets) that may be in Arabic or English.
 
 Return exactly one evaluation object per posting, echoing its job_index.
 
@@ -122,15 +154,31 @@ HARD RULES:
   * If the posting is a listing page, a search-results page, a CV/profile, an
     advert or a news article, set is_real_job=false and match_score=0.
   * If the text is too vague to judge (no role, no requirements), score <= 40.
-  * `why_matched` must name the concrete overlapping technologies, e.g.
-    "Requires Asterisk/FreePBX administration and SIP trunk troubleshooting,
-    which maps directly to the candidate's Issabel PBX and SIP/IAX2 support
-    work." Never write generic filler.
-  * `skill_gaps` lists real, specific missing requirements (a certification, a
-    named product, a years-of-experience bar). Empty array if there are none.
-  * Translate Arabic postings and answer in English.
-  * Extract company_name and location from the posting text itself. Use
-    "Unknown" only when genuinely absent.
+  * SALARY: copy the figure the posting states, with its currency and period.
+    Return an empty string when none is stated. Never estimate a market rate --
+    an invented salary is worse than a missing one.
+
+BILINGUAL OUTPUT -- both languages are required, and they are NOT translations
+of each other. They serve two different cards:
+
+  ENGLISH (why_matched_en, gaps_en) goes on the full technical card. Name the
+  concrete overlapping technologies, e.g. "Requires Asterisk/FreePBX
+  administration and SIP trunk troubleshooting, which maps directly to the
+  candidate's Issabel PBX and SIP/IAX2 support work."
+
+  ARABIC (arabic_summary, why_matched_ar, gaps_ar) goes on a WhatsApp card with
+  a HARD size budget. Write natural, plain Arabic -- not transliterated English
+  -- and keep each field to ONE short line inside its character limit. Being
+  over the limit costs the reader the rest of the message, so brevity beats
+  completeness here. Keep well-known technology names in Latin script (SIP,
+  Issabel, Odoo, Linux); translate everything else.
+
+  * arabic_summary  -- what the job IS.        <= 70 characters
+  * why_matched_ar  -- why it suits HIM.       <= 70 characters
+  * gaps_ar         -- what he is missing.     <= 55 characters, empty if none
+
+  Extract company_name and location from the posting text itself. Use
+  "Unknown" only when genuinely absent.
 """
 
 

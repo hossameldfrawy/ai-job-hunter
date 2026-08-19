@@ -1,22 +1,35 @@
 """
-WhatsApp dispatch via CallMeBot.
+Dual-channel alert dispatch.
 
-CallMeBot is a free relay: one HTTPS GET queues a WhatsApp message to a number
-that has previously authorised the bot. It has real, undocumented constraints
-that this module handles explicitly, because each one is a silent-failure mode
-in production:
+Every match goes out on BOTH channels, carrying DIFFERENT content, tied
+together by a short reference the reader can quote (#101, #102 ...):
 
-  * The whole message travels in a QUERY STRING, so it must be percent-encoded
-    and kept under a safe URL length -- an over-long alert is DROPPED, not
-    truncated. Budgeting therefore counts ENCODED length, never characters:
-    Arabic is 2 bytes per character and ~9 URL characters once encoded, so a
-    509-character Arabic alert is 1,985 URL characters. Optional fields are
-    shed until it fits; the header, link and source lines never are.
-  * The service throttles aggressively; back-to-back sends get swallowed. Sends
-    are spaced by `alert_interval_seconds`.
-  * A failed send returns HTTP 200 with an error sentence in the HTML BODY, so
-    the status code alone is worthless. `_classify` reads the body.
-  * WhatsApp renders *bold* with single asterisks -- not markdown's **.
+  WhatsApp (CallMeBot)  -- the lightweight bilingual card. English metadata
+    (company, role, location, salary, score) plus two or three short Arabic
+    lines, and deliberately NO application URL. It ends with a pointer:
+    "Search Telegram Saved Messages for #101".
+
+  Telegram (Saved Messages) -- the full master card. Same reference, the full
+    English reasoning, the Arabic read-out, and the clickable link.
+
+WHY THE WHATSAPP CARD HAS NO LINK. The message travels percent-encoded in a
+query string with a hard URL ceiling, and CallMeBot DROPS what overflows rather
+than truncating it. Job URLs run past 400 characters; Arabic costs ~5.6 URL
+characters per character. Carrying both would routinely blow the budget and
+lose the alert silently. Dropping the link buys back roughly 400 characters and
+makes room for the Arabic that actually helps the reader triage.
+
+Other constraints this module handles, each a silent-failure mode in production:
+
+  * Budgeting counts ENCODED length, never characters. A 509-character Arabic
+    message is 1,985 URL characters.
+  * CallMeBot answers datacentre IPs with HTTP 403, so a cloud run would deliver
+    nothing at all. Telegram has no such restriction, which is why it is a real
+    channel here and not merely a fallback.
+  * The service throttles hard; sends are spaced by `alert_interval_seconds`.
+  * A failed send returns HTTP 200 with the error in the HTML BODY, so the
+    status code alone is worthless -- `_classify` reads the body.
+  * WhatsApp renders *bold* with single asterisks, not markdown's **.
 """
 
 from __future__ import annotations
@@ -112,41 +125,122 @@ class WhatsAppNotifier:
         self._last_send = 0.0
 
     # -- formatting ---------------------------------------------------------
-    def format_alert(self, ev: Evaluation) -> str:
-        company = _clean_field(ev.company_name, 90) or "Unknown"
-        location = _clean_field(ev.location, 90) or "Unknown"
-        role = _clean_field(ev.role_title, 120) or "Unknown"
-        link = _clean_field(ev.direct_link, 400) or "(no direct link in the posting)"
-        source = _clean_field(ev.source_platform, 60) or "unknown"
-        reason = _clean_field(ev.why_matched, 420)
-        gaps = _clean_field(", ".join(ev.skill_gaps), 220)
+    @staticmethod
+    def _ref(ev: Evaluation) -> str:
+        return f"#{ev.ref_id}" if ev.ref_id else "#--"
 
-        def build(why: str, missing: str) -> str:
-            body = [
-                f"\U0001F6A8 *NEW HIGH-MATCH JOB FOUND* (Score: {ev.match_score}%)",
+    def format_whatsapp_card(
+        self, ev: Evaluation, telegram_delivered: bool = True
+    ) -> str:
+        """The lightweight bilingual card. Carries NO application URL.
+
+        Dropping the link is what keeps this message small and reliable: job
+        URLs run to 400+ characters, they percent-encode badly, and CallMeBot
+        drops anything that overflows its query-string budget rather than
+        truncating it. The reader gets the metadata and a short Arabic read-out,
+        then pulls the full card (with the clickable link) out of Telegram by
+        its reference number.
+
+        If Telegram did NOT accept the card, the pointer would be dangling, so
+        the raw URL is included here instead -- worse formatting, but a working
+        alert beats a tidy dead end.
+        """
+        ref = self._ref(ev)
+        company = _clean_field(ev.company_name, 70) or "Unknown"
+        role = _clean_field(ev.role_title, 90) or "Unknown"
+        location = _clean_field(ev.location, 70) or "Unknown"
+        salary = _clean_field(ev.salary, 60)
+        source = _clean_field(ev.source_platform, 40) or "unknown"
+
+        summary_ar = _clean_field(ev.arabic_summary, 140)
+        why_ar = _clean_field(ev.why_matched_ar, 140)
+        gaps_ar = _clean_field(ev.gaps_ar, 110)
+
+        def build(s_ar: str, w_ar: str, g_ar: str) -> str:
+            head = [
+                f"\U0001F6A8 *NEW HIGH-MATCH JOB* {ref} ({ev.match_score}%)",
                 f"\U0001F3E2 *Company:* {company}",
-                f"\U0001F4CD *Location:* {location}",
                 f"\U0001F4BC *Role:* {role}",
-                f"\U0001F517 *Link:* {link}",
-                f"\U0001F4E1 *Source:* {source}",
+                f"\U0001F4CD *Location:* {location}",
             ]
-            if why:
-                body.append(f"✅ *Why You Match:* {why}")
-            if missing:
-                body.append(f"⚠️ *Gaps to address:* {missing}")
-            return _strip_control("\n".join(body))
+            if salary:
+                head.append(f"\U0001F4B0 *Salary:* {salary}")
+            head.append(f"\U0001F4E1 *Source:* {source}")
 
-        # Shed optional content until the message fits the ENCODED budget, not
-        # the character count. An Arabic alert runs ~4x longer once percent-
-        # encoded, so a 509-character message can be 1,985 URL characters -- and
-        # CallMeBot silently drops what it cannot fit rather than truncating.
-        # The header, link and source lines are never sacrificed.
-        while _over_budget(build(reason, gaps)) and (reason or gaps):
-            if gaps:
-                gaps = self._shrink(gaps)
+            body: list[str] = []
+            if s_ar:
+                body.append(f"\U0001F4DD {s_ar}")
+            if w_ar:
+                body.append(f"✅ {w_ar}")
+            if g_ar:
+                body.append(f"⚠️ {g_ar}")
+
+            if telegram_delivered:
+                tail = f"\U0001F517 *Link:* Search Telegram Saved Messages for {ref}"
             else:
-                reason = self._shrink(reason)
-        return build(reason, gaps)
+                link = _clean_field(ev.direct_link, 300)
+                tail = f"\U0001F517 *Link:* {link}" if link else \
+                       "\U0001F517 *Link:* (none in the posting)"
+
+            parts = ["\n".join(head)]
+            if body:
+                parts.append("\n".join(body))
+            parts.append(tail)
+            return _strip_control("\n\n".join(parts))
+
+        # Arabic costs ~5.6 URL characters each, so roughly 195 Arabic
+        # characters fit alongside the English shell. Shed the least important
+        # line first (gaps), then the reasoning, then the summary.
+        while _over_budget(build(summary_ar, why_ar, gaps_ar)) and (
+            summary_ar or why_ar or gaps_ar
+        ):
+            if gaps_ar:
+                gaps_ar = self._shrink(gaps_ar)
+            elif why_ar:
+                why_ar = self._shrink(why_ar)
+            else:
+                summary_ar = self._shrink(summary_ar)
+        return build(summary_ar, why_ar, gaps_ar)
+
+    def format_telegram_card(self, ev: Evaluation) -> str:
+        """The full master card: every detail plus the clickable link.
+
+        Telegram allows 4096 characters and no URL encoding, so nothing here
+        needs shortening. This is the record the WhatsApp card points at.
+        """
+        ref = self._ref(ev)
+        lines = [
+            f"\U0001F6A8 NEW HIGH-MATCH JOB {ref}  ({ev.match_score}%)",
+            "",
+            f"\U0001F3E2 Company:  {_clean_field(ev.company_name, 120) or 'Unknown'}",
+            f"\U0001F4BC Role:     {_clean_field(ev.role_title, 160) or 'Unknown'}",
+            f"\U0001F4CD Location: {_clean_field(ev.location, 120) or 'Unknown'}",
+        ]
+        if ev.salary:
+            lines.append(f"\U0001F4B0 Salary:   {_clean_field(ev.salary, 90)}")
+        lines.append(f"\U0001F4E1 Source:   {_clean_field(ev.source_platform, 60)}")
+        lines.append("")
+        lines.append(
+            f"\U0001F517 Link: {ev.direct_link or '(no direct link in the posting)'}"
+        )
+
+        if ev.why_matched:
+            lines += ["", f"✅ Why you match: {_clean_field(ev.why_matched, 700)}"]
+        if ev.skill_gaps:
+            lines.append(f"⚠️ Gaps: {_clean_field(', '.join(ev.skill_gaps), 400)}")
+
+        arabic = [t for t in (
+            _clean_field(ev.arabic_summary, 300),
+            _clean_field(ev.why_matched_ar, 300),
+            _clean_field(ev.gaps_ar, 200),
+        ) if t]
+        if arabic:
+            lines += ["", "\U0001F4DD " + "\n✅ ".join(arabic[:2])]
+            if len(arabic) > 2:
+                lines.append("⚠️ " + arabic[2])
+
+        lines += ["", f"\U0001F50E Reference: {ref}"]
+        return _strip_control("\n".join(lines))[:4000]
 
     @staticmethod
     def _shrink(text: str) -> str:
@@ -218,15 +312,17 @@ class WhatsAppNotifier:
         except Exception as exc:
             return False, f"telegram fallback failed: {type(exc).__name__}: {exc}"[:200]
 
-    def send_raw(self, message: str) -> tuple[bool, str]:
-        """Deliver one message. Returns (ok, detail). Never raises.
+    def _send_callmebot(self, message: str) -> tuple[bool, str]:
+        """WhatsApp only, with no fallback. Never raises.
 
-        Tries CallMeBot first (WhatsApp is the requested channel), then falls
-        back to Telegram if configured -- see `send_via_telegram` for why that
-        matters in the cloud.
+        Job alerts use this directly because they go down BOTH channels with
+        DIFFERENT content -- falling back here would resend the WhatsApp card
+        (the one with no link) to Telegram, which already has the better one.
+        Single-message traffic like the digest uses `send_raw`, which does fall
+        back.
         """
         if self.dry_run:
-            log.info("[DRY_RUN] would send:\n%s\n", message)
+            log.info("[DRY_RUN] would WhatsApp:\n%s\n", message)
             return True, "dry_run"
 
         text = message[:MAX_TEXT_CHARS]
@@ -255,10 +351,19 @@ class WhatsAppNotifier:
             return False, f"{type(exc).__name__}: {exc}"
 
         if resp.status_code != 200:
-            return self._fallback(
-                message, f"HTTP {resp.status_code}: {resp.text[:120]}"
-            )
-        ok, detail = self._classify(resp.text)
+            return False, f"HTTP {resp.status_code}: {resp.text[:120]}"
+        return self._classify(resp.text)
+
+    def send_raw(self, message: str) -> tuple[bool, str]:
+        """Deliver one message down whichever channel works. Never raises.
+
+        CallMeBot first (WhatsApp is the requested channel), then Telegram --
+        see `send_via_telegram` for why that fallback exists. Used for
+        single-message traffic: the source digest, failure alerts, heartbeats
+        and the self-test. Job alerts use `dispatch`, which sends a tailored
+        card to each channel instead.
+        """
+        ok, detail = self._send_callmebot(message)
         if ok:
             return True, detail
         return self._fallback(message, detail)
@@ -279,7 +384,17 @@ class WhatsAppNotifier:
 
     # -- high level ---------------------------------------------------------
     def dispatch(self, evaluations: Iterable[Evaluation]) -> DispatchResult:
-        """Send one alert per evaluation, recording every outcome."""
+        """Send each match down BOTH channels, recording every outcome.
+
+        Telegram goes FIRST, deliberately. The WhatsApp card carries no link --
+        it says "search Saved Messages for #101" -- so if WhatsApp arrived first
+        and Telegram then failed, the reader would be chasing a card that does
+        not exist. Sending Telegram first means the pointer is only ever printed
+        once its target is already there; if Telegram fails, the WhatsApp card
+        falls back to carrying the raw URL instead.
+
+        A match counts as delivered if EITHER channel accepted it.
+        """
         result = DispatchResult()
 
         for ev in evaluations:
@@ -288,29 +403,59 @@ class WhatsAppNotifier:
                 result.skipped += 1
                 continue
 
-            ok, detail = self.send_raw(self.format_alert(ev))
-            if ok:
+            # Stable, human-quotable handle shared by both cards.
+            if self.db and not ev.ref_id:
+                ev.ref_id = self.db.assign_ref_id(ev.fingerprint)
+
+            tg_ok, tg_detail = (False, "telegram unavailable")
+            if self.dry_run:
+                tg_ok, tg_detail = self.send_via_telegram(
+                    self.format_telegram_card(ev)
+                )
+            elif self._telegram_available():
+                tg_ok, tg_detail = self.send_via_telegram(
+                    self.format_telegram_card(ev)
+                )
+                if not tg_ok:
+                    log.warning("Telegram card failed for #%s: %s",
+                                ev.ref_id, tg_detail[:110])
+
+            wa_ok, wa_detail = self._send_callmebot(
+                self.format_whatsapp_card(ev, telegram_delivered=tg_ok)
+            )
+
+            delivered = tg_ok or wa_ok
+            if delivered:
                 result.sent += 1
                 log.info(
-                    "Alert sent: %s @ %s (score %d)",
-                    ev.role_title[:60], ev.company_name[:40], ev.match_score,
+                    "Alert #%s sent (%s): %s @ %s (score %d)",
+                    ev.ref_id or "-",
+                    "+".join(c for c, k in (("telegram", tg_ok),
+                                            ("whatsapp", wa_ok)) if k),
+                    ev.role_title[:52], ev.company_name[:32], ev.match_score,
                 )
             else:
                 result.failed += 1
-                result.errors.append(detail)
-                log.error("Alert FAILED for %r: %s", ev.role_title[:60], detail)
+                result.errors.append(f"whatsapp: {wa_detail} | telegram: {tg_detail}")
+                log.error("Alert #%s FAILED on BOTH channels for %r: %s | %s",
+                          ev.ref_id or "-", ev.role_title[:50],
+                          wa_detail[:80], tg_detail[:80])
 
             if self.db:
                 # A dry run must NOT be banked as 'sent'. `already_alerted()`
                 # only counts 'sent', so recording it here would permanently
                 # suppress a job the user never actually received.
-                if self.dry_run:
-                    status = "dry_run"
-                elif ok:
-                    status = "sent"
-                else:
-                    status = "failed"
-                self.db.record_alert(ev.fingerprint, self.channel, status, detail)
+                for channel, ok, detail in (
+                    ("callmebot", wa_ok, wa_detail),
+                    ("telegram", tg_ok, tg_detail),
+                ):
+                    if self.dry_run:
+                        status = "dry_run"
+                    elif ok:
+                        status = "sent"
+                    else:
+                        status = "failed"
+                    self.db.record_alert(ev.fingerprint, channel, status, detail)
         return result
 
     # -- source health digest ----------------------------------------------

@@ -531,7 +531,9 @@ class TestSourceHealthDigest(unittest.TestCase):
             why_matched="الوظيفة تتطلب خبرة في السنترالات وأنظمة SIP و Issabel " * 4,
             skill_gaps=["شهادة سيسكو", "خبرة اضافية في Asterisk"],
         )
-        msg = WhatsAppNotifier(None).format_alert(ev)
+        msg = WhatsAppNotifier(None).format_whatsapp_card(
+            ev, telegram_delivered=False
+        )
         url = ("https://api.callmebot.com/whatsapp.php"
                f"?phone=%2B201234567890&apikey=TESTKEY&text={quote(msg)}")
         self.assertLessEqual(len(url), MAX_URL_LENGTH,
@@ -539,8 +541,13 @@ class TestSourceHealthDigest(unittest.TestCase):
         self.assertIn("tanqeeb.com", msg, "the link must survive shrinking")
         self.assertIn("88%", msg)
 
-    def test_send_raw_guard_bounds_any_message(self):
-        """Even a caller that ignores the budget must not produce a dead URL."""
+    def test_callmebot_guard_bounds_any_message(self):
+        """Even a caller that ignores the budget must not produce a dead URL.
+
+        Exercises `_send_callmebot` rather than `send_raw` on purpose: send_raw
+        falls back to Telegram, and a unit test must never reach the user's real
+        account.
+        """
         from urllib.parse import quote
 
         from notifier import MAX_URL_LENGTH, WhatsAppNotifier
@@ -558,7 +565,7 @@ class TestSourceHealthDigest(unittest.TestCase):
         original = http_client.get
         http_client.get = fake_get
         try:
-            n.send_raw("مطلوب مهندس دعم فني " * 200)
+            n._send_callmebot("مطلوب مهندس دعم فني " * 200)
         finally:
             http_client.get = original
         self.assertLessEqual(len(captured["url"]), MAX_URL_LENGTH)
