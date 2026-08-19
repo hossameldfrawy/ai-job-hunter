@@ -89,6 +89,27 @@ def _age_gate(jobs: list[JobPost], max_days: int) -> tuple[list[JobPost], int]:
     return kept, dropped
 
 
+def _source_sample(result: Any) -> dict[str, str]:
+    """Pick one posting to prove a source really returned real data.
+
+    Prefers the freshest posting that actually names a company, because
+    "Last seen: <title> @ <company>" is only convincing evidence when both
+    halves are present. Falls back to the newest, then simply the first.
+    """
+    jobs = [j for j in getattr(result, "jobs", []) or [] if j.title]
+    if not jobs:
+        return {}
+
+    def freshness(job: Any) -> float:
+        posted = getattr(job, "posted_at", None)
+        return posted.timestamp() if posted else 0.0
+
+    named = [j for j in jobs if j.company]
+    pool = named or jobs
+    best = max(pool, key=freshness)
+    return {"title": best.title, "company": best.company or ""}
+
+
 def apply_eval_cap(
     candidates: list[JobPost], cap: int
 ) -> tuple[list[JobPost], list[JobPost]]:
@@ -201,7 +222,8 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
     report.scraped = len(raw)
     report.sources = [
         {"name": r.name, "ok": r.ok, "count": r.count,
-         "seconds": round(r.duration_s, 1), "error": r.error}
+         "seconds": round(r.duration_s, 1), "error": r.error,
+         "sample": _source_sample(r)}
         for r in sorted(results, key=lambda r: -r.count)
     ]
     report.errors.extend(f"{r.name}: {r.error}" for r in results if not r.ok)
@@ -349,6 +371,8 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
     )
     _write_report(report)
 
+    _maybe_send_digest(db, notifier, report)
+
     if (
         settings.notifications.get("send_heartbeat", False)
         and report.alerts_sent == 0
@@ -357,6 +381,48 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
 
     log.info("RUN COMPLETE in %.1fs -- %s", report.duration_s, report.headline())
     return report
+
+
+def _maybe_send_digest(
+    db: Database, notifier: WhatsAppNotifier, report: RunReport
+) -> bool:
+    """Send the source-health digest when it is actually worth reading.
+
+    Two triggers, deliberately different:
+      * ROUTINE -- every `digest_interval_hours`, as standing proof that each
+        platform is still reachable. Not every run: at a 30-minute cadence that
+        would be ~48 messages a day and would bury the job alerts it exists to
+        support.
+      * FAILURE -- immediately when a source breaks or goes empty, because that
+        is the moment the report changes what you would do.
+    """
+    cfg = settings.notifications
+    if not cfg.get("send_source_digest", False) or not report.sources:
+        return False
+
+    broken = [s for s in report.sources if not s.get("ok", True)]
+    empty = [s for s in report.sources if s.get("ok", True) and not s.get("count")]
+    degraded = bool(broken or empty)
+
+    if degraded and cfg.get("digest_on_source_failure", True):
+        cooldown = int(cfg.get("digest_failure_cooldown_minutes", 120))
+        if db.cooldown_active("digest_failure", cooldown):
+            log.info("Source digest suppressed: failure cooldown active.")
+            return False
+        reason = "source_failure"
+    else:
+        hours = int(cfg.get("digest_interval_hours", 12))
+        if hours > 0 and db.cooldown_active("digest_routine", hours * 60):
+            return False
+        reason = "routine"
+
+    log.info("Sending source health digest (%s).", reason)
+    sent = notifier.send_source_digest(report)
+    if sent:
+        db.mark_cooldown("digest_routine")
+        if degraded:
+            db.mark_cooldown("digest_failure")
+    return sent
 
 
 def _write_report(report: RunReport, path: Path = REPORT_PATH) -> None:

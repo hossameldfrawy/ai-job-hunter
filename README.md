@@ -184,6 +184,52 @@ is a regression test for it.
 Arabic keywords live alongside the English ones in `config.yml` under
 `profile:`, and Tanqeeb is queried in both languages.
 
+### Source health & audit digest
+
+Proof that every platform actually ran, delivered to WhatsApp:
+
+```
+📊 SOURCE HEALTH & AUDIT REPORT
+──────────────────
+🔹 Tanqeeb (Arab/GCC): 928 jobs scraped
+└ Last seen: "IT Help Desk Specialist @ Erada Egypt"
+🔹 Talent.com Regional: 640 jobs scraped
+└ Last seen: "Telecom Support Engineer @ Solutions by STC"
+🔹 LinkedIn (GCC): 369 jobs scraped
+└ Last seen: "VoIP Engineer @ Etisalat"
+🔻 RSS Feeds: FAILED
+└ HTTP 429
+──────────────────
+Total: 2,769 jobs inspected across 8/9 platforms.
+```
+
+Run it on demand — ingestion only, no AI calls, nothing recorded as seen, so it
+is safe to run any time and cannot consume the evaluation backlog:
+
+```bash
+python main.py --digest
+```
+
+It also fires automatically. Not on every run: at a 30-minute cadence that
+would be ~48 messages a day and would bury the job alerts it exists to support.
+Instead:
+
+| Trigger | When |
+|---|---|
+| Routine | Every `digest_interval_hours` (default 12) — standing proof of reachability |
+| Failure | **Immediately** when a source breaks or returns nothing, throttled by `digest_failure_cooldown_minutes` |
+
+Failed sources sort to the top, because they are the only part of the report
+that needs acting on. Set `digest_interval_hours: 0` to send one after every run.
+
+**On message limits.** CallMeBot carries the whole message in a query string
+with a hard URL ceiling, and it *drops* what it cannot fit rather than
+truncating. Budgeting counts **encoded** length, not characters — Arabic is two
+bytes per character and about nine URL characters once percent-encoded, so a
+509-character Arabic alert is 1,985 URL characters. The digest therefore splits
+across numbered parts rather than dropping a source, since a truncated audit
+would misreport a working platform as absent.
+
 ### Watching your own Telegram groups
 
 The public-channel scraper only sees channels that expose a `t.me/s/` web
@@ -268,6 +314,7 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python main.py --dry-run` | Everything except sending WhatsApp messages |
 | `python main.py --daemon` | Run forever on an interval (Docker/VPS) |
 | `python main.py --live` | Real-time Telegram listener + periodic sweeps |
+| `python main.py --digest` | Audit every source now, WhatsApp the report |
 | `python main.py --stats` | Lifetime statistics and recent run history |
 | `python main.py --selftest` | Verify Gemini + WhatsApp connectivity |
 | `python main.py --prune` | Compact the deduplication database |
@@ -276,7 +323,7 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python auth_telegram.py` | One-time Telegram login (private groups) |
 | `python check_telegram.py` | Verify the Telegram client, list your groups |
 | `python check_telegram.py --scan 168 --suggest` | Rank your chats by hiring output, emit a narrowed `include_chats` |
-| `python -m unittest discover -s tests` | Offline test suite (97 tests, no network) |
+| `python -m unittest discover -s tests` | Offline test suite (115 tests, no network) |
 
 ---
 

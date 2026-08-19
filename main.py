@@ -6,6 +6,7 @@ AI Job Hunter -- entry point.
     python main.py --live          real-time Telegram listener + periodic sweeps
     python main.py --dry-run       full pipeline, but print alerts instead of
                                    sending them
+    python main.py --digest        audit every source now, WhatsApp the result
     python main.py --stats         what the bot has done so far
     python main.py --selftest      prove Gemini + WhatsApp are reachable
     python main.py --prune         compact the dedup database
@@ -30,9 +31,15 @@ from typing import Any
 from config import ConfigError, settings
 from db import Database
 from notifier import WhatsAppNotifier
-from pipeline import handle_live_job, run_once
+from pipeline import RunReport, handle_live_job, run_once
 
 log = logging.getLogger("job_hunter")
+
+
+def iso_now() -> str:
+    from models import iso, utc_now
+
+    return iso(utc_now())
 
 _shutdown = threading.Event()
 
@@ -230,6 +237,50 @@ def cmd_live(db: Database, interval_minutes: int) -> int:
     return 0
 
 
+def cmd_digest(db: Database) -> int:
+    """Audit every source right now and WhatsApp the result.
+
+    Ingestion ONLY -- no Gemini calls, no job alerts, nothing recorded as seen.
+    It exists to answer one question: is every platform still reachable, and can
+    each one show me a real posting to prove it? Safe to run any time; it costs
+    nothing but HTTP requests and cannot consume the evaluation backlog.
+    """
+    import scrapers
+    from pipeline import _maybe_send_digest, _source_sample
+
+    log.info("Source audit: scraping every enabled source (no AI, no alerts)...")
+    built = scrapers.build_scrapers(settings, db=db)
+    if not built:
+        log.error("No sources are enabled in config.yml.")
+        return 1
+
+    raw, results = scrapers.run_all(
+        built, max_workers=int(settings.engine.get("scraper_concurrency", 8))
+    )
+    report = RunReport(started_at=iso_now())
+    report.scraped = len(raw)
+    report.sources = [
+        {"name": r.name, "ok": r.ok, "count": r.count,
+         "seconds": round(r.duration_s, 1), "error": r.error,
+         "sample": _source_sample(r)}
+        for r in sorted(results, key=lambda r: -r.count)
+    ]
+
+    notifier = WhatsAppNotifier(db)
+    parts = notifier.format_source_digest(report)
+    print()
+    for part in parts:
+        print(part)
+        print("-" * 40)
+
+    # Bypass the interval throttle: an explicit --digest is always intentional.
+    ok = notifier.send_source_digest(report)
+    healthy = sum(1 for s in report.sources if s["ok"] and s["count"])
+    log.info("Audit complete: %d/%d sources returned postings, %d total.",
+             healthy, len(report.sources), report.scraped)
+    return 0 if ok else 1
+
+
 def cmd_stats(db: Database) -> int:
     stats = db.stats()
     print("\n" + "=" * 62)
@@ -308,6 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="run continuously on an interval")
     mode.add_argument("--live", action="store_true",
                       help="real-time Telegram listener + periodic sweeps")
+    mode.add_argument("--digest", action="store_true",
+                      help="audit every source now and WhatsApp the report")
     mode.add_argument("--stats", action="store_true", help="print lifetime statistics")
     mode.add_argument("--selftest", action="store_true",
                       help="verify Gemini + CallMeBot connectivity")
@@ -350,6 +403,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.stats:
             return cmd_stats(db)
+        if args.digest:
+            return cmd_digest(db)
         if args.selftest:
             return cmd_selftest(db)
         if args.prune:

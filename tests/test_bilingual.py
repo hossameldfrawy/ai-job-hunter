@@ -25,7 +25,9 @@ os.environ.setdefault("CV_TEXT", "VoIP engineer with SIP and Issabel PBX experie
 os.environ.setdefault("DRY_RUN", "true")
 
 from config import settings                                    # noqa: E402
-from models import JobPost, fingerprint, normalise_text        # noqa: E402
+from models import (                                           # noqa: E402
+    JobPost, fingerprint, normalise_text, utc_now,
+)
 from relevance import _compile_terms, score_job                # noqa: E402
 
 
@@ -365,6 +367,201 @@ class TestQuotaExhaustion(unittest.TestCase):
         self.assertTrue(evaluator.quota_exhausted)
         self.assertEqual(calls["n"], 1,
                          "only the FIRST batch should have hit the API")
+
+
+class TestSourceHealthDigest(unittest.TestCase):
+    """The digest exists to PROVE every source ran, so it must never drop one.
+
+    CallMeBot carries the message in a query string with a hard URL ceiling.
+    Nine sources at two lines each exceeds one message, so the digest splits
+    across parts rather than truncating -- a truncated audit would quietly
+    misreport a source as absent.
+    """
+
+    def setUp(self):
+        from notifier import MAX_TEXT_CHARS, MAX_URL_LENGTH, WhatsAppNotifier
+        from pipeline import RunReport
+
+        self.N = WhatsAppNotifier
+        self.RunReport = RunReport
+        self.max_chars = MAX_TEXT_CHARS
+        self.max_url = MAX_URL_LENGTH
+
+    def _report(self, sources, **kw):
+        r = self.RunReport()
+        r.sources = sources
+        for k, v in kw.items():
+            setattr(r, k, v)
+        return r
+
+    @staticmethod
+    def _src(name, count=10, ok=True, title="IT Support Engineer",
+             company="Acme", error=""):
+        return {"name": name, "ok": ok, "count": count, "error": error,
+                "sample": {"title": title, "company": company} if title else {}}
+
+    def _within_limits(self, parts):
+        from urllib.parse import quote
+
+        for p in parts:
+            self.assertLessEqual(len(p), self.max_chars, "message text over budget")
+            url = ("https://api.callmebot.com/whatsapp.php"
+                   f"?phone=%2B201234567890&apikey=1140049&text={quote(p)}")
+            self.assertLessEqual(len(url), self.max_url, "encoded URL over budget")
+
+    def test_every_source_appears_even_when_split(self):
+        names = ["linkedin", "tanqeeb", "talent", "telegram", "telegram_user",
+                 "job_apis", "search_proxy", "rss", "facebook"]
+        sources = [self._src(n, count=500) for n in names]
+        parts = self.N.format_source_digest(self._report(sources))
+        rendered = sum(p.count("🔹") + p.count("🔻") for p in parts)
+        self.assertEqual(rendered, len(names),
+                         "a source was dropped to make the message fit")
+        self._within_limits(parts)
+
+    def test_pathological_lengths_still_fit(self):
+        sources = [self._src(f"src{i}", title="X" * 400, company="Y" * 400)
+                   for i in range(9)]
+        parts = self.N.format_source_digest(self._report(sources))
+        self._within_limits(parts)
+        self.assertEqual(sum(p.count("🔹") for p in parts), 9)
+
+    def test_arabic_content_fits_the_url_budget(self):
+        """Arabic is 2 bytes/char and ~9 chars once percent-encoded."""
+        sources = [
+            self._src(f"tanqeeb{i}", title="اخصائي دعم فني وشبكات",
+                      company="شركة النور للتكنولوجيا والاتصالات")
+            for i in range(8)
+        ]
+        parts = self.N.format_source_digest(self._report(sources))
+        self._within_limits(parts)
+
+    def test_failed_source_is_marked_and_listed_first(self):
+        sources = [self._src("linkedin", count=300),
+                   self._src("rss", ok=False, count=0, error="HTTP 429")]
+        parts = self.N.format_source_digest(self._report(sources))
+        blob = "\n".join(parts)
+        self.assertIn("🔻", blob, "a failed source was not flagged")
+        self.assertIn("FAILED", blob)
+        self.assertIn("HTTP 429", blob)
+        self.assertLess(blob.index("🔻"), blob.index("🔹"),
+                        "failures must surface above healthy sources")
+
+    def test_empty_source_says_so_rather_than_looking_broken(self):
+        parts = self.N.format_source_digest(
+            self._report([self._src("facebook", count=0, title="")])
+        )
+        self.assertIn("nothing new", "\n".join(parts))
+
+    def test_totals_are_reported(self):
+        sources = [self._src("a", count=100), self._src("b", count=250)]
+        parts = self.N.format_source_digest(
+            self._report(sources, evaluated=40, matched=2, alerts_sent=2)
+        )
+        blob = "\n".join(parts)
+        self.assertIn("350", blob, "total job count missing")
+        self.assertIn("2/2 platforms", blob)
+        self.assertIn("matched 2", blob)
+
+    def test_no_sources_does_not_crash(self):
+        parts = self.N.format_source_digest(self._report([]))
+        self.assertTrue(parts)
+        self._within_limits(parts)
+
+    def test_parts_are_numbered_only_when_split(self):
+        single = self.N.format_source_digest(self._report([self._src("a")]))
+        self.assertEqual(len(single), 1)
+        self.assertNotIn("part 1/", single[0])
+
+        many = self.N.format_source_digest(
+            self._report([self._src(f"s{i}", title="T" * 55) for i in range(12)])
+        )
+        self.assertGreater(len(many), 1)
+        self.assertIn(f"part 1/{len(many)}", many[0])
+
+    def test_unknown_scraper_still_gets_a_readable_label(self):
+        parts = self.N.format_source_digest(
+            self._report([self._src("some_new_board", count=5)])
+        )
+        self.assertIn("Some New Board", "\n".join(parts))
+
+    def test_sample_prefers_a_posting_that_names_a_company(self):
+        from datetime import timedelta
+
+        from pipeline import _source_sample
+        from scrapers.base import ScrapeResult
+
+        older_named = JobPost(source="t", title="Named Role", company="Acme",
+                              location="Dubai", url="https://e.com/1",
+                              posted_at=utc_now() - timedelta(days=3))
+        newer_anon = JobPost(source="t", title="Anon Role", company="",
+                             location="Dubai", url="https://e.com/2",
+                             posted_at=utc_now())
+        sample = _source_sample(ScrapeResult("t", [newer_anon, older_named]))
+        self.assertEqual(sample["company"], "Acme",
+                         "a sample without a company is weak evidence")
+
+    def test_sample_of_empty_source_is_empty(self):
+        from pipeline import _source_sample
+        from scrapers.base import ScrapeResult
+
+        self.assertEqual(_source_sample(ScrapeResult("t", [])), {})
+
+
+    def test_arabic_job_alert_fits_the_encoded_url(self):
+        """Regression: Arabic alerts were silently dropped by CallMeBot.
+
+        The old budget counted characters, so a 509-char Arabic alert passed
+        the 900-char cap while being 1,985 URL characters -- over the limit.
+        The fallback then computed a character `keep` larger than the message,
+        trimmed nothing, and the send was discarded with no error.
+        """
+        from urllib.parse import quote
+
+        from models import Evaluation
+        from notifier import MAX_URL_LENGTH, WhatsAppNotifier
+
+        ev = Evaluation(
+            fingerprint="x",
+            company_name="شركة النور للتكنولوجيا والاتصالات المتقدمة",
+            role_title="اخصائي دعم فني وشبكات وسنترالات",
+            location="القاهرة، جمهورية مصر العربية",
+            match_score=88, source_platform="tanqeeb:egypt",
+            direct_link="https://egypt.tanqeeb.com/jobs-in-middle-east/all/jobs/021171884.html",
+            why_matched="الوظيفة تتطلب خبرة في السنترالات وأنظمة SIP و Issabel " * 4,
+            skill_gaps=["شهادة سيسكو", "خبرة اضافية في Asterisk"],
+        )
+        msg = WhatsAppNotifier(None).format_alert(ev)
+        url = ("https://api.callmebot.com/whatsapp.php"
+               f"?phone=%2B201234567890&apikey=1140049&text={quote(msg)}")
+        self.assertLessEqual(len(url), MAX_URL_LENGTH,
+                             "Arabic alert would be dropped by CallMeBot")
+        self.assertIn("tanqeeb.com", msg, "the link must survive shrinking")
+        self.assertIn("88%", msg)
+
+    def test_send_raw_guard_bounds_any_message(self):
+        """Even a caller that ignores the budget must not produce a dead URL."""
+        from urllib.parse import quote
+
+        from notifier import MAX_URL_LENGTH, WhatsAppNotifier
+
+        n = WhatsAppNotifier(None)
+        n.dry_run = False
+        captured = {}
+
+        def fake_get(url, **kw):
+            captured["url"] = url
+            raise RuntimeError("stop before the network")
+
+        import http_client
+
+        original = http_client.get
+        http_client.get = fake_get
+        try:
+            n.send_raw("مطلوب مهندس دعم فني " * 200)
+        finally:
+            http_client.get = original
+        self.assertLessEqual(len(captured["url"]), MAX_URL_LENGTH)
 
 
 if __name__ == "__main__":

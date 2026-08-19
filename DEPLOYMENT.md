@@ -288,6 +288,12 @@ Repository **Variables** (not secrets) act as live switches without a redeploy:
 | `MAX_ALERTS_PER_RUN=5` | Cap the volume |
 | `DISABLE_LINKEDIN=1` | Turn one source off (`DISABLE_TELEGRAM`, `DISABLE_TALENT`, ...) |
 | `DRY_RUN=true` | Keep hunting, stop sending |
+| `DISABLE_TANQEEB=1` | Turn off the Arabic/GCC aggregator |
+
+To get a one-off proof that every platform is reachable from the cloud runner
+(not just from your machine), trigger the workflow and read the run summary, or
+run `python main.py --digest` locally — the source list and per-source samples
+are identical because both use the same scrapers.
 
 To pause entirely: **Actions → AI Job Hunter → ⋯ → Disable workflow.**
 

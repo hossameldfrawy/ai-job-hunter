@@ -480,3 +480,17 @@ notifications:
   send_failure_alerts: true
   # Don't re-send the same failure more than once per N minutes.
   failure_cooldown_minutes: 180
+
+  # -- Source health & audit digest ----------------------------------------
+  # A WhatsApp message listing EVERY source scraped this run, with a sample
+  # posting from each -- proof that no platform is silently blocked.
+  send_source_digest: true
+  # Hours between routine digests. The bot runs every 30 min; a digest on every
+  # run would be ~48 messages/day and would bury the actual job alerts, so this
+  # is throttled. Set to 0 to send one after every single run.
+  digest_interval_hours: 12
+  # Send a digest IMMEDIATELY (ignoring the interval) when a source fails or
+  # returns nothing -- that is the moment the report is actually worth reading.
+  digest_on_source_failure: true
+  # Don't repeat a failure-triggered digest more often than this.
+  digest_failure_cooldown_minutes: 120

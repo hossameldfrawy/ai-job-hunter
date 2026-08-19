@@ -7,8 +7,11 @@ that this module handles explicitly, because each one is a silent-failure mode
 in production:
 
   * The whole message travels in a QUERY STRING, so it must be percent-encoded
-    and kept under a safe URL length -- an over-long alert is dropped, not
-    truncated. `_fit_to_budget` shortens the least important field instead.
+    and kept under a safe URL length -- an over-long alert is DROPPED, not
+    truncated. Budgeting therefore counts ENCODED length, never characters:
+    Arabic is 2 bytes per character and ~9 URL characters once encoded, so a
+    509-character Arabic alert is 1,985 URL characters. Optional fields are
+    shed until it fits; the header, link and source lines never are.
   * The service throttles aggressively; back-to-back sends get swallowed. Sends
     are spaced by `alert_interval_seconds`.
   * A failed send returns HTTP 200 with an error sentence in the HTML BODY, so
@@ -23,7 +26,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import quote
 
 import http_client
@@ -74,6 +77,27 @@ def _clean_field(value: str, limit: int) -> str:
     return value[:limit]
 
 
+# Bytes reserved for "https://api.callmebot.com/whatsapp.php?phone=..&apikey=.."
+# plus the "(part n/m)" suffix. Generous on purpose: overshooting the URL limit
+# means CallMeBot drops the message silently.
+_URL_OVERHEAD = 220
+
+
+def _over_budget(text: str) -> bool:
+    """True if `text` will not survive the trip to CallMeBot.
+
+    Counting CHARACTERS is not enough. The message travels percent-encoded in a
+    query string, and Arabic is 2 bytes per character -- so `اخصائي` costs 36
+    URL characters, not 6. A digest full of Arabic job titles measures well
+    under the character cap while being nearly twice the URL limit, and
+    CallMeBot answers that by dropping the message rather than truncating it.
+    """
+    return (
+        len(text) > MAX_TEXT_CHARS
+        or len(quote(text)) + _URL_OVERHEAD > MAX_URL_LENGTH
+    )
+
+
 class WhatsAppNotifier:
     """Formats and delivers alerts. Honours DRY_RUN."""
 
@@ -88,20 +112,6 @@ class WhatsAppNotifier:
         self._last_send = 0.0
 
     # -- formatting ---------------------------------------------------------
-    @staticmethod
-    def _fit_to_budget(reason: str, gaps: str, overflow: int) -> tuple[str, str]:
-        """Shed the least important content first: gaps, then the reason."""
-        if overflow <= 0:
-            return reason, gaps
-        if gaps:
-            trim = min(len(gaps), overflow)
-            gaps = gaps[: len(gaps) - trim].rstrip(" ,;") + ("..." if trim else "")
-            overflow -= trim
-        if overflow > 0 and reason:
-            keep = max(60, len(reason) - overflow)
-            reason = reason[:keep].rstrip(" ,;") + "..."
-        return reason, gaps
-
     def format_alert(self, ev: Evaluation) -> str:
         company = _clean_field(ev.company_name, 90) or "Unknown"
         location = _clean_field(ev.location, 90) or "Unknown"
@@ -111,22 +121,39 @@ class WhatsAppNotifier:
         reason = _clean_field(ev.why_matched, 420)
         gaps = _clean_field(", ".join(ev.skill_gaps), 220)
 
-        fixed = len(company) + len(location) + len(role) + len(link) + len(source) + 140
-        reason, gaps = self._fit_to_budget(reason, gaps, fixed + len(reason) + len(gaps) - MAX_TEXT_CHARS)
+        def build(why: str, missing: str) -> str:
+            body = [
+                f"\U0001F6A8 *NEW HIGH-MATCH JOB FOUND* (Score: {ev.match_score}%)",
+                f"\U0001F3E2 *Company:* {company}",
+                f"\U0001F4CD *Location:* {location}",
+                f"\U0001F4BC *Role:* {role}",
+                f"\U0001F517 *Link:* {link}",
+                f"\U0001F4E1 *Source:* {source}",
+            ]
+            if why:
+                body.append(f"✅ *Why You Match:* {why}")
+            if missing:
+                body.append(f"⚠️ *Gaps to address:* {missing}")
+            return _strip_control("\n".join(body))
 
-        lines = [
-            f"\U0001F6A8 *NEW HIGH-MATCH JOB FOUND* (Score: {ev.match_score}%)",
-            f"\U0001F3E2 *Company:* {company}",
-            f"\U0001F4CD *Location:* {location}",
-            f"\U0001F4BC *Role:* {role}",
-            f"\U0001F517 *Link:* {link}",
-            f"\U0001F4E1 *Source:* {source}",
-        ]
-        if reason:
-            lines.append(f"✅ *Why You Match:* {reason}")
-        if gaps:
-            lines.append(f"⚠️ *Gaps to address:* {gaps}")
-        return _strip_control("\n".join(lines))
+        # Shed optional content until the message fits the ENCODED budget, not
+        # the character count. An Arabic alert runs ~4x longer once percent-
+        # encoded, so a 509-character message can be 1,985 URL characters -- and
+        # CallMeBot silently drops what it cannot fit rather than truncating.
+        # The header, link and source lines are never sacrificed.
+        while _over_budget(build(reason, gaps)) and (reason or gaps):
+            if gaps:
+                gaps = self._shrink(gaps)
+            else:
+                reason = self._shrink(reason)
+        return build(reason, gaps)
+
+    @staticmethod
+    def _shrink(text: str) -> str:
+        """Drop roughly a quarter of a field, or clear it once it is a stub."""
+        if len(text) <= 24:
+            return ""
+        return text[: int(len(text) * 0.75)].rstrip(" ,;،") + "..."
 
     # -- transport ----------------------------------------------------------
     @staticmethod
@@ -154,17 +181,23 @@ class WhatsAppNotifier:
             return True, "dry_run"
 
         text = message[:MAX_TEXT_CHARS]
-        url = (
-            f"{API_URL}?phone={quote(self.phone)}"
-            f"&apikey={quote(self.apikey)}&text={quote(text)}"
-        )
+
+        def build(body: str) -> str:
+            return (f"{API_URL}?phone={quote(self.phone)}"
+                    f"&apikey={quote(self.apikey)}&text={quote(body)}")
+
+        # Last-resort guard. Callers should already fit the budget, but this
+        # must hold for ANY message: trimming a fixed number of CHARACTERS
+        # cannot bound a percent-encoded URL, because one Arabic character can
+        # cost nine URL characters. Shrink until it actually fits.
+        url = build(text)
+        while len(url) > MAX_URL_LENGTH and len(text) > 40:
+            overshoot = len(url) - MAX_URL_LENGTH
+            text = text[: max(40, len(text) - max(8, overshoot // 6))].rstrip() + "..."
+            url = build(text)
         if len(url) > MAX_URL_LENGTH:
-            keep = MAX_TEXT_CHARS - (len(url) - MAX_URL_LENGTH) // 3 - 16
-            text = text[: max(120, keep)] + "..."
-            url = (
-                f"{API_URL}?phone={quote(self.phone)}"
-                f"&apikey={quote(self.apikey)}&text={quote(text)}"
-            )
+            log.error("Message cannot be made to fit CallMeBot's URL limit; "
+                      "sending anyway may fail.")
 
         self._throttle()
         try:
@@ -211,6 +244,119 @@ class WhatsAppNotifier:
                     status = "failed"
                 self.db.record_alert(ev.fingerprint, self.channel, status, detail)
         return result
+
+    # -- source health digest ----------------------------------------------
+    #
+    # Human-readable names for the scraper keys. Anything not listed falls back
+    # to a title-cased version of the key, so a new scraper still appears in the
+    # digest without anyone remembering to register it here.
+    SOURCE_LABELS: dict[str, str] = {
+        "linkedin": "LinkedIn (GCC)",
+        "tanqeeb": "Tanqeeb (Arab/GCC)",
+        "talent": "Talent.com Regional",
+        "telegram": "Telegram Channels",
+        "telegram_user": "Telegram User Client",
+        "job_apis": "Remote Job APIs",
+        "search_proxy": "Search Proxy (Bayt/Wuzzuf)",
+        "rss": "RSS Feeds",
+        "facebook": "Facebook (indexed)",
+    }
+
+    @classmethod
+    def _label(cls, name: str) -> str:
+        return cls.SOURCE_LABELS.get(name, name.replace("_", " ").title())
+
+    @classmethod
+    def format_source_digest(cls, report: Any) -> list[str]:
+        """Render the per-source audit as one or more WhatsApp messages.
+
+        The whole point is proof that EVERY source ran, so this must never
+        silently drop a source to fit. CallMeBot carries the text in a query
+        string with a hard URL ceiling, and nine sources at two lines each
+        comfortably exceeds one message -- so the digest SPLITS across numbered
+        parts instead of truncating. The notifier already paces sends, so the
+        parts arrive in order.
+        """
+        sources = list(getattr(report, "sources", []) or [])
+        # Failures first (ok=False sorts before ok=True), then busiest. A broken
+        # source is the only part of this report that needs acting on, so it
+        # must not be buried below nine healthy ones.
+        sources.sort(key=lambda s: (bool(s.get("ok", True)), -int(s.get("count", 0))))
+
+        blocks: list[str] = []
+        for src in sources:
+            name = cls._label(str(src.get("name", "?")))
+            count = int(src.get("count", 0))
+            healthy = bool(src.get("ok", True))
+
+            if not healthy:
+                detail = _clean_field(str(src.get("error", "")), 70) or "unknown error"
+                blocks.append(f"🔻 *{name}:* FAILED\n└ {detail}")
+                continue
+
+            line = f"🔹 *{name}:* {count} job{'' if count == 1 else 's'} scraped"
+            sample = src.get("sample") or {}
+            title = _clean_field(str(sample.get("title", "")), 58)
+            company = _clean_field(str(sample.get("company", "")), 34)
+            if title and company:
+                line += f'\n└ Last seen: "{title} @ {company}"'
+            elif title:
+                line += f'\n└ Last seen: "{title}"'
+            elif count == 0:
+                line += "\n└ nothing new this run"
+            blocks.append(line)
+
+        total = sum(int(s.get("count", 0)) for s in sources)
+        healthy = sum(1 for s in sources if s.get("ok", True))
+        rule = "─" * 18
+        header = f"📊 *SOURCE HEALTH & AUDIT REPORT*\n{rule}"
+        footer = (
+            f"{rule}\nTotal: {total:,} jobs inspected across "
+            f"{healthy}/{len(sources)} platforms."
+        )
+        if getattr(report, "evaluated", 0):
+            footer += (
+                f"\nAI-scored {report.evaluated}, matched {report.matched}, "
+                f"alerted {report.alerts_sent}."
+            )
+
+        # Pack blocks into messages that each stay inside the transport budget.
+        # The footer is packed as just another block, so it lands at the end of
+        # whichever part has room rather than stranding itself in a near-empty
+        # message. Continuation parts get a compact header with no rule, or the
+        # divider would print twice in a row.
+        cont_header = "📊 *SOURCE AUDIT — continued*"
+        parts: list[str] = []
+        current = header
+        current_header = header
+
+        for block in blocks + [footer]:
+            candidate = f"{current}\n{block}"
+            if _over_budget(candidate) and current != current_header:
+                parts.append(current)
+                current_header = cont_header
+                current = f"{cont_header}\n{block}"
+            else:
+                current = candidate
+        parts.append(current)
+
+        if len(parts) > 1:
+            parts = [f"{p}\n_(part {i}/{len(parts)})_" for i, p in enumerate(parts, 1)]
+        return [_strip_control(p) for p in parts]
+
+    def send_source_digest(self, report: Any) -> bool:
+        """Deliver the audit digest. Returns True if every part was accepted."""
+        parts = self.format_source_digest(report)
+        all_ok = True
+        for index, part in enumerate(parts, 1):
+            ok, detail = self.send_raw(part)
+            if not ok:
+                all_ok = False
+                log.error("Source digest part %d/%d failed: %s",
+                          index, len(parts), detail)
+        if all_ok:
+            log.info("Source health digest sent (%d part(s)).", len(parts))
+        return all_ok
 
     # -- operational messages ----------------------------------------------
     def send_failure_alert(self, summary: str) -> bool:
