@@ -58,10 +58,47 @@ $log = Join-Path $logDir 'listener.log'
 
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 
+# Decode the child process's stdout as UTF-8.
+#
+# Python forces UTF-8 on its streams (see config.py), but PowerShell decodes a
+# native command's output using [Console]::OutputEncoding, which defaults to
+# the OEM codepage -- cp437 here. So an em dash arrives as "ΓÇö" and ARABIC
+# arrives as nothing recoverable at all. The log carries the review cards and
+# the user's own replies, both of which are routinely Arabic, so getting this
+# wrong turns the log into noise precisely when it is being read to find out
+# why an approval did not happen.
+$previousOutputEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$OutputEncoding = [Console]::OutputEncoding
+
+# Every write to the log goes through here, with the encoding stated. Windows
+# PowerShell 5.1 defaults the redirection operators and Tee-Object to UTF-16,
+# and Add-Content to the ANSI codepage -- so a log written by a mix of them is
+# a mix of encodings, and this one carries ARABIC (the review cards and the
+# user's own replies). Half of it renders as mojibake and the rest as spaced
+# nulls, which makes the log useless exactly when it is being read to find out
+# why an approval did not happen.
 function Write-Log([string]$message) {
     $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message
     Write-Host $line
     Add-Content -Path $log -Value $line -Encoding utf8
+}
+
+# A log left over from an older run may be UTF-16. Appending UTF-8 to it
+# produces a file no tool can read end to end, so retire it once instead.
+function Reset-LogIfNotUtf8 {
+    if (-not (Test-Path $log)) { return }
+    $bytes = Get-Content -Path $log -Encoding Byte -TotalCount 4 -ErrorAction SilentlyContinue
+    $isUtf16 = $bytes.Length -ge 2 -and (
+        ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+        ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) -or
+        ($bytes.Length -ge 2 -and $bytes[1] -eq 0x00)
+    )
+    if ($isUtf16) {
+        $retired = "$log.utf16.bak"
+        Move-Item -Path $log -Destination $retired -Force
+        Write-Host "Retired a UTF-16 log to $retired"
+    }
 }
 
 if ($Detached) {
@@ -90,6 +127,7 @@ if ($existing) {
 }
 
 Set-Location $root
+Reset-LogIfNotUtf8
 Write-Log "Supervisor starting. Working directory: $root"
 
 $failures = 0
@@ -98,7 +136,12 @@ $backoff = 5
 while ($true) {
     Write-Log 'Starting: python main.py --listen'
     try {
-        & python main.py --listen 2>&1 | Tee-Object -FilePath $log -Append
+        # NOT Tee-Object: it has no -Encoding before PowerShell 6 and writes
+        # UTF-16 here. Explicit per-line append keeps the whole file UTF-8.
+        & python main.py --listen 2>&1 | ForEach-Object {
+            Write-Host $_
+            Add-Content -Path $log -Value ([string]$_) -Encoding utf8
+        }
         $code = $LASTEXITCODE
     } catch {
         $code = 1
