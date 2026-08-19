@@ -220,15 +220,19 @@ jobs:
           print("| stage | count |")
           print("|---|---:|")
           for key in ("scraped", "too_old", "duplicates", "prefilter_dropped",
-                      "prefilter_disqualified", "evaluated", "matched",
-                      "alerts_sent", "alerts_failed"):
+                      "prefilter_disqualified", "over_cap", "evaluated",
+                      "evaluation_failures", "matched", "alerts_sent",
+                      "alerts_failed"):
               print(f"| {key.replace('_', ' ')} | {r.get(key, 0)} |")
           print(f"\n**Gemini:** {r['gemini_calls']} calls, ~{r['gemini_tokens']} tokens\n")
           if r.get("sources"):
-              print("| source | ok | postings | seconds |")
-              print("|---|:--:|---:|---:|")
+              print("| source | ok | postings | seconds | last seen |")
+              print("|---|:--:|---:|---:|---|")
               for s in r["sources"]:
-                  print(f"| {s['name']} | {'yes' if s['ok'] else 'NO'} | {s['count']} | {s['seconds']} |")
+                  smp = s.get("sample") or {}
+                  seen = " @ ".join(x for x in (smp.get("title"), smp.get("company")) if x)
+                  print(f"| {s['name']} | {'yes' if s['ok'] else 'NO'} | {s['count']} "
+                        f"| {s['seconds']} | {seen[:60] or '-'} |")
           if r.get("top_matches"):
               print("\n### Best matches this run\n")
               for m in r["top_matches"][:5]:
