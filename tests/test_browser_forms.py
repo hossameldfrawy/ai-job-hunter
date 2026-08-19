@@ -26,12 +26,14 @@ Run:  python -m pytest tests/test_browser_forms.py -v
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -2087,3 +2089,65 @@ class TestQuestionsAreCounted(unittest.TestCase):
             with self.subTest(kind=kind):
                 field = _field(kind, f"#{kind}", "text", kind)
                 self.assertFalse(browser_mod.is_question_control(field))
+
+
+@contextmanager
+def _as_linux():
+    """Make the guard believe it is on a bare Linux host, whatever we run on."""
+    with (
+        mock.patch.object(browser_mod.os, "name", "posix"),
+        mock.patch.object(browser_mod.sys, "platform", "linux"),
+    ):
+        yield
+
+# ---------------------------------------------------------------------------
+class TestHeadlessDisplayGuard(unittest.TestCase):
+    """A headed browser on a display-less host is a crash, not a preference.
+
+    config.yml ships `auto_apply.headed: true` because assisted registration
+    needs a human to solve the CAPTCHA. Carried onto a cloud VM unchanged that
+    setting does not merely degrade -- Chromium refuses to launch at all with
+    no $DISPLAY, so every apply run dies at the first browser.
+    """
+
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in ("DISPLAY", "WAYLAND_DISPLAY")}
+        for key in self._env:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_headless_request_is_always_honoured(self):
+        self.assertTrue(browser_mod.resolve_headless(False))
+
+    def test_headed_request_downgrades_when_linux_has_no_display(self):
+        with _as_linux():
+            self.assertTrue(
+                browser_mod.resolve_headless(True),
+                "a headed launch was allowed with no display; Chromium would abort",
+            )
+
+    def test_headed_request_survives_when_a_display_exists(self):
+        with _as_linux():
+            os.environ["DISPLAY"] = ":99"          # e.g. Xvfb
+            self.assertFalse(browser_mod.resolve_headless(True))
+
+    def test_wayland_counts_as_a_display(self):
+        with _as_linux():
+            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+            self.assertFalse(browser_mod.resolve_headless(True))
+
+    def test_desktop_platforms_always_have_a_display(self):
+        for name, platform in (("nt", "win32"), ("posix", "darwin")):
+            with self.subTest(platform=platform):
+                with (
+                    mock.patch.object(browser_mod.os, "name", name),
+                    mock.patch.object(browser_mod.sys, "platform", platform),
+                ):
+                    self.assertTrue(browser_mod.display_available())
+

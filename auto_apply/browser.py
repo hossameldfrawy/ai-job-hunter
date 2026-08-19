@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -222,6 +223,40 @@ def playwright_available() -> bool:
         return False
 
 
+def display_available() -> bool:
+    """Can this machine actually put a browser window on a screen?
+
+    Windows and macOS always can. Linux only can when something is listening
+    on X or Wayland -- which a cloud VM is not. Chromium does not degrade
+    there: `headless=False` with no $DISPLAY aborts the launch outright, so
+    the honest answer has to be known BEFORE we ask for a headed browser.
+    """
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def resolve_headless(show: bool) -> bool:
+    """The headless flag to actually launch with, given what was asked for.
+
+    A headed request on a machine with no display is not a preference we can
+    honour -- it is a crash. Downgrade it to headless and say so once, loudly:
+    the run continues, but any flow that needed a human at the glass (solving
+    a CAPTCHA during assisted registration) is now running blind, and the log
+    is the only place that will admit it.
+    """
+    if not show:
+        return True
+    if display_available():
+        return False
+    log.warning(
+        "Headed browser requested but no display is available (no $DISPLAY / "
+        "$WAYLAND_DISPLAY). Falling back to headless. Flows that need a human "
+        "to solve a challenge cannot complete on this host."
+    )
+    return True
+
+
 def platform_slug(platform: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(platform or "default").lower()).strip("_") \
         or "default"
@@ -416,7 +451,7 @@ def browser_context(
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
-            headless=not show,
+            headless=resolve_headless(show),
             viewport={"width": 1440, "height": 900},
             locale="en-US",
             timezone_id="Africa/Cairo",
