@@ -582,5 +582,78 @@ class TestApplicationFormDetection(unittest.TestCase):
             v.close()
 
 
+class TestAppPasswordNormalisation(unittest.TestCase):
+    """Gmail rejects an app password containing an invisible NBSP.
+
+    Google renders app passwords as four spaced groups. Copy-pasting from that
+    page can carry a non-breaking or zero-width space, which is visually
+    identical to a normal one and which Gmail refuses -- producing exactly the
+    same "Invalid credentials" error as a genuinely wrong password. Normalising
+    against a character class rather than `.strip()` removes them.
+    """
+
+    def setUp(self):
+        from auto_apply.email_listener import _password_variants
+
+        self.v = _password_variants
+        self.expected = "abcdefghijklmnop"
+
+    def test_every_surface_form_normalises_to_the_same_credential(self):
+        nbsp, narrow, zwsp = chr(0x00a0), chr(0x202f), chr(0x200b)
+        for label, raw in {
+            "unspaced": self.expected,
+            "spaced": "abcd efgh ijkl mnop",
+            "trailing newline": self.expected + chr(10),
+            "leading/trailing space": "  " + self.expected + "  ",
+            "NBSP separators": nbsp.join(["abcd", "efgh", "ijkl", "mnop"]),
+            "narrow NBSP": narrow.join(["abcd", "efgh", "ijkl", "mnop"]),
+            "zero-width lurker": "abcdefgh" + zwsp + "ijklmnop",
+        }.items():
+            self.assertEqual(self.v(raw)[0], self.expected, f"form={label}")
+
+    def test_spaced_form_is_also_offered(self):
+        """Gmail accepts the spaced form too; try it as a fallback."""
+        self.assertIn("abcd efgh ijkl mnop", self.v(self.expected))
+
+    def test_variants_are_deduplicated_and_ordered(self):
+        out = self.v(self.expected)
+        self.assertEqual(len(out), len(set(out)))
+        self.assertEqual(out[0], self.expected, "most likely form must be first")
+
+    def test_empty_input_yields_nothing(self):
+        self.assertEqual(self.v(""), [])
+
+
+class TestInboxFailsSafely(unittest.TestCase):
+    def test_missing_credentials_raise_a_useful_message(self):
+        from auto_apply.email_listener import EmailMonitor
+
+        v = _store()
+        try:
+            monitor = EmailMonitor(v, notifier=None)
+            monitor.user, monitor.password = "", ""
+            with self.assertRaises(RuntimeError) as ctx:
+                monitor._connect()
+            self.assertIn("JOB_EMAIL", str(ctx.exception))
+        finally:
+            v.close()
+
+    def test_a_failed_pass_returns_zero_counts_rather_than_crashing(self):
+        """A dead mailbox must not take down a --daemon or --live process."""
+        from auto_apply.email_listener import EmailMonitor
+
+        v = _store()
+        try:
+            monitor = EmailMonitor(v, notifier=None)
+            monitor.fetch_unread = lambda: (_ for _ in ()).throw(
+                RuntimeError("auth failed")
+            )
+            counts = monitor.run_once()
+            self.assertEqual(counts["scanned"], 0)
+            self.assertEqual(counts["alerted"], 0)
+        finally:
+            v.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

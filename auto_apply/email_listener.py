@@ -24,6 +24,7 @@ import email.utils
 import imaplib
 import logging
 import re
+import ssl
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
@@ -132,6 +133,30 @@ class InboxMessage:
         return [u for u in found if any(h in u.lower() for h in _MEETING_HOSTS)]
 
 
+# Characters that survive a copy-paste from a web page and look identical to a
+# normal space: non-breaking space, narrow NBSP, zero-width space/joiner.
+_INVISIBLE = re.compile(r"[\s  ​‌‍﻿]+")
+
+
+def _password_variants(raw: str) -> list[str]:
+    """Every surface form of an app password worth trying, most likely first.
+
+    Google renders app passwords as four spaced groups, and people paste them
+    with the spaces, without them, or with an invisible NBSP that Gmail rejects
+    while looking identical on screen. Stripping is done against a character
+    class rather than `.strip()` so those invisibles are actually removed.
+    """
+    if not raw:
+        return []
+    squashed = _INVISIBLE.sub("", raw)
+    spaced = " ".join(squashed[i:i + 4] for i in range(0, len(squashed), 4))
+    out: list[str] = []
+    for value in (squashed, spaced, raw.strip(), raw):
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
 def _decode(value: str | None) -> str:
     if not value:
         return ""
@@ -198,19 +223,13 @@ class EmailMonitor:
                 "and put both in .env."
             )
 
-        conn = imaplib.IMAP4_SSL(self.host, self.port)
-        # Google displays app passwords in four spaced groups; the spaces are
-        # presentational. Try the literal value first, then the stripped form,
-        # so a copy-paste straight from the Google page works either way.
-        candidates = [self.password]
-        squashed = self.password.replace(" ", "")
-        if squashed != self.password:
-            candidates.append(squashed)
-
+        conn = imaplib.IMAP4_SSL(
+            self.host, self.port, ssl_context=ssl.create_default_context()
+        )
         last = ""
-        for candidate in candidates:
+        for candidate in _password_variants(self.password):
             try:
-                conn.login(self.user, candidate)
+                conn.login(self.user.strip(), candidate)
                 conn.select(self.mailbox)
                 return conn
             except imaplib.IMAP4.error as exc:
