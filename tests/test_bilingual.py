@@ -406,7 +406,7 @@ class TestSourceHealthDigest(unittest.TestCase):
         for p in parts:
             self.assertLessEqual(len(p), self.max_chars, "message text over budget")
             url = ("https://api.callmebot.com/whatsapp.php"
-                   f"?phone=%2B201234567890&apikey=1140049&text={quote(p)}")
+                   f"?phone=%2B201234567890&apikey=TESTKEY&text={quote(p)}")
             self.assertLessEqual(len(url), self.max_url, "encoded URL over budget")
 
     def test_every_source_appears_even_when_split(self):
@@ -533,7 +533,7 @@ class TestSourceHealthDigest(unittest.TestCase):
         )
         msg = WhatsAppNotifier(None).format_alert(ev)
         url = ("https://api.callmebot.com/whatsapp.php"
-               f"?phone=%2B201234567890&apikey=1140049&text={quote(msg)}")
+               f"?phone=%2B201234567890&apikey=TESTKEY&text={quote(msg)}")
         self.assertLessEqual(len(url), MAX_URL_LENGTH,
                              "Arabic alert would be dropped by CallMeBot")
         self.assertIn("tanqeeb.com", msg, "the link must survive shrinking")
