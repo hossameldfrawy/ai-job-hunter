@@ -1667,3 +1667,195 @@ class TestCaptureSessionIsWiredUp(unittest.TestCase):
         that failure looks exactly like the tool being broken."""
         self.assertIn("Close every Chrome window first",
                       browser_mod.CHROME_LAUNCH_HINT)
+
+
+class TestArrivedAtTheApplication(unittest.TestCase):
+    """Knowing when to STOP clicking.
+
+    Measured on draft #9, before this existed. The chain worked perfectly:
+    .apply-btn -> the board's job page, signed in -> "Complete your
+    application" -> wuzzuf.net/job-questions/<uuid>. Then it inspected that
+    page before the app had rendered, saw nothing it recognised, and hopped
+    once more into a nav link that navigated to /saved -- discarding a
+    part-finished application that was one step from submittable.
+    """
+
+    def test_an_application_url_is_recognised(self):
+        for url in ("https://wuzzuf.net/job-questions/e5b161d0-5add-4294",
+                    "https://boards.greenhouse.io/acme/jobs/1/apply",
+                    "https://x.com/careers/application/44",
+                    "https://y.com/screening-questions/9"):
+            with self.subTest(url=url):
+                self.assertTrue(browser_mod.on_application_url(url))
+
+    def test_a_plain_job_page_is_not_an_application_url(self):
+        for url in ("https://wuzzuf.net/jobs/p/vtcukbqmnbok-it-help-desk",
+                    "https://egypt.tanqeeb.com/jobs-in-egypt/all/jobs/1.html",
+                    "https://wuzzuf.net/saved",
+                    ""):
+            with self.subTest(url=url):
+                self.assertFalse(browser_mod.on_application_url(url))
+
+    def test_the_hop_loop_stops_once_it_is_on_one(self):
+        """Even when the page has not rendered yet -- which is exactly the
+        moment the old code hopped away."""
+        page = ApplyPage(controls=('.apply-btn',),
+                         url="https://wuzzuf.net/job-questions/abc",
+                         fields_before=SEARCH_WIDGET,
+                         fields_after=SEARCH_WIDGET)
+        with _inspecting(page):
+            _active, opened, note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+        self.assertEqual(len(page.clicked), 1, "it hopped off the application")
+        self.assertIn("stopped on the application", note)
+
+
+class TestScreeningQuestionsAreAnApplication(unittest.TestCase):
+    """What a SIGNED-IN candidate is actually shown.
+
+    The board already holds the name, email and CV, so it asks only its
+    screening questions -- and every marker the guard looks for is absent.
+    Wuzzuf then names each question with a UUID and labels the box "Write your
+    answer here..", so nothing classifies either. Live field map from #9:
+
+        [name="q"]                                    -> the site search
+        form >> nth=1 >> textarea >> nth=0            -> "Write your answer.."
+        [name="a6767d69-d125-486f-8cb7-d3b4fa719da6"] -> a radio
+
+    Two real questions, and the old rules called the page a search widget.
+    """
+
+    APP_URL = "https://wuzzuf.net/job-questions/e5b161d0-5add-4294-89ee"
+    SEARCH = _field("unknown", '[name="q"]', label="Search jobs, companies..")
+    QUESTIONS = [
+        _field("unknown", "form >> nth=1 >> textarea >> nth=0", "textarea",
+               "Write your answer here.."),
+        _field("unknown", '[name="a6767d69-d125-486f-8cb7-d3b4fa719da6"]',
+               "radio", "a6767d69-d125-486f-8cb7-d3b4fa719da6"),
+    ]
+
+    def test_uuid_named_questions_on_the_boards_own_url_are_an_application(self):
+        ok, why = looks_like_application_form(
+            [self.SEARCH] + self.QUESTIONS, self.APP_URL)
+        self.assertTrue(ok, why)
+        self.assertIn("2 question(s)", why)
+
+    def test_the_search_box_alone_is_still_not_an_application(self):
+        """The whole point of the guard survives: a URL is not enough on its
+        own, or we would submit the site search from an application page."""
+        ok, why = looks_like_application_form([self.SEARCH], self.APP_URL)
+        self.assertFalse(ok)
+        self.assertIn("search", why)
+
+    def test_the_same_questions_off_an_application_url_are_still_refused(self):
+        """Without the URL there is no evidence -- these fields are
+        indistinguishable from any other unlabelled widget."""
+        ok, _why = looks_like_application_form(
+            [self.SEARCH] + self.QUESTIONS,
+            "https://wuzzuf.net/jobs/p/some-job")
+        self.assertFalse(ok)
+
+    def test_a_signup_form_is_refused_even_on_an_application_url(self):
+        """The password rule outranks everything, including this one. A board
+        that bounces us to a signup while keeping an /apply URL must never be
+        filled in and submitted as an application."""
+        signup = [
+            _field("first_name", "#f", label="firstname"),
+            _field("last_name", "#l", label="lastname"),
+            _field("email", "#e", label="email"),
+            _field("password", "#p", label="password"),
+        ]
+        ok, why = looks_like_application_form(signup, self.APP_URL)
+        self.assertFalse(ok)
+        self.assertIn("sign-in or registration", why)
+
+    def test_omitting_the_url_keeps_the_old_behaviour(self):
+        ok, _why = looks_like_application_form([self.SEARCH] + self.QUESTIONS)
+        self.assertFalse(ok)
+
+    def test_a_real_application_form_still_passes_without_a_url(self):
+        fields = [_field("resume", "#cv", "file", "Upload CV")]
+        self.assertTrue(looks_like_application_form(fields)[0])
+
+
+class TestAlreadyApplied(unittest.TestCase):
+    """A job the board has already taken is not a blocked draft.
+
+    Draft #7's page said "Already applied". Left pending it would keep
+    offering the user a `done 7` that cannot work, and any attempt to satisfy
+    it risks a duplicate application under their name.
+    """
+
+    class Page:
+        def __init__(self, text="", raises=False):
+            self._text, self._raises = text, raises
+
+        def inner_text(self, _selector):
+            if self._raises:
+                raise RuntimeError("gone")
+            return self._text
+
+    def test_the_live_wording_is_recognised(self):
+        page = self.Page("EXPLORE SAVED 1 APPLICATIONS H IT Help Desk "
+                         "Specialist ... posted 14 days ago Already applied "
+                         "Track Applications")
+        self.assertEqual(browser_mod.detect_already_applied(page),
+                         "already applied")
+
+    def test_every_marker_matches(self):
+        for marker in browser_mod.ALREADY_APPLIED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    browser_mod.detect_already_applied(
+                        self.Page(f"header {marker} footer")), marker)
+
+    def test_an_ordinary_job_page_is_not_already_applied(self):
+        page = self.Page("IT Help Desk Full Time On-site Apply For Job")
+        self.assertEqual(browser_mod.detect_already_applied(page), "")
+
+    def test_the_word_apply_alone_does_not_count(self):
+        """A false positive here means a job silently never applied for, so
+        the match is deliberately exact-phrase."""
+        for text in ("Apply For Job", "Applications close soon",
+                     "How to apply", "Applicants must have 3 years"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    browser_mod.detect_already_applied(self.Page(text)), "")
+
+    def test_an_unreadable_page_is_not_assumed_applied(self):
+        self.assertEqual(
+            browser_mod.detect_already_applied(self.Page(raises=True)), "")
+
+
+class TestSpaSettling(unittest.TestCase):
+    """The reason the hop overshot: the page had not rendered yet."""
+
+    class Page:
+        def __init__(self, fail_states=()):
+            self.states = []
+            self.slept = 0
+            self._fail = set(fail_states)
+
+        def wait_for_load_state(self, state, timeout=None):
+            if state in self._fail:
+                raise RuntimeError("never idle")
+            self.states.append(state)
+
+        def wait_for_timeout(self, ms):
+            self.slept += ms
+
+    def test_it_waits_for_the_network_to_go_quiet(self):
+        page = self.Page()
+        browser_mod._settle_spa(page)
+        self.assertEqual(page.states, ["networkidle"])
+        self.assertGreaterEqual(page.slept, 2000)
+
+    def test_a_page_that_never_goes_idle_falls_back_to_load(self):
+        page = self.Page(fail_states=("networkidle",))
+        browser_mod._settle_spa(page)
+        self.assertEqual(page.states, ["load"])
+
+    def test_a_page_that_answers_nothing_still_returns(self):
+        page = self.Page(fail_states=("networkidle", "load"))
+        browser_mod._settle_spa(page)
+        self.assertGreaterEqual(page.slept, 2000)

@@ -366,8 +366,8 @@ def prepare_application(
         return int(existing["id"])
 
     from auto_apply.browser import (
-        browser_page, detect_ats, has_saved_session, inspect_form,
-        looks_like_application_form, open_application_form,
+        browser_page, detect_ats, detect_bot_wall, has_saved_session,
+        inspect_form, looks_like_application_form, open_application_form,
     )
     from auto_apply.profile_builder import platform_for_url
     from auto_apply.profile_builder import platform_for_source
@@ -405,8 +405,21 @@ def prepare_application(
                 )
                 fields = inspect_form(apply_page)
                 ats = detect_ats(apply_page)
-                form_ok, form_note = looks_like_application_form(fields)
-                if opened:
+                form_ok, form_note = looks_like_application_form(
+                    fields, str(getattr(apply_page, "url", "") or ""))
+                # An anti-bot holding page has no form on it, so every check
+                # above reports its own symptom -- "0 fields", "search widget"
+                # -- and none of them names the 403 that caused all of it.
+                wall = detect_bot_wall(apply_page)
+                if not form_ok and wall:
+                    form_ok, form_note = False, (
+                        f"blocked by an anti-bot check ({wall!r}) -- this "
+                        f"browser is never served the real page. Sign in with "
+                        f"your normal Chrome, then run: "
+                        f"python main.py --capture-session "
+                        f"{board.name if board else session_key}"
+                    )
+                elif opened:
                     form_note = f"{form_note} ({open_note})"
                 elif "never automated" in open_note:
                     # A refusal, not a detection failure. Say which it is:
@@ -560,8 +573,8 @@ def refresh_draft(app_id: int, store: SecureStore,
     token, and without the quota being the reason the fix cannot be verified.
     """
     from auto_apply.browser import (
-        browser_page, detect_ats, inspect_form, looks_like_application_form,
-        open_application_form,
+        browser_page, detect_already_applied, detect_ats, detect_bot_wall,
+        inspect_form, looks_like_application_form, open_application_form,
     )
     from auto_apply.profile_builder import platform_for_source
     from auto_apply.review import DraftCard, dispatch_review, payload_of
@@ -592,15 +605,39 @@ def refresh_draft(app_id: int, store: SecureStore,
             apply_page, open_note = _sign_in_and_retry(apply_page, store,
                                                        open_note)
             fields = inspect_form(apply_page)
-            form_ok, form_note = looks_like_application_form(fields)
+            form_ok, form_note = looks_like_application_form(
+                fields, str(getattr(apply_page, "url", "") or ""))
             payload["ats"] = detect_ats(apply_page)
             payload["field_map"] = describe_fields(fields)
+            wall = detect_bot_wall(apply_page) if not form_ok else ""
+            applied = detect_already_applied(apply_page) if not form_ok else ""
     except Exception as exc:
         return False, f"#{app_id} could not be re-inspected: {exc}"[:200]
 
+    if applied:
+        # The board has this application already. Leaving the row pending
+        # would keep offering the user a "done 7" that cannot work, and any
+        # attempt to satisfy it risks a duplicate application under their name.
+        payload["form_note"] = f"the board says {applied!r}"
+        store.update_application_draft(app_id, payload=payload)
+        store.set_application_status(app_id, STATUS_SUBMITTED)
+        return True, (f"#{app_id} ALREADY APPLIED on the board "
+                      f"({applied!r}) -- marked submitted, nothing left to do")
+
     payload["form_ok"] = form_ok
-    payload["form_note"] = (f"{form_note} ({open_note})" if open_note
-                            else form_note)
+    if wall:
+        # Name the 403, not its symptom. Everything above was describing a
+        # holding page: "0 fields" and "search widget" are both true of one,
+        # and neither tells the reader that the real page was never served.
+        payload["form_note"] = (
+            f"blocked by an anti-bot check ({wall!r}) -- this browser is never "
+            f"served the real page. Sign in with your normal Chrome, then run: "
+            f"python main.py --capture-session "
+            f"{board.name if board else session_key}"
+        )
+    else:
+        payload["form_note"] = (f"{form_note} ({open_note})" if open_note
+                                else form_note)
     store.update_application_draft(app_id, payload=payload)
 
     changed = form_ok != was_ok

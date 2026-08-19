@@ -518,9 +518,49 @@ APPLY_SELECTORS: tuple[str, ...] = (
     'button:has-text("Easy Apply")',
     'button:has-text("Apply for this job")',
     'a:has-text("Apply for this job")',
+    # Resuming a part-finished application. Wuzzuf keeps an unsubmitted
+    # application as a draft on ITS side and replaces the apply button with
+    # this -- verified live on draft #9: "Complete your application / Your
+    # application is saved as a draft and not submitted yet". Without these
+    # the page reads as a job ad with no way in, and the draft looks blocked
+    # when it is actually further along than any other.
+    'button:has-text("Complete your application")',
+    'a:has-text("Complete your application")',
+    'button:has-text("Complete application")',
+    'button:has-text("Continue application")',
+    'button:has-text("Resume application")',
+    'button:has-text("أكمل طلبك")',
     'button:has-text("Apply")',
     'a:has-text("Apply")',
 )
+
+#: Text that means the board has ALREADY taken this application.
+#: Not a failure and not a blocker -- the opposite. A draft whose page says
+#: this must never be re-submitted, and must not sit in the queue pretending
+#: to be unfinished work.
+ALREADY_APPLIED_MARKERS: tuple[str, ...] = (
+    "already applied",
+    "you have applied",
+    "application submitted",
+    "تم التقديم",
+    "تقدمت بالفعل",
+)
+
+
+def detect_already_applied(page: Any) -> str:
+    """Return the marker showing this job was already applied to, or "".
+
+    Deliberately exact-phrase: the cost of a false positive is a job silently
+    never applied for, so a loose match here is worse than no match.
+    """
+    try:
+        text = " ".join((page.inner_text("body") or "").split()).lower()
+    except Exception:
+        return ""
+    for marker in ALREADY_APPLIED_MARKERS:
+        if marker in text:
+            return marker
+    return ""
 
 #: Text that means "this is not the apply button", checked before clicking one
 #: whose match was only textual. "Apply filters" and "Applied" are both common
@@ -953,6 +993,43 @@ def adopt_session_for(context: Any, url: str) -> str:
     return board.name
 
 
+def _settle_spa(page: Any, timeout_ms: int = 5000) -> None:
+    """Give a single-page app time to hydrate after a reload.
+
+    Load-bearing on the hop that signs us in. Wuzzuf renders its "Complete
+    your application" button client-side: at the 1.2s this used to wait, the
+    button is not in the DOM yet, so the freshly-authenticated page reads as a
+    job ad with no way into the form -- and the draft furthest along of all of
+    them reported itself blocked.
+    """
+    for state in ("networkidle", "load"):
+        try:
+            page.wait_for_load_state(state, timeout=timeout_ms)
+            break
+        except Exception:
+            continue
+    try:
+        page.wait_for_timeout(2500)
+    except Exception:
+        pass
+
+
+#: URL fragments that mean "you have arrived" -- the application's own page.
+#: Measured on draft #9: the chain reached
+#: wuzzuf.net/job-questions/<uuid>, inspected it before it had rendered, saw
+#: nothing, and hopped once more into a nav link that navigated to /saved --
+#: losing a part-finished application that was one step from submittable.
+APPLICATION_URL_MARKERS: tuple[str, ...] = (
+    "job-questions", "/apply", "/application", "screening-questions",
+)
+
+
+def on_application_url(url: str) -> bool:
+    """True when this URL is the application itself, not a way to reach one."""
+    return any(marker in (url or "").lower()
+               for marker in APPLICATION_URL_MARKERS)
+
+
 def open_application_form(
     page: Any, timeout_ms: int = 5000, max_hops: int = 3
 ) -> tuple[Any, bool, str]:
@@ -975,7 +1052,14 @@ def open_application_form(
         if not opened:
             break
         opened_any = True
-        if looks_like_application_form(inspect_form(current))[0]:
+        here = str(getattr(current, "url", "") or "")
+        if looks_like_application_form(inspect_form(current), here)[0]:
+            break
+        if on_application_url(here):
+            # Already on the application's own page. Anything else clickable
+            # here leads AWAY from it, and one wrong hop discards a form we
+            # may not be able to get back to.
+            notes.append("stopped on the application's own page")
             break
 
     return current, opened_any, " -> ".join(notes)
@@ -1129,9 +1213,12 @@ def _open_application_once(
                 try:
                     popup.reload(wait_until="domcontentloaded",
                                  timeout=timeout_ms)
-                    popup.wait_for_timeout(1200)
                 except Exception:
                     pass
+            # Settle whether or not we signed in. The caller inspects the page
+            # the moment this returns, and an unhydrated SPA reads as "no form
+            # here" -- which sends the hop loop off clicking the next thing.
+            _settle_spa(popup, timeout_ms)
 
             log.info("The application opened in a new tab: %s", popup_url[:90])
             detail = (f"clicked {selector}; the application opened in a new "
@@ -1152,9 +1239,9 @@ def _open_application_once(
                 try:
                     page.reload(wait_until="domcontentloaded",
                                 timeout=timeout_ms)
-                    page.wait_for_timeout(1200)
                 except Exception:
                     pass
+            _settle_spa(page, timeout_ms)
         detail = (f"clicked {selector} and the page moved to {after_url[:80]}"
                   if moved else f"clicked {selector}; the form opened in place")
         log.info("Opened the application view: %s", detail)
@@ -1267,7 +1354,8 @@ _SEARCH_FIELD_HINTS = (
 )
 
 
-def looks_like_application_form(fields: list[FormField]) -> tuple[bool, str]:
+def looks_like_application_form(fields: list[FormField],
+                                url: str = "") -> tuple[bool, str]:
     """Decide whether these fields are really an application form.
 
     Job pages are full of forms that are not the one we want -- the site's
@@ -1311,6 +1399,25 @@ def looks_like_application_form(fields: list[FormField]) -> tuple[bool, str]:
         if any(h in f.selector.lower() or h in f.label.lower()
                for h in _SEARCH_FIELD_HINTS)
     ]
+
+    # THE BOARD'S OWN APPLICATION URL, WITH QUESTIONS ON IT.
+    #
+    # A signed-in candidate is asked only the screening questions -- the board
+    # already holds their name, email and CV -- so not one of the markers above
+    # is present. Wuzzuf then names each question with a UUID
+    # ([name="a6767d69-d125-486f-8cb7-d3b4fa719da6"]) and labels the box
+    # "Write your answer here..", so nothing classifies either.
+    #
+    # Verified live on draft #9: a real, part-finished application that every
+    # rule above called a search widget. The URL is what carries the evidence
+    # here, and it is the board's own -- we arrived by clicking its "Complete
+    # your application" button, not by guessing at one.
+    if on_application_url(url):
+        questions = [f for f in fields if f not in searchy]
+        if questions:
+            return True, (f"the board's own application page, with "
+                          f"{len(questions)} question(s) to answer")
+
     if searchy and not personal:
         return False, (
             "this looks like the site's search/filter widget, not an "
