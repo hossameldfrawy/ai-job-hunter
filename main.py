@@ -404,7 +404,13 @@ def cmd_inbox(loop, interval_minutes):
     from notifier import WhatsAppNotifier
 
     if not settings.email_monitor_ready:
-        log.error("JOB_EMAIL / JOB_EMAIL_APP_PASSWORD are not set in .env.")
+        log.error(
+            "No mailbox access is configured.\n"
+            "  Preferred: python auth_gmail.py   (Gmail API over OAuth2 -- the "
+            "only route that works on a modern Google account)\n"
+            "  Legacy:    set JOB_EMAIL and JOB_EMAIL_APP_PASSWORD in .env "
+            "(older accounts only)."
+        )
         return 2
 
     store, notifier = _store(), WhatsAppNotifier(None)

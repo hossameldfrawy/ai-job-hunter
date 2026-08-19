@@ -1,0 +1,75 @@
+# ============================================================================
+#  Test suite
+# ============================================================================
+#  Deliberately separate from job_hunter.yml. The hunt runs every 30 minutes
+#  and must not be blocked by a red test; the tests run on every push and must
+#  not wait for a hunt. Coupling them would mean a broken test silently stops
+#  the job search, which is the opposite of what a test suite is for.
+#
+#  NO SECRETS ARE PROVIDED TO THIS JOB, on purpose. tests/conftest.py neuters
+#  every credential and blocks every non-loopback socket, so a suite that needs
+#  a real key to pass has a bug in it -- and running without secrets is how
+#  that gets noticed here rather than in the user's Telegram.
+# ============================================================================
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the scheduled hunt runs on; 3.14 is the desktop that
+        # drives auto-apply. Both have to stay green or one of the two
+        # environments is untested.
+        python-version: ["3.12", "3.14"]
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          pip install -r requirements-dev.txt --quiet
+
+      - name: Run the suite
+        # pytest.ini pins testpaths=tests and turns warnings into errors.
+        run: python -m pytest
+
+      - name: Assert no secret ever became a tracked file
+        run: |
+          leaked=$(git ls-files \
+            | grep -E '^(secrets/|\.env$|state/.*\.db$|screenshots/)' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::These are tracked but must never be:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "No secret artefacts are tracked."

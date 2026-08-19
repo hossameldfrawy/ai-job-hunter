@@ -167,6 +167,15 @@ form must show real evidence (a CV upload, a cover-letter box, or two personal
 fields) before anything is submitted; otherwise the draft is kept, the cover
 letter is ready to paste, and you get the link to apply by hand.
 
+The check is **fail-closed and pre-flight**: only a draft whose stored
+`form_ok` is explicitly `true` may reach a browser at all. It used to refuse
+only on an explicit `false`, which let two cases through to Chromium — a draft
+written before `form_ok` was recorded, and one with no payload. Neither is
+hypothetical: the pending draft in the vault had `form_ok: null` and its only
+detected fields were `keywords` and `state`, i.e. Tanqeeb's search box. There
+is still a second check *inside* the browser in case the page changed between
+drafting and approval, but it is a backstop, not the gate.
+
 ### Interview monitor
 
 Recruiter mail is classified by Gemini into interview / assessment / rejection /
@@ -207,6 +216,26 @@ It is careful with a real mailbox either way. `messages.get` does not mark
 anything read (nor does IMAP's `BODY.PEEK`) — only an explicit label change
 does, and only for mail already classified as job-related. A cheap local filter
 runs first, so a personal email is never sent to the AI at all.
+
+**One alert per email, and one Gemini call per email — for life.** The monitor
+re-reads the same mailbox every 15 minutes, so both guarantees are about what
+happens on the *second* pass:
+
+- `message_id` is `UNIQUE` in `email_interview_events` and `seen_message()`
+  reads that table, so a message is classified at most once, ever. Every
+  verdict is banked — **including "not job mail"**. Skipping that record meant
+  a job-alert digest, which says "position" and so clears the keyword gate on
+  every pass, was re-sent to Gemini on every poll for as long as it sat unread:
+  roughly 96 wasted calls a day, indefinitely.
+- The event row is written **before** the alert is sent. That ordering is what
+  makes a duplicate impossible even if the process dies mid-send or two polls
+  overlap. `alerted` is then corrected to what actually happened, so it means
+  "you saw it" rather than "we meant to tell you"; a failed send is logged
+  loudly rather than retried, because a second copy of an interview invitation
+  is worse than one you can find in the log.
+
+A transient Gemini error is *not* banked — only real verdicts stick — so a 503
+costs a retry next pass rather than losing the invitation.
 
 ---
 
@@ -453,7 +482,47 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python auth_telegram.py` | One-time Telegram login (private groups) |
 | `python check_telegram.py` | Verify the Telegram client, list your groups |
 | `python check_telegram.py --scan 168 --suggest` | Rank your chats by hiring output, emit a narrowed `include_chats` |
-| `python -m unittest discover -s tests` | Offline test suite (115 tests, no network) |
+| `python -m pytest` | Offline test suite (272 tests, no network) |
+
+---
+
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+**Use pytest, not `unittest discover`.** The safety harness lives in
+`tests/conftest.py`, which only pytest loads. Running the suite any other way
+skips it, and `tests/test_no_real_sends.py` will refuse to import rather than
+let that happen quietly.
+
+### The suite cannot message you
+
+It used to. Every module set `DRY_RUN=true`, all assertions passed, the run
+finished green — and five real job cards landed in the user's Telegram Saved
+Messages on **every run**, because `send_via_telegram` had no dry-run guard and
+`dispatch()` called it in both arms of an `if dry_run: … elif …`. A green suite
+proved nothing about delivery.
+
+That is fixed in `notifier.py`, and `conftest.py` now makes the next such bug
+unable to reach you, through three independent layers:
+
+| Layer | What it does |
+|---|---|
+| **Environment** | Real credentials are replaced with obvious test values *before* `config.py` reads `.env`, so a stray call authenticates as nobody. `TELEGRAM_STRING_SESSION` is emptied outright. |
+| **Transports** | `send_via_telegram`, `send_raw` and `http_client.get` become recorders that deliver nothing. Ask for the `outbox` fixture to assert on what *would* have been sent. |
+| **Sockets** | `connect()` to any non-loopback address raises. Loopback stays open because asyncio's self-pipe needs it. |
+
+The socket layer is the one that matters — the first two can be defeated by a
+test that builds its own client; a blocked socket cannot.
+`tests/test_no_real_sends.py` asserts all three are armed *and* that the real
+production methods honour `DRY_RUN`, checked against the genuine
+implementations rather than the stubs.
+
+No secrets are supplied to CI on purpose: a suite that needs a real key to pass
+has a bug, and it should surface there rather than in your Telegram.
 
 ---
 
@@ -482,12 +551,27 @@ scrapers/               One module per source
   ├─ search_proxy.py    Google News RSS for 403-blocked boards
   ├─ rss_feeds.py       Generic RSS/Atom
   └─ facebook.py        Indexed posts / optional cookie
+vault.py                Encrypted local store: credentials, applications, inbox events
+auto_apply/             Phase 2: registration, drafting, approval, submission
+  ├─ gmail_oauth.py     Gmail API OAuth2: token lifecycle and refresh
+  ├─ email_listener.py  Inbox monitor, backends, exactly-once alerting
+  ├─ engine.py          Draft → review → approve → submit → evidence
+  ├─ browser.py         Playwright plumbing and semantic form detection
+  ├─ profile_builder.py Assisted account creation, per-platform passwords
+  └─ candidate.py       Structured profile extracted from the CV
 setup_wizard.py         Setup, verification, secret export
+auth_gmail.py           One-time Gmail API authorisation
 auth_telegram.py        One-time interactive Telegram authorisation
 check_telegram.py       Telegram connection/dialog/filter verification
 discover_channels.py    Public Telegram channel auditor
+tests/                  Offline suite -- run with pytest, never unittest
+  ├─ conftest.py        The safety harness: env, transports, sockets
+  ├─ test_no_real_sends.py   Proof the suite cannot message you
+  ├─ test_inbox_dedup.py     Exactly-once alerting, Gemini quota
+  └─ test_lifecycle_e2e.py   register → apply → approve → evidence
+pytest.ini              testpaths=tests, warnings are errors
 n8n_workflow.json       Importable n8n visual workflow
-.github/workflows/      The 24/7 GitHub Actions engine
+.github/workflows/      The 24/7 GitHub Actions engine + the test gate
 ```
 
 ---

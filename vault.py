@@ -311,12 +311,26 @@ class SecureStore:
         self, app_id: int, status: str, *, screenshot_path: str = "",
         failure_reason: str = "",
     ) -> None:
+        """Move an application along its lifecycle.
+
+        The two non-status columns are treated differently on purpose:
+
+          * `screenshot_path` is EVIDENCE that a submission happened, so it is
+            only ever overwritten by a new path -- never cleared. This used to
+            be a plain assignment, which meant re-running `--approve` on an
+            already-submitted application silently threw away the proof.
+          * `failure_reason` IS cleared when none is supplied, because a stale
+            reason shown against a since-approved application is worse than no
+            reason at all.
+        """
         with self._tx() as c:
             c.execute(
-                "UPDATE applications_history SET status=?, screenshot_path=?, "
-                "failure_reason=?, submitted_at=CASE WHEN ?='submitted' "
+                "UPDATE applications_history SET status=?, "
+                "screenshot_path=COALESCE(NULLIF(?,''), screenshot_path), "
+                "failure_reason=NULLIF(?,''), "
+                "submitted_at=CASE WHEN ?='submitted' "
                 "THEN ? ELSE submitted_at END WHERE id=?",
-                (status, screenshot_path or None, failure_reason or None,
+                (status, screenshot_path or "", failure_reason or "",
                  status, iso(utc_now()), app_id),
             )
 
@@ -404,8 +418,20 @@ class SecureStore:
         summary: str = "", matched_app_id: int | None = None,
         alerted: bool = False,
     ) -> int:
+        """Bank one triaged message. Idempotent on `message_id`.
+
+        This row IS the anti-duplicate key: `message_id` is UNIQUE and
+        `seen_message()` reads exactly this table, so a message that has a row
+        can never be classified, alerted or charged to the Gemini quota twice
+        -- however many times the poll laps the same inbox.
+
+        Returns the row id, re-read on conflict. `lastrowid` is meaningless
+        after `DO NOTHING`: SQLite leaves it pointing at whatever this cursor
+        last inserted, so the previous caller's id would be handed back as if
+        it were this message's.
+        """
         with self._tx() as c:
-            cur = c.execute(
+            c.execute(
                 "INSERT INTO email_interview_events "
                 "(message_id,sender,subject,classification,parsed_date,"
                 " meeting_link,summary,matched_app_id,alerted,received_at) "
@@ -415,7 +441,25 @@ class SecureStore:
                  meeting_link, summary, matched_app_id, int(alerted),
                  iso(utc_now())),
             )
-        return int(cur.lastrowid or 0)
+            row = c.execute(
+                "SELECT id FROM email_interview_events WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        return int(row["id"]) if row else 0
+
+    def mark_event_alerted(self, message_id: str, alerted: bool = True) -> None:
+        """Record whether the alert for this message actually went out.
+
+        Split from `record_email_event` on purpose. The row is written BEFORE
+        the send so a crash mid-delivery cannot produce a second alert; this
+        then records what really happened, so `alerted` means "the user saw
+        it" rather than "we intended to tell them".
+        """
+        with self._tx() as c:
+            c.execute(
+                "UPDATE email_interview_events SET alerted=? WHERE message_id=?",
+                (int(alerted), message_id),
+            )
 
     def recent_events(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:

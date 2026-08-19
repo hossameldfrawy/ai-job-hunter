@@ -290,7 +290,19 @@ class WhatsAppNotifier:
         because it is private, always present, and needs no extra setup.
         Message limit is 4096 characters rather than CallMeBot's URL budget, so
         nothing has to be shortened here.
+
+        HONOURS DRY_RUN. This guard is load-bearing, not decorative: every
+        auto-apply, inbox and review message in the codebase reaches Telegram
+        through this one method, and Saved Messages is a REAL inbox the user
+        reads. Without the check here, `--dry-run` silenced WhatsApp while
+        Telegram carried on delivering, and the test suite -- which sets
+        DRY_RUN=true and holds a valid MTProto session -- posted live cards to
+        the user's own account on every run.
         """
+        if self.dry_run:
+            log.info("[DRY_RUN] would Telegram:\n%s\n", message)
+            return True, "dry_run"
+
         if not self._telegram_available():
             return False, "telegram fallback unavailable (no session or Telethon)"
 
@@ -407,12 +419,10 @@ class WhatsAppNotifier:
             if self.db and not ev.ref_id:
                 ev.ref_id = self.db.assign_ref_id(ev.fingerprint)
 
+            # One branch, not two. These used to be an if/elif that called the
+            # same thing either way, which made `dry_run` a no-op for Telegram.
             tg_ok, tg_detail = (False, "telegram unavailable")
-            if self.dry_run:
-                tg_ok, tg_detail = self.send_via_telegram(
-                    self.format_telegram_card(ev)
-                )
-            elif self._telegram_available():
+            if self.dry_run or self._telegram_available():
                 tg_ok, tg_detail = self.send_via_telegram(
                     self.format_telegram_card(ev)
                 )

@@ -1,0 +1,10 @@
+# ── Development / CI only ────────────────────────────────────────────────
+# The runtime image does not need these; `requirements.txt` stays lean so the
+# scheduled GitHub Actions run installs nothing it will not execute.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest
+
+-r requirements.txt
+
+pytest>=8,<10

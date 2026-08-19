@@ -135,24 +135,38 @@ class TestBackendSelection(unittest.TestCase):
             listener.GmailApiBackend = real_backend
 
     def test_falls_back_to_imap_when_the_api_is_unusable(self):
-        """A broken token must not block the legacy route."""
+        """A broken token must not block the legacy route.
+
+        The IMAP credentials are set HERE rather than inherited from the
+        environment. This test used to pass only on a machine whose .env still
+        held a dead App Password; with a clean environment `select_backend()`
+        had nothing to fall back TO and the test failed for a reason that had
+        nothing to do with what it claims to check.
+        """
         import auto_apply.email_listener as listener
         from auto_apply import gmail_oauth
+        from config import settings
 
         real_configured = gmail_oauth.is_configured
         real_backend = listener.GmailApiBackend
+        real_email = settings.job_email
+        real_pw = settings.job_email_password
 
         def explode():
             raise RuntimeError("token revoked")
 
         gmail_oauth.is_configured = lambda: True
         listener.GmailApiBackend = explode
+        settings.job_email = "legacy@example.invalid"
+        settings.job_email_password = "abcd efgh ijkl mnop"
         try:
             backend = listener.select_backend()
             self.assertEqual(backend.name, "imap")
         finally:
             gmail_oauth.is_configured = real_configured
             listener.GmailApiBackend = real_backend
+            settings.job_email = real_email
+            settings.job_email_password = real_pw
 
     def test_no_credentials_at_all_names_both_routes(self):
         import auto_apply.email_listener as listener
@@ -198,14 +212,27 @@ class TestOAuthArtefactsAreProtected(unittest.TestCase):
         self.assertNotIn("GOCSPX-", source, "a real Google client secret is embedded")
 
     def test_non_interactive_load_never_opens_a_browser(self):
-        """A scheduled run must fail fast, not hang on a consent screen."""
-        from auto_apply.gmail_oauth import GmailAuthError, TOKEN_PATH, load_credentials
+        """A scheduled run must fail fast, not hang on a consent screen.
 
-        if TOKEN_PATH.exists():
-            self.skipTest("a real token exists; skipping the no-token path")
-        with self.assertRaises(GmailAuthError) as ctx:
-            load_credentials(interactive=False)
-        self.assertIn("auth_gmail.py", str(ctx.exception))
+        The token path is redirected to an empty temp directory instead of
+        skipping when a real token is present. Self-skipping meant this ran
+        only on machines where Gmail was NOT set up -- i.e. never on the
+        machine anyone was actually developing on, which is precisely where a
+        blocking consent screen would be introduced.
+        """
+        import tempfile
+
+        from auto_apply import gmail_oauth
+        from auto_apply.gmail_oauth import GmailAuthError
+
+        real_token = gmail_oauth.TOKEN_PATH
+        gmail_oauth.TOKEN_PATH = Path(tempfile.mkdtemp()) / "absent_token.json"
+        try:
+            with self.assertRaises(GmailAuthError) as ctx:
+                gmail_oauth.load_credentials(interactive=False)
+            self.assertIn("auth_gmail.py", str(ctx.exception))
+        finally:
+            gmail_oauth.TOKEN_PATH = real_token
 
 
 if __name__ == "__main__":

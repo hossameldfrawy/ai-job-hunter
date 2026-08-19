@@ -209,6 +209,10 @@ class TestApprovalGate(unittest.TestCase):
         self.app_id = self.v.record_application(
             job_fingerprint="fp-gate", job_id=1, company="Acme", role="Engineer",
             platform="tanqeeb", job_url="https://example.com/j",
+            # form_ok=True because this class tests the APPROVAL gate. The form
+            # gate is fail-closed and fires first, so without a confirmed form
+            # every case here would be refused for the wrong reason.
+            payload={"fields": {"#email": "a@b.c"}, "form_ok": True},
             status=STATUS_REVIEW,
         )
 
@@ -562,9 +566,21 @@ class TestApplicationFormDetection(unittest.TestCase):
         finally:
             v.close()
 
-    def test_legacy_records_without_the_flag_are_not_blocked(self):
-        """Rows drafted before the flag existed fall through to the live check."""
-        from auto_apply.engine import submit_application
+    def test_legacy_records_without_the_flag_are_refused(self):
+        """A draft with no recorded verdict must NOT reach a browser.
+
+        This used to assert the opposite -- that an unflagged row "falls
+        through to the live check". It does, but the live check runs *inside*
+        `browser_page()`, after Chromium has launched and navigated, which is
+        precisely what the pre-flight guard exists to prevent.
+
+        Not hypothetical. The pending draft in the real vault had form_ok=None
+        and its only detected fields were `keywords` and `state` -- Tanqeeb's
+        search box. Under the old guard, `--approve 1` launched a browser at
+        it; filling and submitting a search widget produces a "submitted"
+        record for an application nobody ever made.
+        """
+        from auto_apply.engine import ApplyError, submit_application
 
         v = _store()
         try:
@@ -575,10 +591,57 @@ class TestApplicationFormDetection(unittest.TestCase):
                 payload={"fields": {"#email": "a@b.c"}},   # no form_ok key
                 status=STATUS_APPROVED,
             )
-            self.assertTrue(
+            with self.assertRaises(ApplyError) as ctx:
                 submit_application(app_id, v, notifier=None, dry_run=True)
-            )
+            self.assertIn("apply by hand", str(ctx.exception).lower())
+            self.assertIn("--apply", str(ctx.exception),
+                          "the error should say how to re-inspect the page")
         finally:
+            v.close()
+
+    def test_an_empty_payload_is_refused_rather_than_assumed_safe(self):
+        from auto_apply.engine import ApplyError, submit_application
+
+        v = _store()
+        try:
+            app_id = v.record_application(
+                job_fingerprint="fp-nopayload", job_id=4, company="Acme",
+                role="Engineer", platform="tanqeeb:egypt",
+                job_url="https://example.com/j4",
+                status=STATUS_APPROVED,          # no payload at all
+            )
+            with self.assertRaises(ApplyError):
+                submit_application(app_id, v, notifier=None, dry_run=True)
+        finally:
+            v.close()
+
+    def test_the_guard_runs_before_any_browser_is_launched(self):
+        """Ordering is the whole point: refuse first, never launch and check."""
+        import auto_apply.browser as browser
+        from auto_apply.engine import ApplyError, submit_application
+
+        launched = []
+
+        def tripwire(*args, **kwargs):
+            launched.append(1)
+            raise AssertionError("a browser was launched for an unverified form")
+
+        real = browser.browser_page
+        browser.browser_page = tripwire
+        v = _store()
+        try:
+            app_id = v.record_application(
+                job_fingerprint="fp-order", job_id=5, company="Acme",
+                role="Engineer", platform="tanqeeb:egypt",
+                job_url="https://example.com/j5",
+                payload={"fields": {"[name=\"keywords\"]": "IT support"}},
+                status=STATUS_APPROVED,
+            )
+            with self.assertRaises(ApplyError):
+                submit_application(app_id, v, notifier=None, dry_run=False)
+            self.assertEqual(launched, [])
+        finally:
+            browser.browser_page = real
             v.close()
 
 

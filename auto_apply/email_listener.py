@@ -1,20 +1,40 @@
 """
-Inbound interview & status monitor (IMAP).
+Inbound interview & status monitor.
 
 Watches the job-hunt mailbox, classifies recruiter mail with Gemini, and pushes
 interview invitations to Telegram with the meeting time and link already pulled
 out -- so an invitation buried in a Tuesday inbox does not get noticed on
 Thursday.
 
-Two properties this is careful about, because it reads a real personal mailbox:
+Two ways in, behind one `MailBackend` interface. The Gmail API over OAuth2 is
+preferred and is the only route that works on a modern Google account, because
+Google no longer issues App Passwords there -- the setting is simply absent.
+IMAP is kept for older accounts that still have a working password, and for any
+non-Gmail host.
 
-  * NOTHING IS MARKED READ UNLESS IT IS JOB MAIL. Fetches use BODY.PEEK, which
-    leaves \\Seen untouched. Only a message Gemini classifies as job-related is
-    flagged, and only when `mark_seen_when_classified` is on. A personal email
-    that happens to sit in the same inbox is read and forgotten, not touched.
-  * A CHEAP LOCAL FILTER RUNS FIRST. Gemini never sees a message unless it looks
-    plausibly job-related, which keeps both the quota and the privacy exposure
-    down.
+Four properties this is careful about, because it reads a real personal mailbox
+on a timer:
+
+  * NOTHING IS MARKED READ UNLESS IT IS JOB MAIL. IMAP fetches use BODY.PEEK
+    and a Gmail API `get` does not touch the UNREAD label; only an explicit
+    modify does. A message is flagged only once Gemini has called it job mail,
+    and only when `mark_seen_when_classified` is on. A personal email sitting
+    in the same inbox is read and forgotten, not touched.
+
+  * A CHEAP LOCAL FILTER RUNS FIRST. Gemini never sees a message that fails a
+    keyword regex, which keeps both the quota and the privacy exposure down.
+
+  * EVERY VERDICT IS BANKED, INCLUDING "NOT JOB MAIL". `message_id` is UNIQUE
+    in `email_interview_events` and `seen_message()` reads that table, so a
+    message is classified at most once in its life. Skipping the record for a
+    negative verdict used to mean a job-alert digest -- which says "position"
+    and so clears the keyword gate on every pass -- was re-sent to Gemini every
+    poll for as long as it sat unread.
+
+  * THE ROW IS WRITTEN BEFORE THE ALERT. That ordering is what makes duplicate
+    alerting impossible even if the process dies mid-send or two polls overlap.
+    `alerted` is then corrected to what actually happened, so it means "the
+    user saw it" rather than "we meant to tell them".
 """
 
 from __future__ import annotations
@@ -155,6 +175,20 @@ def _password_variants(raw: str) -> list[str]:
         if value and value not in out:
             out.append(value)
     return out
+
+
+def _delivered(outcome: Any) -> tuple[bool, str]:
+    """Normalise a notifier's return value into (delivered, detail).
+
+    `WhatsAppNotifier.send_via_telegram` returns `(ok, detail)`, but the
+    monitor accepts any object with that method -- test doubles and the
+    setup wizard's stub notifier both return a bare bool. Unpacking blindly
+    would turn a delivery-reporting improvement into a crash inside the poll
+    loop, which is the one place that must never raise.
+    """
+    if isinstance(outcome, tuple) and len(outcome) == 2:
+        return bool(outcome[0]), str(outcome[1])
+    return bool(outcome), "" if outcome else "notifier reported failure"
 
 
 def _decode(value: str | None) -> str:
@@ -565,6 +599,23 @@ class EmailMonitor:
 
             if not result.get("is_job_related"):
                 counts["skipped"] += 1
+                # BANK THE VERDICT. Without this row the message stays unread,
+                # sails through the keyword gate again on the next poll, and is
+                # re-sent to Gemini every 15 minutes for as long as it sits in
+                # the inbox. A job-alert digest is the standing example: it
+                # says "position", so it clears the keyword gate on every
+                # pass, and only Gemini can tell it is not an application
+                # update. ~96 wasted calls a day, indefinitely -- the exact
+                # opposite of the quota conservation the gate exists for.
+                #
+                # NOT marked read: the module's contract is that only genuine
+                # job mail is ever flagged, and Gemini just said this is not
+                # job mail.
+                self.store.record_email_event(
+                    message_id=message.message_id, sender=message.sender,
+                    subject=message.subject, classification="not_job_related",
+                    summary=str(result.get("summary", ""))[:300],
+                )
                 continue
 
             counts["classified"] += 1
@@ -577,19 +628,36 @@ class EmailMonitor:
             app = self.store.find_application_by_company(result.get("company", ""))
             should_alert = kind in ("interview", "assessment", "recruiter_outreach")
 
+            # Written BEFORE the send, deliberately. `message_id` is UNIQUE and
+            # `seen_message()` reads this table, so the row existing is what
+            # makes a duplicate alert impossible -- even if the process dies
+            # mid-delivery or two polls overlap. `alerted` starts false and is
+            # corrected below once the outcome is known.
             self.store.record_email_event(
                 message_id=message.message_id, sender=message.sender,
                 subject=message.subject, classification=kind,
                 parsed_date=result.get("meeting_datetime", ""),
                 meeting_link=link, summary=result.get("summary", ""),
-                matched_app_id=(app or {}).get("id"), alerted=should_alert,
+                matched_app_id=(app or {}).get("id"), alerted=False,
             )
 
             if should_alert and self.notifier:
                 result["meeting_link"] = link
-                self.notifier.send_via_telegram(self.format_alert(result, app))
-                counts["alerted"] += 1
-                log.info("ALERTED: %s from %s", kind, result.get("company"))
+                ok, detail = _delivered(
+                    self.notifier.send_via_telegram(self.format_alert(result, app))
+                )
+                self.store.mark_event_alerted(message.message_id, ok)
+                if ok:
+                    counts["alerted"] += 1
+                    log.info("ALERTED: %s from %s", kind, result.get("company"))
+                else:
+                    # Not retried: a second copy of an interview invitation is
+                    # worse than one you can find in the log.
+                    log.error("Could NOT deliver the %s alert for %s: %s",
+                              kind, result.get("company"), detail)
+            elif should_alert:
+                log.warning("No notifier configured -- %s from %s recorded but "
+                            "not alerted.", kind, result.get("company"))
             else:
                 log.info("Recorded %s from %s (no alert).", kind,
                          result.get("company"))

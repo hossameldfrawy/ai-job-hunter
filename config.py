@@ -167,7 +167,24 @@ class Settings:
 
     @property
     def email_monitor_ready(self) -> bool:
-        return bool(self.job_email and self.job_email_password)
+        """True when the inbox monitor has ANY route into the mailbox.
+
+        Both routes count, and the OAuth one is checked first because it is the
+        only one that works on a modern Google account. This used to demand an
+        App Password unconditionally, which meant `--inbox` refused to start on
+        the very setup the Gmail API migration exists to support: it ran only
+        while a now-dead password string happened to remain in .env, and would
+        have broken the moment anyone tidied that stale secret away.
+        """
+        if self.job_email and self.job_email_password:
+            return True
+        # Imported lazily: gmail_oauth imports ROOT from this module.
+        try:
+            from auto_apply import gmail_oauth
+
+            return gmail_oauth.is_configured()
+        except Exception:
+            return False
 
     @property
     def telegram_session_path(self) -> Path:

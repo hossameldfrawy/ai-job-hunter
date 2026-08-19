@@ -223,12 +223,18 @@ def format_review_message(
 def format_submitted_message(app_id: int, app: dict[str, Any]) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     shot = app.get("screenshot_path") or ""
+    # Split on BOTH separators rather than just the backslash. The screenshot is
+    # captured on Windows but the vault is readable from Linux too, and a
+    # one-separator split prints the entire absolute path on the other platform
+    # -- pathlib is no help here, since PurePosixPath does not treat "\" as one.
+    evidence = (f"Screenshot saved — {shot.replace(chr(92), '/').rsplit('/', 1)[-1]}"
+                if shot else "not captured")
     return (
         f"🚀 *APPLICATION SUCCESSFULLY SUBMITTED!* [#{app_id}]\n"
         f"🏢 Company: {app.get('company')}\n"
         f"💼 Role: {app.get('role')}\n"
         f"🌐 Platform: {app.get('platform')}\n"
-        f"📸 Evidence: {'Screenshot saved — ' + shot.split(chr(92))[-1] if shot else 'not captured'}\n"
+        f"📸 Evidence: {evidence}\n"
         f"🕒 Time: {stamp}"
     )
 
@@ -332,17 +338,29 @@ def submit_application(
     if not allowed:
         raise ApplyError(reason)
 
-    # Refuse before launching a browser. Drafting already established whether
+    # Refuse BEFORE launching a browser. Drafting already established whether
     # the page has a real application form; a job that has none is not a
     # failure to retry, it is one to apply to by hand. Raising here keeps it
     # alongside the other pre-conditions instead of being recorded as a crash.
+    #
+    # FAIL CLOSED: only an explicit True may proceed. This was `is False`,
+    # which let two cases straight through to the browser -- a draft written
+    # before `form_ok` was recorded at all, and one whose payload is empty.
+    # Both read as "unknown", and the first is not hypothetical: the pending
+    # draft on this machine had form_ok=None and its only detected fields were
+    # `keywords` and `state`, i.e. Tanqeeb's SEARCH BOX. Submitting that runs a
+    # search and reports it as a delivered application, which is worse than
+    # failing because it looks like success.
     stored = json.loads(app.get("submitted_payload_json") or "{}")
-    if stored and stored.get("form_ok") is False:
+    if stored.get("form_ok") is not True:
+        note = str(stored.get("form_note") or
+                   "this draft predates form detection, so the page was never "
+                   "checked for a real application form")
         raise ApplyError(
-            "No auto-submittable application form on this page ("
-            + str(stored.get("form_note", "unknown"))
+            "No confirmed application form on this page (" + note
             + "). The drafted cover letter is saved -- apply by hand: "
             + str(app.get("job_url") or "")
+            + "\nRe-draft to re-inspect the page: python main.py --apply"
         )
 
     from auto_apply.browser import (
