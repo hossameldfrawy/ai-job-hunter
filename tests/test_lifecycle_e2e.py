@@ -25,6 +25,7 @@ Run:  python -m pytest tests/test_lifecycle_e2e.py -v
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,7 @@ from auto_apply.engine import (                                # noqa: E402
     submit_application,
 )
 from auto_apply.profile_builder import Platform, prefill_registration  # noqa: E402
+from config import settings                                    # noqa: E402
 from models import Evaluation                                  # noqa: E402
 from vault import (                                            # noqa: E402
     STATUS_APPROVED, STATUS_DECLINED, STATUS_REVIEW, STATUS_SUBMITTED,
@@ -140,6 +142,21 @@ class LifecycleHarness(unittest.TestCase):
         self.filled: list[tuple[str, str]] = []
         self.shots: list[str] = []
 
+        # A CV that exists, owned by this test. Relying on the developer's real
+        # assets/master_cv.pdf meant the CV-upload assertion passed locally and
+        # failed on CI, where there is no CV -- and, worse, that the CI failure
+        # was the only signal that a missing CV is silently tolerated.
+        self.cv = Path(tempfile.mkdtemp()) / "master_cv.pdf"
+        self.cv.write_bytes(b"%PDF-1.4\n% test CV\n")
+        self._saved_cv_env = os.environ.get("CV_PATH")
+        os.environ["CV_PATH"] = str(self.cv)
+        # CV_PATH is only the FIRST entry in `settings.cv_paths`; the rest come
+        # from config.yml's `cv.paths` chain, and on a developer machine one of
+        # those exists. Emptying the chain makes CV_PATH the single source of
+        # truth, so "no CV on disk" is a state this test can actually reach.
+        self._saved_cv_chain = settings.raw.setdefault("cv", {}).get("paths")
+        settings.raw["cv"]["paths"] = []
+
         @contextmanager
         def fake_browser_page(platform="default", headed=None):
             yield self.page
@@ -169,6 +186,11 @@ class LifecycleHarness(unittest.TestCase):
         candidate_mod.load_candidate = lambda *a, **k: PROFILE
 
     def tearDown(self):
+        if self._saved_cv_env is None:
+            os.environ.pop("CV_PATH", None)
+        else:
+            os.environ["CV_PATH"] = self._saved_cv_env
+        settings.raw["cv"]["paths"] = self._saved_cv_chain
         browser_mod.browser_page = self._saved["browser_page"]
         browser_mod.inspect_form = self._saved["inspect_form"]
         browser_mod.fill_field = self._saved["fill_field"]
@@ -431,6 +453,54 @@ class TestFailureIsRecoverable(LifecycleHarness):
                       "\n".join(self.notifier.sent))
         self.assertIn("egypt.tanqeeb.com", self.notifier.sent[-1],
                       "the failure notice must carry the manual link")
+
+    def test_a_required_cv_with_no_cv_on_disk_is_refused(self):
+        """Submitting a CV-less application is not a partial success.
+
+        The board rejects it, but we would still click submit, screenshot the
+        error page and record 'submitted' -- the same looks-like-success shape
+        as filling a search widget. On CI, where no CV exists, this path was
+        being taken silently.
+        """
+        self.form = [
+            FormField(selector="#cv", kind="resume", input_type="file",
+                      label="Upload CV", required=True),
+            FormField(selector="#email", kind="email", input_type="text",
+                      label="Email"),
+        ]
+        app_id = prepare_application(self._ev(fingerprint="fp-nocv"),
+                                     self.v, self.notifier)
+        approve(app_id, self.v)
+        os.environ["CV_PATH"] = str(self.cv) + ".missing"
+
+        self.assertFalse(
+            submit_application(app_id, self.v, self.notifier, dry_run=False)
+        )
+        self.assertEqual(self.page.clicked, [],
+                         "submit was clicked with no CV attached")
+        app = self.v.get_application(app_id)
+        self.assertEqual(app["status"], "failed")
+        self.assertIn("requires a CV", app["failure_reason"] or "")
+
+    def test_an_optional_cv_field_with_no_cv_still_submits(self):
+        """Not every form needs one; the guard must stay narrow."""
+        self.form = [
+            FormField(selector="#cv", kind="resume", input_type="file",
+                      label="Attach CV (optional)"),
+            FormField(selector="#email", kind="email", input_type="text",
+                      label="Email"),
+            FormField(selector="#cover", kind="cover_letter",
+                      input_type="textarea", label="Cover letter"),
+        ]
+        app_id = prepare_application(self._ev(fingerprint="fp-optcv"),
+                                     self.v, self.notifier)
+        approve(app_id, self.v)
+        os.environ["CV_PATH"] = str(self.cv) + ".missing"
+
+        self.assertTrue(
+            submit_application(app_id, self.v, self.notifier, dry_run=False)
+        )
+        self.assertNotIn("resume", [k for k, _ in self.filled])
 
     def test_evidence_survives_a_later_status_change(self):
         """Re-approving a submitted application must not erase the proof."""

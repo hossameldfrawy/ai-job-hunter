@@ -392,6 +392,27 @@ def submit_application(
                     + ". Apply by hand here: " + str(app["job_url"])
                 )
 
+            # A CV upload with no CV on disk is not a partial success. The
+            # board rejects the submission, but we would still click submit,
+            # capture a screenshot of the error page and record it as
+            # 'submitted' -- the same looks-like-success failure mode as
+            # filling a search widget.
+            resume_fields = [f for f in fields if f.kind == "resume"]
+            if resume_fields and not cv_path:
+                tried = ", ".join(str(p) for p in settings.cv_paths) or "(none configured)"
+                if any(f.required for f in resume_fields):
+                    raise ApplyError(
+                        "This form requires a CV upload and no CV file exists. "
+                        "Looked in: " + tried
+                        + "\nSet CV_PATH in .env or drop the PDF at one of the "
+                        "paths above, then re-run: python main.py --approve "
+                        + str(app_id)
+                    )
+                log.warning(
+                    "The form has a CV field but no CV file was found (looked "
+                    "in: %s); submitting without an attachment.", tried,
+                )
+
             filled = 0
             for f in fields:
                 if f.kind == "resume" and cv_path:

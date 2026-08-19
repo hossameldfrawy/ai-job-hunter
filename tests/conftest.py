@@ -94,6 +94,12 @@ _TEST_ENV = {
     "JOB_EMAIL_APP_PASSWORD": "",
     "FACEBOOK_COOKIE": "",
     "VAULT_KEY": _generated_vault_key(),
+    # The seed the password-derivation tests were always written against --
+    # `test_the_seed_is_not_recoverable_from_the_output` asserts this exact
+    # string is absent from the output. It was never actually set, so those
+    # four tests silently derived from the developer's real
+    # APPLY_BASE_PASSWORD locally and failed outright on CI.
+    "APPLY_BASE_PASSWORD": "TestSeed99@",
 }
 
 for _key, _value in _TEST_ENV.items():
