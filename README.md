@@ -210,6 +210,30 @@ configured means every request is refused, a bad HMAC is refused, a message
 from any number but yours is refused, and a re-delivered message never executes
 twice.
 
+**Keeping the listener alive.** `--listen` is a foreground process: it dies
+with whatever started it — a terminal you close, a dropped SSH session, an
+agent session that ends. That matters because the failure is *silent*: the
+review card still arrives, you still reply, and nothing happens. So run it
+under the supervisor instead, which restarts on crash and detaches from the
+console:
+
+```powershell
+# run it here, Ctrl-C to stop
+powershell -ExecutionPolicy Bypass -File scriptsun_listener.ps1
+
+# or detached -- closing the window leaves it running
+powershell -ExecutionPolicy Bypass -File scriptsun_listener.ps1 -Detached
+
+# or at every logon, surviving a reboot (see the script's header for the
+# exact schtasks line)
+schtasks /Run /TN "AI Job Hunter Listener"
+```
+
+It refuses to start a second copy: two listeners on one Telegram session fight
+over the update stream and both act on the same command. A clean Ctrl-C is
+respected rather than restarted — a supervisor you cannot stop is worse than
+none.
+
 **`--listen` runs two mechanisms, not one.** An event handler reacts the instant
 you reply, and a poll sweep re-checks every 60s. That redundancy is deliberate:
 Telegram never delivers an update for a message the *same* session sent, so the
