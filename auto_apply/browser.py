@@ -149,6 +149,32 @@ _FOLDED_PATTERNS: dict[str, tuple[tuple[str, bool], ...]] = {
 }
 
 
+def _squash(text: str) -> str:
+    """Drop every separator: "first name" and "firstname" become one string."""
+    return re.sub(r"[^a-z0-9؀-ۿ]+", "", (text or "").lower())
+
+
+#: Multi-word patterns with their separators removed.
+#:
+#: Wuzzuf names its inputs `firstname`, `lastname` -- one word, no separator at
+#: all -- so the space-separated patterns matched none of them and a perfectly
+#: ordinary signup form came back as five `unknown` fields. Only MULTI-WORD
+#: needles are squashed: a single short word like "cv" or "tel" is already
+#: risky as a substring, and removing word boundaries entirely would make it
+#: far worse.
+_SQUASHED_PATTERNS: dict[str, tuple[str, ...]] = {
+    kind: tuple(sorted(
+        {
+            _squash(needle)
+            for needle, _token in pairs
+            if " " in needle and len(_squash(needle)) >= 7
+        },
+        key=len, reverse=True,
+    ))
+    for kind, pairs in _FOLDED_PATTERNS.items()
+}
+
+
 def _classify(haystack: str) -> str:
     """Name the semantic field this label describes, or "unknown".
 
@@ -167,10 +193,15 @@ def _classify(haystack: str) -> str:
     if not blob:
         return "unknown"
     padded = f" {blob} "
+    squashed = _squash(blob)
     for kind, needles in _FOLDED_PATTERNS.items():
         for needle, whole_token in needles:
             if f" {needle} " in padded if whole_token else needle in blob:
                 return kind
+        # Then the same patterns with their separators removed, which is how
+        # boards actually name inputs: `firstname`, `coverletter`, `jobtitle`.
+        if any(needle in squashed for needle in _SQUASHED_PATTERNS[kind]):
+            return kind
     return "unknown"
 
 
@@ -300,8 +331,16 @@ def session_status(platform: str,
     if not any(live(c) for c in auth):
         return False, "session expired — re-run --register"
 
+    # "auth cookies present", NOT "signed in".
+    #
+    # This is an INFERENCE from cookie names, and it can be wrong: Tanqeeb's
+    # saved state carries `token` and `user_id` on its own domain, and clicking
+    # Apply still lands on /users/login. A cookie that exists is not a cookie
+    # the server still honours. The authoritative check is what the board does
+    # when you try to apply -- which `looks_like_application_form` now reports
+    # as a sign-in wall -- so this line must not out-confidence it.
     names = ", ".join(sorted({str(c.get("name")) for c in auth})[:3])
-    return True, f"signed in ({len(own)} cookies: {names})"
+    return True, f"auth cookies present ({len(own)}: {names})"
 
 
 def save_storage_state(context: Any, platform: str) -> str:
@@ -559,9 +598,37 @@ def is_automatable_url(url: str) -> tuple[bool, str]:
 
 
 def open_application_form(
+    page: Any, timeout_ms: int = 5000, max_hops: int = 3
+) -> tuple[Any, bool, str]:
+    """Click through to the real application view, following the whole chain.
+
+    Aggregators hand off to each other. Measured live: a Tanqeeb posting's
+    apply button opens Wuzzuf in a new tab, and Wuzzuf then has its own "Apply
+    For Job" button before any form exists. One hop is not enough, so this
+    keeps going until it reaches something that looks like an application form,
+    runs out of controls, or is refused.
+    """
+    notes: list[str] = []
+    current = page
+    opened_any = False
+
+    for _hop in range(max(1, max_hops)):
+        current, opened, note = _open_application_once(current, timeout_ms)
+        if note:
+            notes.append(note)
+        if not opened:
+            break
+        opened_any = True
+        if looks_like_application_form(inspect_form(current))[0]:
+            break
+
+    return current, opened_any, " -> ".join(notes)
+
+
+def _open_application_once(
     page: Any, timeout_ms: int = 5000
 ) -> tuple[Any, bool, str]:
-    """Click through to the real application view.
+    """One hop: click the apply control on THIS page and follow where it goes.
 
     Returns `(page_to_use, opened, note)`. The page comes back because the
     click routinely opens a NEW TAB rather than changing the current one --
@@ -616,11 +683,30 @@ def open_application_form(
             if not _is_clickable(element) or not _apply_text_ok(element, selector):
                 continue
             try:
+                # Scroll first. A board can render the control in a bar that
+                # sits OUTSIDE the viewport -- measured on Wuzzuf, where the
+                # first "Apply For Job" button reports a bounding box at
+                # y=-222 and Playwright refuses to click it however long it
+                # waits. Scrolling rescues the reachable ones; the loop moves
+                # on for the rest.
+                element.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
                 element.click(timeout=2500)
                 clicked_element = True
                 break
             except Exception:
-                continue
+                # Last resort: dispatch the click in the page. It skips
+                # Playwright's actionability checks, which is exactly what an
+                # off-canvas-but-real button needs -- and the element already
+                # passed the visible/enabled/text gates above.
+                try:
+                    element.evaluate("node => node.click()")
+                    clicked_element = True
+                    break
+                except Exception:
+                    continue
         if not clicked_element:
             continue
 
@@ -794,6 +880,24 @@ def looks_like_application_form(fields: list[FormField]) -> tuple[bool, str]:
     upload, a cover-letter box, or a cluster of personal-detail inputs.
     """
     kinds = {f.kind for f in fields}
+
+    # A PASSWORD FIELD MEANS THIS IS A LOGIN OR SIGNUP, NEVER AN APPLICATION.
+    #
+    # Checked before anything else, because this form is otherwise a perfect
+    # impostor: Wuzzuf's registration page asks for first name, last name and
+    # email, which is exactly the "cluster of personal details" that proves an
+    # application form below. Filling it and pressing submit would create an
+    # account -- or fail against an existing one -- and then bank the result as
+    # a delivered application. That is the same looks-like-success failure as
+    # submitting the site's search widget, and it is reached by the same route:
+    # the board showed a sign-in wall because we are not actually logged in.
+    if "password" in kinds:
+        return False, (
+            "this is a sign-in or registration form, not an application form "
+            "-- the board is asking you to log in. Run: "
+            "python main.py --register <board>"
+        )
+
     strong = kinds & {"resume", "cover_letter", "salary", "notice_period"}
     personal = kinds & {"email", "phone", "first_name", "last_name", "full_name"}
 

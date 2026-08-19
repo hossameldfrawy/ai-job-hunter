@@ -656,6 +656,10 @@ class ApplyPage:
         self.closed = True
 
 
+def _refuse(_script):
+    raise RuntimeError("detached from the DOM")
+
+
 class _FakeContext:
     """Just the pages list -- popup detection is all `open_application_form`
     asks a context for."""
@@ -683,11 +687,20 @@ class _FakeControl:
     def is_enabled(self):
         return self._enabled
 
+    def scroll_into_view_if_needed(self, timeout=None):
+        return None
+
     def click(self, timeout=None):
         if self._raises:
             raise RuntimeError("intercepted by an overlay")
         if self._page is not None:
             self._page._register_click(self._selector)
+
+    def evaluate(self, script):
+        """The DOM-dispatch fallback for an off-canvas but real control."""
+        if "click" in script and self._page is not None:
+            self._page._register_click(self._selector)
+        return None
 
 
 APPLY_FORM = [
@@ -811,13 +824,16 @@ class TestOpenApplicationForm(unittest.TestCase):
             browser_mod.open_application_form(page)
         self.assertEqual(page.clicked, ['[data-action="apply"]'])
 
-    def test_a_click_that_throws_moves_on_to_the_next_selector(self):
+    def test_a_control_that_cannot_be_clicked_at_all_moves_on(self):
+        """Both routes have to fail before we give up on a selector: a plain
+        click AND the DOM dispatch that rescues an off-canvas button."""
         class Stubborn(ApplyPage):
             def query_selector_all(self, selector):
                 elements = super().query_selector_all(selector)
                 if selector == ".apply-btn":
                     for element in elements:
                         element._raises = True
+                        element.evaluate = _refuse
                 return elements
 
         page = Stubborn(controls=(".apply-btn", 'button:has-text("Apply")'),
@@ -981,3 +997,180 @@ class TestNeverAutomateUrls(unittest.TestCase):
         self.assertFalse(
             browser_mod.is_automatable_url("https://linkedin.com/x")[0]
         )
+
+
+class TestConcatenatedFieldNames(unittest.TestCase):
+    """Boards name inputs with no separator at all.
+
+    Wuzzuf's registration form uses `firstname` and `lastname` -- one word --
+    so the space-separated patterns matched none of them and the whole form
+    came back as `unknown`. The separator-folding added earlier only helps
+    when there IS a separator.
+    """
+
+    CASES = [
+        ("firstname", "first_name"),
+        ("lastname", "last_name"),
+        ("fullname", "full_name"),
+        ("coverletter", "cover_letter"),
+        ("jobtitle", "current_title"),
+        ("currentcompany", "current_employer"),
+        ("noticeperiod", "notice_period"),
+        ("expectedsalary", "salary"),
+        ("yearsofexperience", "years_experience"),
+    ]
+
+    def test_a_name_with_no_separator_still_classifies(self):
+        for raw, expected in self.CASES:
+            with self.subTest(raw=raw):
+                self.assertEqual(_classify(raw), expected)
+
+    def test_the_spaced_and_squashed_forms_agree(self):
+        for raw, expected in self.CASES:
+            with self.subTest(raw=raw):
+                spaced = raw.replace("firstname", "first name") \
+                            .replace("lastname", "last name")
+                if spaced != raw:
+                    self.assertEqual(_classify(spaced), expected)
+
+    def test_squashing_does_not_resurrect_the_short_needle_bugs(self):
+        """Only multi-word patterns are squashed. A bare "tel" or "cv" matched
+        without word boundaries would be far worse than it already was."""
+        for label in ("Tell us about your most difficult outage",
+                      "Storage capacity in GB",
+                      "Preferred payment method",
+                      "What is your intelligence quotient?"):
+            with self.subTest(label=label):
+                self.assertEqual(_classify(label), "unknown")
+
+    def test_prose_is_still_not_a_field_name(self):
+        for label in ("Describe a time you led a project",
+                      "Anything else we should know"):
+            with self.subTest(label=label):
+                self.assertEqual(_classify(label), "unknown")
+
+
+class TestSignInWallIsNotAnApplicationForm(unittest.TestCase):
+    """The impostor this guard exists for.
+
+    Verified live: Tanqeeb's "Apply Now" opens /users/login, and Wuzzuf's
+    "Apply For Job" opens a registration form asking first name, last name and
+    email -- which is EXACTLY the "cluster of personal details" that otherwise
+    proves an application form. Filling it and pressing submit would create an
+    account, then bank the result as a delivered application.
+    """
+
+    @staticmethod
+    def _signup():
+        return [
+            _field("first_name", "#f", label="firstname"),
+            _field("last_name", "#l", label="lastname"),
+            _field("email", "#e", label="email"),
+            _field("password", "#p", label="password"),
+        ]
+
+    def test_a_password_field_disqualifies_the_form(self):
+        ok, why = looks_like_application_form(self._signup())
+        self.assertFalse(ok)
+        self.assertIn("sign-in or registration", why)
+
+    def test_the_refusal_says_what_to_do_about_it(self):
+        _ok, why = looks_like_application_form(self._signup())
+        self.assertIn("--register", why)
+
+    def test_it_beats_the_personal_fields_rule(self):
+        """Without the guard these four fields read as a valid application."""
+        without_password = [f for f in self._signup() if f.kind != "password"]
+        self.assertTrue(looks_like_application_form(without_password)[0])
+        self.assertFalse(looks_like_application_form(self._signup())[0])
+
+    def test_it_beats_even_a_cv_upload_on_the_same_form(self):
+        """A signup that also offers a CV upload is still a signup."""
+        fields = self._signup() + [_field("resume", "#cv", "file", "Upload CV")]
+        ok, why = looks_like_application_form(fields)
+        self.assertFalse(ok)
+        self.assertIn("sign-in", why)
+
+    def test_a_real_application_form_is_unaffected(self):
+        fields = [
+            _field("resume", "#cv", "file", "Upload CV"),
+            _field("cover_letter", "#c", "textarea", "Cover letter"),
+            _field("email", "#e", label="email"),
+        ]
+        self.assertTrue(looks_like_application_form(fields)[0])
+
+    def test_an_application_asking_only_personal_details_still_passes(self):
+        fields = [_field("email", "#e", label="email"),
+                  _field("phone", "#p", label="phone")]
+        self.assertTrue(looks_like_application_form(fields)[0])
+
+
+class TestApplyChainFollowsMultipleHops(unittest.TestCase):
+    """Aggregators hand off to each other; one hop is not enough.
+
+    Measured live: a Tanqeeb posting's apply button opens Wuzzuf in a new tab,
+    and Wuzzuf then has its OWN "Apply For Job" button before any form exists.
+    """
+
+    def test_a_second_hop_is_followed(self):
+        second = ApplyPage(controls=('button:has-text("Apply")',),
+                           url="https://wuzzuf.net/jobs/p/1",
+                           fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+
+        first = ApplyPage(controls=('.apply-btn',),
+                          fields_before=SEARCH_WIDGET, fields_after=SEARCH_WIDGET)
+
+        def hop(selector):
+            first.clicked.append(selector)
+            first.opened = True
+            first.context.pages.append(second)
+
+        first._register_click = hop
+        second.context = first.context
+
+        with _inspecting(first):
+            active, opened, note = browser_mod.open_application_form(first)
+        self.assertTrue(opened)
+        self.assertIs(active, second)
+        self.assertEqual(second.clicked, ['button:has-text("Apply")'])
+        self.assertTrue(browser_mod.looks_like_application_form(active.fields)[0])
+
+    def test_the_chain_stops_once_a_real_form_is_reached(self):
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened)
+        self.assertEqual(len(page.clicked), 1, "it kept clicking past the form")
+
+    def test_the_chain_is_bounded(self):
+        """A page that always offers another apply button must not loop."""
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=SEARCH_WIDGET)
+        with _inspecting(page):
+            _active, _opened, _note = browser_mod.open_application_form(
+                page, max_hops=3)
+        self.assertLessEqual(len(page.clicked), 3)
+
+
+class TestOffCanvasControls(unittest.TestCase):
+    """Wuzzuf renders its first "Apply For Job" at y=-222 -- visible and
+    enabled, but outside the viewport, and Playwright refuses to click it
+    however long it waits."""
+
+    def test_a_click_failure_falls_back_to_a_dom_dispatch(self):
+        page = ApplyPage(controls=('.apply-btn',),
+                         fields_before=SEARCH_WIDGET, fields_after=APPLY_FORM)
+        original = page.query_selector_all
+
+        def refuse_real_clicks(selector):
+            elements = original(selector)
+            for element in elements:
+                element._raises = True
+            return elements
+
+        page.query_selector_all = refuse_real_clicks
+        with _inspecting(page):
+            _active, opened, _note = browser_mod.open_application_form(page)
+        self.assertTrue(opened, "the DOM-dispatch fallback did not fire")
+        self.assertTrue(page.clicked)
