@@ -141,8 +141,31 @@ class CandidateProfile:
             "gpa": self.gpa,
             "linkedin": self.linkedin_url,
             "summary": self.summary,
+            # `bio` and `username` are REGISTRATION fields -- they only appear
+            # on signup forms, and leaving them blank is the difference between
+            # a profile a recruiter can read and an empty stub that never
+            # surfaces in a search.
+            "bio": self.summary,
+            "headline": self.headline,
+            "username": self.username,
             "skills": ", ".join(self.skills[:20]),
         }
+
+    @property
+    def username(self) -> str:
+        """A handle for the few boards that want one instead of the email.
+
+        Derived from the email's local part, then the name -- the same handle
+        the candidate would have picked, so it stays recognisable to them.
+        """
+        import re
+
+        base = (self.email.split("@")[0] if "@" in self.email
+                else self.full_name)
+        handle = re.sub(r"[^a-z0-9]+", "", base.lower())
+        if len(handle) < 4:
+            handle = re.sub(r"[^a-z0-9]+", "", self.full_name.lower())
+        return handle[:24]
 
     def highlights(self) -> str:
         """The bits worth repeating in a cover letter or a profile bio."""

@@ -22,8 +22,9 @@ THREE INDEPENDENT LAYERS
   1. ENVIRONMENT -- real credentials are replaced with obvious test values
      BEFORE config.py can read the real .env, so a stray call authenticates
      as nobody.
-  2. TRANSPORTS  -- send_via_telegram / send_raw / http_client.get are
-     replaced with recorders that deliver nothing and remember everything.
+  2. TRANSPORTS  -- send_via_telegram, send_photo_via_telegram, send_raw,
+     _send_callmebot and http_client.get are replaced with recorders that
+     deliver nothing and remember everything.
   3. SOCKETS     -- connect() to any non-loopback address raises.
 
 Layer 3 is the one that actually matters. Layers 1 and 2 can be defeated by a
@@ -169,17 +170,28 @@ class Outbox:
 
     def __init__(self) -> None:
         self.telegram: list[str] = []
+        self.whatsapp: list[str] = []
+        #: (path, caption) pairs -- the submission-evidence screenshots
+        self.photos: list[tuple[str, str]] = []
         self.raw: list[str] = []
         self.http: list[str] = []
 
     def clear(self) -> None:
         self.telegram.clear()
+        self.whatsapp.clear()
+        self.photos.clear()
         self.raw.clear()
         self.http.clear()
 
     @property
     def total(self) -> int:
-        return len(self.telegram) + len(self.raw) + len(self.http)
+        return (len(self.telegram) + len(self.whatsapp) + len(self.photos)
+                + len(self.raw) + len(self.http))
+
+    def find(self, needle: str) -> list[str]:
+        """Every text message on either channel containing `needle`."""
+        return [m for m in (self.telegram + self.whatsapp + self.raw)
+                if needle in m]
 
 
 OUTBOX = Outbox()
@@ -196,7 +208,9 @@ def pytest_configure(config: pytest.Config) -> None:
     import notifier
 
     REAL["send_via_telegram"] = notifier.WhatsAppNotifier.send_via_telegram
+    REAL["send_photo_via_telegram"] = notifier.WhatsAppNotifier.send_photo_via_telegram
     REAL["send_raw"] = notifier.WhatsAppNotifier.send_raw
+    REAL["_send_callmebot"] = notifier.WhatsAppNotifier._send_callmebot
     REAL["_telegram_available"] = notifier.WhatsAppNotifier._telegram_available
     REAL["http_get"] = http_client.get
 
@@ -204,8 +218,22 @@ def pytest_configure(config: pytest.Config) -> None:
         OUTBOX.telegram.append(str(message))
         return True, "blocked-in-tests"
 
+    def fake_send_photo_via_telegram(self, path, caption=""):   # noqa: ANN001
+        OUTBOX.photos.append((str(path), str(caption)))
+        return True, "blocked-in-tests"
+
     def fake_send_raw(self, message):                   # noqa: ANN001
         OUTBOX.raw.append(str(message))
+        return True, "blocked-in-tests"
+
+    def fake_send_callmebot(self, message):             # noqa: ANN001
+        # Stubbed as of the dual-channel review flow. Before it, the WhatsApp
+        # half of every card reached `http_client.get`, which raises -- so the
+        # suite could see THAT a send was attempted but never WHAT was sent,
+        # and half of a two-channel feature was untestable. The real method is
+        # stashed in REAL for the tests that must drive it: the URL-budget
+        # guard, and the proof that it honours DRY_RUN.
+        OUTBOX.whatsapp.append(str(message))
         return True, "blocked-in-tests"
 
     def fake_telegram_available():
@@ -215,15 +243,13 @@ def pytest_configure(config: pytest.Config) -> None:
         return True
 
     notifier.WhatsAppNotifier.send_via_telegram = fake_send_via_telegram
+    notifier.WhatsAppNotifier.send_photo_via_telegram = fake_send_photo_via_telegram
     notifier.WhatsAppNotifier.send_raw = fake_send_raw
+    notifier.WhatsAppNotifier._send_callmebot = fake_send_callmebot
     notifier.WhatsAppNotifier._telegram_available = staticmethod(
         fake_telegram_available
     )
 
-    # `_send_callmebot` is deliberately NOT stubbed: one test drives the real
-    # method to prove the URL-budget guard bounds any message. Blocking the
-    # transport underneath it gives that test something to inspect while still
-    # guaranteeing nothing leaves the machine.
     def fake_http_get(url, *args, **kwargs):            # noqa: ANN001
         OUTBOX.http.append(str(url))
         raise NetworkBlockedInTests(
@@ -231,6 +257,104 @@ def pytest_configure(config: pytest.Config) -> None:
         )
 
     http_client.get = fake_http_get
+
+    # ---------------------------------------------------------------
+    # Layer 4: the browser
+    # ---------------------------------------------------------------
+    # A real Chromium is not a network connection, so the socket block never
+    # saw it -- and a test that reached the genuine `browser_context` launched
+    # one, drove a live job board, and passed. That is exactly what happened
+    # when the registration flow moved from `browser_page` to
+    # `browser_context` and one harness only stubbed the first: the lifecycle
+    # test quietly spent two seconds inside a headless browser on every run.
+    #
+    # Blocking it at the source means a half-stubbed harness fails loudly
+    # instead of silently doing the real thing.
+    try:
+        import playwright.sync_api as _pw
+
+        REAL["sync_playwright"] = _pw.sync_playwright
+
+        def blocked_playwright(*args, **kwargs):
+            raise NetworkBlockedInTests(
+                "A test tried to launch a REAL browser.\n"
+                "Playwright is blocked in the suite -- stub "
+                "`auto_apply.browser.browser_context` (and `browser_page`) in "
+                "your harness. Stubbing only one of them is how this leak got "
+                "in the first time."
+            )
+
+        _pw.sync_playwright = blocked_playwright
+    except Exception:            # Playwright absent on CI: nothing to block
+        pass
+
+
+class RecordingNotifier:
+    """A dual-channel notifier double. Records everything, delivers nothing.
+
+    Shared here rather than re-invented per file because it has to stay honest
+    about ONE thing: it implements `send_dual`, so a flow that is supposed to
+    reach both channels is actually observed doing so. A double that only knows
+    `send_via_telegram` would quietly exercise the single-channel compatibility
+    path in `review.dispatch_text` and report success for a feature that never
+    WhatsApp half.
+    """
+
+    def __init__(self) -> None:
+        self.telegram: list[str] = []
+        self.whatsapp: list[str] = []
+        self.photos: list[tuple[str, str]] = []
+        self.dry_run = True
+
+    # -- the real notifier's surface ---------------------------------------
+    def send_via_telegram(self, message: str):
+        self.telegram.append(str(message))
+        return True, "recorded"
+
+    def send_photo_via_telegram(self, path: str, caption: str = ""):
+        self.photos.append((str(path), str(caption)))
+        return True, "recorded"
+
+    def send_raw(self, message: str):
+        self.telegram.append(str(message))
+        return True, "recorded"
+
+    def send_dual(self, telegram_text, whatsapp_text=None, photo="",
+                  photo_caption="", channels=("telegram", "whatsapp")):
+        from notifier import DualResult
+
+        wanted = {str(c).lower() for c in channels}
+        result = DualResult()
+        if "telegram" in wanted:
+            self.telegram.append(str(telegram_text))
+            result.telegram_ok, result.telegram_detail = True, "recorded"
+            if photo:
+                self.photos.append((str(photo), str(photo_caption)))
+                result.photo_ok = True
+        if "whatsapp" in wanted:
+            self.whatsapp.append(
+                str(telegram_text if whatsapp_text is None else whatsapp_text)
+            )
+            result.whatsapp_ok, result.whatsapp_detail = True, "recorded"
+        return result
+
+    # -- assertions helpers -------------------------------------------------
+    def clear(self) -> None:
+        self.telegram.clear()
+        self.whatsapp.clear()
+        self.photos.clear()
+
+    @property
+    def both(self) -> str:
+        return "\n".join(self.telegram + self.whatsapp)
+
+    @property
+    def last_telegram(self) -> str:
+        return self.telegram[-1] if self.telegram else ""
+
+    @property
+    def last_whatsapp(self) -> str:
+        return self.whatsapp[-1] if self.whatsapp else ""
 
 
 @pytest.fixture

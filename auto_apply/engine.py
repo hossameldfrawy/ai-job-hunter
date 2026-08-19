@@ -4,9 +4,20 @@ Human-in-the-loop application engine.
     draft  ->  review dispatch  ->  YOUR approval  ->  submit  ->  evidence
 
 The approval step is a real gate, not a notification. Gemini writes the cover
-letter and the screening answers; those go to Telegram and the application sits
-at `review_pending` until you approve it by id. Nothing is ever submitted in
-your name on the strength of a model's guess about your salary expectations.
+letter and the screening answers; those go to BOTH Telegram and WhatsApp, and
+the application sits at `review_pending` until you approve it. Nothing is ever
+submitted in your name on the strength of a model's guess about your salary
+expectations.
+
+Approval arrives by whichever route you have to hand: `python main.py --approve
+7` from a terminal, or a reply of "done 7" / "موافق ٧" read straight out of
+Telegram Saved Messages by `auto_apply.control`. Both land in
+`submit_application`, so the gate is one gate however it is opened.
+
+Two things are stored at draft time purely so the flow can be reopened later:
+`field_map` (what each selector on the form actually is) and `experience`.
+Without the first, an in-line edit can only change the draft's own copy of the
+text while the ORIGINAL value still goes into the form.
 
 LinkedIn is excluded at the top of every entry point, not filtered somewhere
 downstream, so no future refactor can quietly start automating it.
@@ -16,10 +27,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
-from config import ROOT, settings
+from config import settings
 from models import Evaluation
 from vault import (
     STATUS_APPROVED, STATUS_DECLINED, STATUS_DRAFT, STATUS_FAILED,
@@ -122,10 +132,46 @@ def is_automatable(source_platform: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Drafting
 # ---------------------------------------------------------------------------
+# The questions every ATS asks, whether or not this particular page showed
+# them to the inspector.
+#
+# Why answer questions nobody asked yet: a multi-step form (Workday, Taleo)
+# only renders page two AFTER page one is submitted, so the inspector never
+# sees them at draft time -- and by the time it does, the browser is mid-flow
+# with no human watching and no model call budgeted. Drafting the standard set
+# up front means the wizard walker has an answer ready when the question
+# appears, instead of leaving a required field blank and failing at validation.
+#
+# They are also exactly the questions a human would want to review BEFORE
+# approving, which is the whole point of the review card.
+STANDARD_SCREENING_QUESTIONS: tuple[str, ...] = (
+    "What is your notice period?",
+    "What is your expected salary?",
+    "How many years of experience do you have with VoIP, SIP and Asterisk?",
+    "How many years of experience do you have with Python?",
+    "How many years of experience do you have with AI or machine learning?",
+    "Do you require visa sponsorship to work in this location?",
+    "Are you legally authorised to work in the job's country?",
+    "When can you start?",
+    "Are you willing to relocate?",
+    "What is your current location?",
+)
+
+
 def draft_answers(
     ev: Evaluation, job_description: str, questions: list[str]
 ) -> dict[str, Any]:
-    """Ask Gemini for a cover letter and one answer per screening question."""
+    """Ask Gemini for a cover letter and one answer per screening question.
+
+    The form's OWN questions come first and are answered verbatim. The standard
+    set is appended so a multi-step form has answers ready for pages the
+    inspector could not see yet -- see STANDARD_SCREENING_QUESTIONS.
+    """
+    asked = [q for q in questions if q and q.strip()]
+    seen = {q.strip().lower() for q in asked}
+    questions = asked + [
+        q for q in STANDARD_SCREENING_QUESTIONS if q.lower() not in seen
+    ]
     from auto_apply.candidate import load_candidate
     from cv_profile import load_cv
     from evaluator import GeminiEvaluator
@@ -151,12 +197,43 @@ def draft_answers(
             "responseMimeType": "application/json",
             "responseSchema": ANSWER_SCHEMA,
             "temperature": 0.3,
-            "maxOutputTokens": 3072,
+            # 3072 was not enough and the failure was ugly: an ARABIC cover
+            # letter for a Saudi posting hit MAX_TOKENS, the response came back
+            # as JSON cut off mid-string, and the whole draft was lost with an
+            # "unparseable JSON" error. Arabic costs roughly three times the
+            # tokens of the equivalent English, and a bilingual pipeline writes
+            # Arabic whenever the posting is in Arabic -- which on the Gulf
+            # boards is most of the time. Output tokens are only billed when
+            # used, so the headroom is free.
+            "maxOutputTokens": 8192,
         },
     })
     draft = evaluator._extract_json(payload)        # noqa: SLF001
     draft["_model"] = model
     return draft
+
+
+def describe_fields(fields: list[Any]) -> list[dict[str, Any]]:
+    """Record WHAT each selector is, alongside the value we put in it.
+
+    `build_payload` returns `{selector: value}` and nothing else, which is all a
+    submission needs -- and not enough for an edit. When the user later says
+    "edit 7 salary: 15000", the engine has to find the salary input on a form it
+    is not looking at, and a bare selector string carries no clue which one that
+    is. Without this map an in-line edit can only update the draft's own copy of
+    the text, and the ORIGINAL value still goes into the form: an edit that
+    looks applied and submits the old answer.
+    """
+    return [
+        {
+            "selector": f.selector,
+            "kind": f.kind,
+            "label": f.label,
+            "input_type": f.input_type,
+            "required": bool(getattr(f, "required", False)),
+        }
+        for f in fields
+    ]
 
 
 def build_payload(
@@ -182,61 +259,82 @@ def build_payload(
         elif f.kind in values and values[f.kind]:
             payload[f.selector] = values[f.kind]
         elif f.is_question:
-            payload[f.selector] = answers.get(f.label.strip(), "")
+            payload[f.selector] = (
+                answers.get(f.label.strip(), "")
+                or match_screening_answer(f.label, answers)
+            )
     return {k: v for k, v in payload.items() if v}
+
+
+#: Distinctive words that identify a standard screening question, so an answer
+#: drafted for our wording still lands on the board's wording. "Notice period
+#: (in weeks)" and "What is your notice period?" are the same question.
+_SCREENING_TOPICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("notice", ("notice",)),
+    ("salary", ("salary", "compensation", "expected pay", "ctc")),
+    ("voip", ("voip", "sip", "asterisk", "pbx", "telephony")),
+    ("python", ("python",)),
+    ("ai", ("machine learning", "artificial intelligence", " ai ")),
+    ("sponsorship", ("sponsor", "visa")),
+    ("authorised", ("authorised", "authorized", "eligible to work",
+                    "right to work")),
+    ("start", ("start date", "when can you start", "availability")),
+    ("relocate", ("relocat",)),
+    ("location", ("current location", "where are you based", "city")),
+)
+
+
+def _topic_of(label: str) -> str:
+    blob = f" {(label or '').lower()} "
+    for topic, needles in _SCREENING_TOPICS:
+        if any(n in blob for n in needles):
+            return topic
+    return ""
+
+
+def match_screening_answer(label: str, answers: dict[str, str]) -> str:
+    """Find a drafted answer for a question worded differently from ours.
+
+    A multi-step form asks "Notice period (weeks)" on page three; the draft
+    holds "What is your notice period?". Exact-match leaves the field blank and
+    the form fails validation, so questions are matched by TOPIC instead --
+    conservatively, and only for the standard set, because a wrong answer to a
+    screening question is worse than an empty one a human then fills in.
+    """
+    topic = _topic_of(label)
+    if not topic:
+        return ""
+    for question, answer in answers.items():
+        if answer and _topic_of(question) == topic:
+            return answer
+    return ""
 
 
 # ---------------------------------------------------------------------------
 # Review dispatch
+#
+# The cards themselves live in `auto_apply.review`, which renders one draft for
+# BOTH channels and is also what re-renders it after every in-line edit. These
+# two functions stay here as the names the rest of the system already calls.
 # ---------------------------------------------------------------------------
 def format_review_message(
-    app_id: int, ev: Evaluation, draft: dict[str, Any], platform: str
+    app_id: int, ev: Evaluation, draft: dict[str, Any], platform: str,
+    *, experience: str = "", form_ok: bool = True, form_note: str = "",
 ) -> str:
-    answers = draft.get("answers", []) or []
-    lines = []
-    for a in answers[:6]:
-        if not isinstance(a, dict):
-            continue
-        flag = "" if a.get("confident", True) else "  ⚠️ NEEDS YOU"
-        lines.append(f"• {str(a.get('question',''))[:70]}{flag}\n   → "
-                     f"{str(a.get('answer',''))[:160]}")
-    answers_summary = "\n".join(lines) or "(no screening questions on this form)"
+    """The full Telegram review card for a freshly drafted application."""
+    from auto_apply.review import DraftCard, format_review_telegram
 
-    salary = draft.get("salary_expectation") or ""
-    cover = (draft.get("cover_letter") or "")[:600]
-
-    return (
-        f"📝 *APPLICATION DRAFT READY FOR REVIEW* [#{app_id}]\n"
-        f"🏢 Company: {ev.company_name}\n"
-        f"💼 Role: {ev.role_title}\n"
-        f"🌐 Platform: {platform}\n"
-        f"📊 Match: {ev.match_score}%\n"
-        + (f"💰 Salary answer: {salary}\n" if salary else "")
-        + f"\n📋 Proposed Answers:\n{answers_summary}\n"
-        f"\n✍️ Drafted Cover Letter:\n{cover}\n"
-        f"\n──────────────\n"
-        f"Approve:  python main.py --approve {app_id}\n"
-        f"Discard:  python main.py --decline {app_id}"
-    )
+    return format_review_telegram(DraftCard.from_draft(
+        app_id, ev, draft, platform,
+        experience=experience, form_ok=form_ok, form_note=form_note,
+    ))
 
 
 def format_submitted_message(app_id: int, app: dict[str, Any]) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    shot = app.get("screenshot_path") or ""
-    # Split on BOTH separators rather than just the backslash. The screenshot is
-    # captured on Windows but the vault is readable from Linux too, and a
-    # one-separator split prints the entire absolute path on the other platform
-    # -- pathlib is no help here, since PurePosixPath does not treat "\" as one.
-    evidence = (f"Screenshot saved — {shot.replace(chr(92), '/').rsplit('/', 1)[-1]}"
-                if shot else "not captured")
-    return (
-        f"🚀 *APPLICATION SUCCESSFULLY SUBMITTED!* [#{app_id}]\n"
-        f"🏢 Company: {app.get('company')}\n"
-        f"💼 Role: {app.get('role')}\n"
-        f"🌐 Platform: {app.get('platform')}\n"
-        f"📸 Evidence: {evidence}\n"
-        f"🕒 Time: {stamp}"
-    )
+    """The full Telegram confirmation card for a completed submission."""
+    from auto_apply.review import format_submitted_telegram
+
+    return format_submitted_telegram(app_id, app)
 
 
 # ---------------------------------------------------------------------------
@@ -268,22 +366,47 @@ def prepare_application(
         return int(existing["id"])
 
     from auto_apply.browser import (
-        browser_page, inspect_form, looks_like_application_form,
+        browser_page, detect_ats, has_saved_session, inspect_form,
+        looks_like_application_form,
     )
+    from auto_apply.profile_builder import platform_for_source
+
+    board = platform_for_source(ev.source_platform, ev.direct_link)
+    session_key = board.slug if board else (ev.source_platform or "default")
 
     fields: list[Any] = []
     form_ok, form_note = False, "page not inspected"
+    ats = ""
     if ev.direct_link:
         try:
-            with browser_page(ev.source_platform) as page:
+            # Inspected through the board's saved login. Signed out, these
+            # boards serve a public landing page whose only form is the site
+            # search -- which is what `looks_like_application_form` then
+            # (correctly) refuses, leaving a draft that can never be submitted.
+            with browser_page(session_key) as page:
                 page.goto(ev.direct_link, wait_until="domcontentloaded")
                 fields = inspect_form(page)
+                ats = detect_ats(page)
                 form_ok, form_note = looks_like_application_form(fields)
                 if not job_description:
                     job_description = page.inner_text("body")[:6000]
         except Exception as exc:
             log.warning("Could not inspect the application form: %s", exc)
             form_note = f"inspection failed: {exc}"
+
+    # ADD the likely cause; never replace the observation.
+    #
+    # "The only form here is the site search" is what was actually SEEN, and it
+    # stays -- that is the evidence. "You are not signed in" is the most likely
+    # REASON for it, and it is the part that says what to do next. Dropping the
+    # first for the second would trade a fact for an inference.
+    if (not form_ok and board is not None and board.needs_login
+            and not has_saved_session(board.slug)):
+        form_note = (
+            f"{form_note}. Most likely cause: not signed in to {board.name} -- "
+            f"its apply form only exists for a logged-in candidate. "
+            f"Run: python main.py --register {board.name}"
+        )
 
     if not form_ok:
         log.warning(
@@ -295,29 +418,61 @@ def prepare_application(
     questions = [f.label for f in fields if f.is_question]
     draft = draft_answers(ev, job_description, questions)
     payload = build_payload(ev, draft, fields)
+    experience = _experience_label()
 
     app_id = store.record_application(
         job_fingerprint=ev.fingerprint, job_id=ev.ref_id,
         company=ev.company_name, role=ev.role_title,
         platform=ev.source_platform, job_url=ev.direct_link,
-        payload={"fields": payload, "draft": draft,
-                 "form_ok": form_ok, "form_note": form_note},
+        payload={
+            "fields": payload,
+            # What each selector IS, so a later in-line edit can find the right
+            # input instead of only rewriting the draft's own copy.
+            "field_map": describe_fields(fields),
+            "draft": draft,
+            "experience": experience,
+            "match_score": int(ev.match_score or 0),
+            "form_ok": form_ok,
+            "form_note": form_note,
+            "ats": ats,
+            "board": board.name if board else "",
+        },
         cover_letter=draft.get("cover_letter", ""),
         status=STATUS_REVIEW if _cfg().get("require_approval", True) else STATUS_APPROVED,
     )
 
     if notifier:
-        message = format_review_message(app_id, ev, draft, ev.source_platform)
-        if not form_ok:
-            message += (
-                "\n\n⚠️ *No auto-submittable form found* — "
-                + form_note
-                + "\nThe cover letter above is ready to paste. Apply here:\n"
-                + (ev.direct_link or "(no link)")
-            )
-        notifier.send_via_telegram(message)
+        from auto_apply.review import DraftCard, dispatch_review
+
+        # BOTH channels, not just Telegram. The whole point of the review gate
+        # is that the user answers it; a card that only lands where they are not
+        # looking is a gate that stalls rather than one that holds.
+        dispatch_review(notifier, DraftCard.from_draft(
+            app_id, ev, draft, ev.source_platform,
+            experience=experience, form_ok=form_ok, form_note=form_note,
+        ))
     log.info("Application #%d drafted and sent for review.", app_id)
     return app_id
+
+
+def _experience_label() -> str:
+    """"3 years", from the structured CV profile. "" if it cannot be read.
+
+    Read here, at drafting time, rather than inside the card renderer: reading
+    it lazily would make rendering a review card able to trigger a Gemini CV
+    extraction, and re-rendering after every edit would do it again.
+    """
+    try:
+        from auto_apply.candidate import load_candidate
+
+        years = load_candidate().years_experience
+    except Exception as exc:
+        log.debug("Could not read years of experience from the profile: %s", exc)
+        return ""
+    if not years:
+        return ""
+    whole = int(years)
+    return f"{whole} year{'' if whole == 1 else 's'}"
 
 
 def submit_application(
@@ -364,13 +519,17 @@ def submit_application(
         )
 
     from auto_apply.browser import (
-        browser_page, capture_evidence, fill_field, inspect_form,
-        looks_like_application_form,
+        MULTI_STEP_ATS, attach_cv, browser_page, capture_evidence, click_next,
+        click_submit, detect_ats, detect_captcha, fill_field, has_submit,
+        inspect_form, looks_like_application_form,
     )
+    from auto_apply.profile_builder import platform_for_source
 
     payload = json.loads(app.get("submitted_payload_json") or "{}")
     field_values: dict[str, str] = payload.get("fields", {})
     cv_path = next((str(p) for p in settings.cv_paths if p.exists()), "")
+    board = platform_for_source(app.get("platform", ""), app.get("job_url", ""))
+    session_key = board.slug if board else (app.get("platform") or "default")
 
     if dry_run:
         log.info("[DRY_RUN] would submit #%d with %d field(s) to %s",
@@ -378,9 +537,16 @@ def submit_application(
         return True
 
     try:
-        with browser_page(app.get("platform", "default")) as page:
+        # Opened with the board's SAVED LOGIN. Without it the browser arrives
+        # signed out, the board serves its public landing page, and the only
+        # form on it is the site search -- which is why every draft was refused
+        # at this gate before session state existed.
+        with browser_page(session_key) as page:
             page.goto(app["job_url"], wait_until="domcontentloaded")
             fields = inspect_form(page)
+            ats = detect_ats(page)
+            if ats:
+                log.info("Application is served by %s.", ats)
 
             # Re-check at submit time, not just at draft time: the page may have
             # changed, and clicking "submit" on a search widget would run a
@@ -390,6 +556,19 @@ def submit_application(
                 raise ApplyError(
                     "Refusing to submit: " + note
                     + ". Apply by hand here: " + str(app["job_url"])
+                )
+
+            # A CAPTCHA is the same failure shape as a search widget: clicking
+            # submit underneath an unsolved challenge does not raise, the page
+            # re-renders with an error, and the screenshot of that error page
+            # gets banked as evidence of a submission that never happened.
+            # Refuse instead, and say what is in the way.
+            blocked, challenge = detect_captcha(page)
+            if blocked:
+                raise ApplyError(
+                    f"Refusing to submit: this page is behind {challenge}, which "
+                    f"only a human can clear. The drafted cover letter is saved "
+                    f"-- apply by hand here: {app['job_url']}"
                 )
 
             # A CV upload with no CV on disk is not a partial success. The
@@ -413,37 +592,69 @@ def submit_application(
                     "in: %s); submitting without an attachment.", tried,
                 )
 
-            filled = 0
-            for f in fields:
-                if f.kind == "resume" and cv_path:
-                    filled += int(fill_field(page, f, cv_path))
-                elif f.selector in field_values:
-                    filled += int(fill_field(page, f, field_values[f.selector]))
-            log.info("Filled %d/%d field(s).", filled, len(fields))
+            def fill_visible(page_fields: list[Any]) -> int:
+                count = 0
+                for f in page_fields:
+                    if f.kind == "resume":
+                        count += int(attach_cv(page, f, cv_path))
+                    elif f.selector in field_values:
+                        count += int(fill_field(page, f, field_values[f.selector]))
+                return count
 
-            submitted = False
-            for selector in (
-                'button[type="submit"]', 'input[type="submit"]',
-                'button:has-text("Apply")', 'button:has-text("Submit")',
-                'button:has-text("تقديم")', 'button:has-text("إرسال")',
-            ):
-                try:
-                    page.click(selector, timeout=5000)
-                    submitted = True
+            filled = fill_visible(fields)
+            log.info("Filled %d/%d field(s) on the first page.",
+                     filled, len(fields))
+
+            # MULTI-STEP FORMS. Workday, Taleo, iCIMS and SmartRecruiters are
+            # wizards: the submit button does not exist until the last page.
+            # Walk forward, filling whatever each page exposes, and stop the
+            # moment a real submit control appears. Bounded, because a wizard
+            # that loops -- a validation error re-rendering the same step -- is
+            # otherwise an infinite click loop.
+            max_steps = int(_cfg().get("max_form_steps", 6))
+            steps = 1
+            while not has_submit(page) and steps < max_steps:
+                if not click_next(page):
                     break
+                steps += 1
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
-                    continue
-            if not submitted:
-                raise ApplyError("Could not find a submit button on the form.")
+                    pass
+                page_fields = inspect_form(page)
+                filled += fill_visible(page_fields)
+                blocked, challenge = detect_captcha(page)
+                if blocked:
+                    raise ApplyError(
+                        f"Refusing to submit: step {steps} of this form is "
+                        f"behind {challenge}, which only a human can clear. "
+                        f"Apply by hand here: {app['job_url']}"
+                    )
+            if steps > 1:
+                log.info("Walked %d step(s) of a %s form; %d field(s) filled "
+                         "in total.", steps, ats or "multi-page", filled)
+            if ats in MULTI_STEP_ATS and steps == 1:
+                log.info("%s is usually multi-step but the submit control was "
+                         "already present; submitting this page.", ats)
+
+            if not click_submit(page):
+                raise ApplyError(
+                    "Could not find a submit button on the form"
+                    + (f" after {steps} step(s)" if steps > 1 else "")
+                    + "."
+                )
 
             page.wait_for_load_state("networkidle", timeout=30000)
             shot = capture_evidence(page, f"app{app_id}_{app.get('company','')}")
 
         store.set_application_status(app_id, STATUS_SUBMITTED, screenshot_path=shot)
         if notifier:
-            notifier.send_via_telegram(
-                format_submitted_message(app_id, store.get_application(app_id))
-            )
+            from auto_apply.review import dispatch_submitted
+
+            # Both channels, and the screenshot itself rides the Telegram side.
+            # "Submitted" is a claim; the full-page capture is the proof, and
+            # the proof is the part worth pushing to the user's phone.
+            dispatch_submitted(notifier, app_id, store.get_application(app_id))
         return True
 
     except Exception as exc:
@@ -452,12 +663,9 @@ def submit_application(
         )
         log.error("Application #%d failed: %s", app_id, exc)
         if notifier:
-            notifier.send_via_telegram(
-                f"⚠️ *APPLICATION #{app_id} FAILED*\n"
-                f"🏢 {app.get('company')} — {app.get('role')}\n"
-                f"Reason: {str(exc)[:200]}\n\n"
-                f"The draft is kept; apply manually here:\n{app.get('job_url')}"
-            )
+            from auto_apply.review import dispatch_failure
+
+            dispatch_failure(notifier, app_id, app, f"{type(exc).__name__}: {exc}")
         return False
 
 

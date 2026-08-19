@@ -43,7 +43,7 @@ from models import iso, utc_now
 
 log = logging.getLogger(__name__)
 
-VAULT_SCHEMA_VERSION = 1
+VAULT_SCHEMA_VERSION = 3
 DEFAULT_VAULT_PATH = ROOT / "state" / "vault.db"
 KEY_PATH = ROOT / "secrets" / "vault.key"
 
@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS credentials_vault (
     platform_name      TEXT NOT NULL,
     platform_url       TEXT,
     email              TEXT,
+    -- Boards are split on which identifier they sign you in by. Bayt and
+    -- GulfTalent take the email; Wuzzuf and Tanqeeb show a separate handle you
+    -- cannot recover from the email alone. Storing only the email meant half
+    -- the vault could not actually log anyone in.
+    username           TEXT,
     password_encrypted TEXT,
     profile_status     TEXT DEFAULT 'pending',
     notes              TEXT,
@@ -84,7 +89,12 @@ CREATE TABLE IF NOT EXISTS applications_history (
     screenshot_path       TEXT,
     failure_reason        TEXT,
     created_at            TIMESTAMP NOT NULL,
-    submitted_at          TIMESTAMP
+    submitted_at          TIMESTAMP,
+    -- Written by the in-line edit engine: when the draft was last changed and
+    -- how many times. `revision` is what tells the reader whether the card in
+    -- front of them is the original or the third rewrite.
+    updated_at            TIMESTAMP,
+    revision              INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_apps_status ON applications_history(status);
 CREATE INDEX IF NOT EXISTS idx_apps_jobid  ON applications_history(job_id);
@@ -207,9 +217,30 @@ class SecureStore:
                 self._conn.rollback()
                 raise
 
+    #: columns added after v1. The vault is a LOCAL file that is never
+    #: recreated from scratch -- it holds the only copy of every stored
+    #: password -- so new columns have to be added to the file already on disk.
+    _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+        "applications_history": [
+            ("updated_at", "TIMESTAMP"),
+            ("revision", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+        "credentials_vault": [
+            ("username", "TEXT"),
+        ],
+    }
+
     def _migrate(self) -> None:
         with self._tx() as c:
             c.executescript(_SCHEMA)
+            for table, columns in self._ADDED_COLUMNS.items():
+                existing = {
+                    r["name"] for r in c.execute(f"PRAGMA table_info({table})")
+                }
+                for name, coltype in columns:
+                    if name not in existing:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
+                        log.info("Migrated vault %s: added column %s.", table, name)
             c.execute(
                 "INSERT INTO vault_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -228,25 +259,36 @@ class SecureStore:
     def save_credentials(
         self, platform_name: str, platform_url: str, email: str,
         password: str, profile_status: str = "pending", notes: str = "",
+        username: str = "",
     ) -> int:
-        """Store (or update) an account. The password is encrypted here."""
+        """Store (or update) an account. The password is encrypted here.
+
+        `username` is preserved on conflict rather than overwritten with an
+        empty string: a board hands you your real handle only after signup, so
+        a later re-provision (which knows only the derived one) must not wipe
+        the value that actually works.
+        """
         now = iso(utc_now())
         with self._tx() as c:
-            cur = c.execute(
+            c.execute(
                 "INSERT INTO credentials_vault "
-                "(platform_name,platform_url,email,password_encrypted,"
+                "(platform_name,platform_url,email,username,password_encrypted,"
                 " profile_status,notes,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?) "
+                "VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(platform_name,email) DO UPDATE SET "
                 "  password_encrypted=excluded.password_encrypted,"
                 "  platform_url=excluded.platform_url,"
+                "  username=COALESCE(NULLIF(excluded.username,''), username),"
                 "  profile_status=excluded.profile_status,"
                 "  notes=excluded.notes, updated_at=excluded.updated_at",
-                (platform_name, platform_url, email, encrypt(password),
+                (platform_name, platform_url, email, username, encrypt(password),
                  profile_status, notes, now, now),
             )
-            rowid = cur.lastrowid
-        return int(rowid or 0)
+            row = c.execute(
+                "SELECT id FROM credentials_vault WHERE platform_name=? AND email=?",
+                (platform_name, email),
+            ).fetchone()
+        return int(row["id"]) if row else 0
 
     def get_credentials(self, platform_name: str) -> dict[str, Any] | None:
         """Return one account with the password DECRYPTED, or None."""
@@ -348,6 +390,75 @@ class SecureStore:
                 (fingerprint,),
             ).fetchone()
         return dict(row) if row else None
+
+    def update_application_draft(
+        self, app_id: int, *, payload: dict[str, Any] | None = None,
+        cover_letter: str | None = None, status: str | None = None,
+    ) -> bool:
+        """Rewrite a draft in place after an in-line edit. Returns False if unknown.
+
+        Both columns move together on purpose. `cover_letter_text` is what the
+        review card shows; `submitted_payload_json["fields"]` is what actually
+        gets typed into the form. An edit that touched only the first would look
+        applied on the card and submit the ORIGINAL text -- a silent, invisible
+        failure of exactly the kind the human gate exists to prevent. Callers
+        build both halves with `auto_apply.review.apply_edit`, which keeps them
+        consistent.
+
+        `revision` is bumped on every call so a card can say which version of
+        the draft the reader is looking at, and `updated_at` records when.
+        A None argument leaves that column untouched.
+        """
+        if not self.get_application(app_id):
+            return False
+        with self._tx() as c:
+            c.execute(
+                "UPDATE applications_history SET "
+                "  submitted_payload_json=COALESCE(?, submitted_payload_json),"
+                "  cover_letter_text=COALESCE(?, cover_letter_text),"
+                "  status=COALESCE(?, status),"
+                "  revision=COALESCE(revision,0)+1,"
+                "  updated_at=? "
+                "WHERE id=?",
+                (
+                    json.dumps(payload, ensure_ascii=False)
+                    if payload is not None else None,
+                    cover_letter,
+                    status,
+                    iso(utc_now()),
+                    app_id,
+                ),
+            )
+        return True
+
+    #: the order the HITL listener resolves a bare "done" against. A draft
+    #: awaiting review is the obvious target; an already-approved one that was
+    #: never submitted is the next most likely thing the user means.
+    PENDING_ORDER = (STATUS_REVIEW, STATUS_APPROVED, STATUS_DRAFT)
+
+    def latest_pending_application(self) -> dict[str, Any] | None:
+        """The draft a bare `done` / `موافق` should act on.
+
+        Newest-first within each status band rather than newest overall: a
+        `review_pending` draft created this morning outranks an `approved` one
+        from ten minutes ago, because approving something twice is harmless and
+        submitting the wrong job is not.
+        """
+        for status in self.PENDING_ORDER:
+            rows = self.applications_by_status(status)
+            if rows:
+                return rows[0]
+        return None
+
+    def applications_awaiting_review(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Everything still waiting on a human, newest first."""
+        placeholders = ",".join("?" * len(self.PENDING_ORDER))
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(
+                f"SELECT * FROM applications_history WHERE status IN "
+                f"({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*self.PENDING_ORDER, int(limit)),
+            )]
 
     def applications_by_status(self, status: str) -> list[dict[str, Any]]:
         with self._lock:

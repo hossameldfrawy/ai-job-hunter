@@ -537,22 +537,210 @@ auto_apply:
   # the CAPTCHA. Headless is fine once an account already exists.
   headed: true
 
+  # Submit the signup form automatically when the page has no human-verification
+  # challenge on it. When a CAPTCHA IS detected the browser stops and waits for
+  # you -- pushing through one is what turns "an account" into "a banned account
+  # on a board the job hunt depends on". Set false to always stop and confirm.
+  auto_submit_registration: true
+
   # Identity overrides. These beat whatever Gemini reads out of the CV, because
-  # the model should not have the last word on your own contact details.
+  # the model should not have the last word on your own contact details -- or
+  # on how you describe yourself to a recruiter.
   identity:
     email: "hossam.eldefrawy.dev@gmail.com"
+    headline: "VoIP & Network Engineer / AI Graduate"
 
-  # Boards the assisted registration flow knows how to open.
+  # Boards the registration and apply flows know about.
+  #
+  # `hosts` is what maps a scraped JOB URL back to a board, so `--apply` knows
+  # WHICH saved login to open the page with. Without it the browser arrives
+  # signed out and sees the public landing page -- which is a search widget,
+  # not an application form, and is exactly why every draft so far has been
+  # refused at the submit gate.
+  #
+  # `manual_signup: true` means "vault the credentials, pre-fill the form, but
+  # never press submit". It is set for boards behind phone verification, where
+  # a half-created account burns the email address.
+  #
+  # `needs_login: true` means the apply form only exists for a signed-in
+  # candidate. Drafting against one of these without a saved session is
+  # expected to find nothing useful, and says so rather than looking broken.
   platforms:
+    # -- Egypt & Gulf ----------------------------------------------------
     - name: Tanqeeb
       url: "https://www.tanqeeb.com/register"
       login_url: "https://www.tanqeeb.com/login"
+      hosts: ["tanqeeb.com"]
+      needs_login: true
     - name: Wuzzuf
       url: "https://wuzzuf.net/signup/candidate"
       login_url: "https://wuzzuf.net/login"
+      hosts: ["wuzzuf.net"]
+      needs_login: true
+    - name: Bayt
+      url: "https://www.bayt.com/en/register/"
+      login_url: "https://www.bayt.com/en/login/"
+      hosts: ["bayt.com"]
+      needs_login: true
+      # Bayt sends an SMS code during signup and is aggressive about
+      # automation; it is pre-filled but always finished by hand.
+      manual_signup: true
+    - name: GulfTalent
+      url: "https://www.gulftalent.com/register"
+      login_url: "https://www.gulftalent.com/login"
+      hosts: ["gulftalent.com"]
+      needs_login: true
+    - name: Naukrigulf
+      url: "https://www.naukrigulf.com/registration"
+      login_url: "https://www.naukrigulf.com/login"
+      hosts: ["naukrigulf.com"]
+      needs_login: true
+      manual_signup: true
+    - name: Forasna
+      url: "https://forasna.com/register"
+      login_url: "https://forasna.com/login"
+      hosts: ["forasna.com"]
+      needs_login: true
+    - name: Akhtaboot
+      url: "https://www.akhtaboot.com/en/register"
+      login_url: "https://www.akhtaboot.com/en/login"
+      hosts: ["akhtaboot.com"]
+      needs_login: true
+
+    # -- Global & aggregators --------------------------------------------
     - name: Talent.com
       url: "https://ae.talent.com/register"
       login_url: "https://ae.talent.com/login"
+      hosts: ["talent.com"]
+      needs_login: true
+    - name: Indeed
+      url: "https://secure.indeed.com/account/register"
+      login_url: "https://secure.indeed.com/account/login"
+      hosts: ["indeed.com"]
+      needs_login: true
+      # Indeed fingerprints browser automation harder than anything else here
+      # except LinkedIn, and a flagged account loses Direct Apply entirely.
+      manual_signup: true
+    - name: Glassdoor
+      url: "https://www.glassdoor.com/profile/joinNow_input.htm"
+      login_url: "https://www.glassdoor.com/profile/login_input.htm"
+      hosts: ["glassdoor.com"]
+      needs_login: true
+      manual_signup: true
+    - name: ZipRecruiter
+      url: "https://www.ziprecruiter.com/authn/registration"
+      login_url: "https://www.ziprecruiter.com/authn/login"
+      hosts: ["ziprecruiter.com"]
+      needs_login: true
+    - name: Foundit
+      url: "https://www.foundit.in/seeker/registration"
+      login_url: "https://www.foundit.in/seeker/login"
+      hosts: ["foundit.in", "foundit.com", "monster.com", "monstergulf.com"]
+      needs_login: true
+    - name: RemoteOK
+      url: "https://remoteok.com/"
+      login_url: "https://remoteok.com/"
+      hosts: ["remoteok.com", "remoteok.io"]
+      # No account needed: postings link straight out to the employer's own
+      # form, so there is nothing to sign into.
+      needs_login: false
+    - name: WeWorkRemotely
+      url: "https://weworkremotely.com/"
+      login_url: "https://weworkremotely.com/"
+      hosts: ["weworkremotely.com"]
+      needs_login: false
+
+  # Where an authenticated browser session is kept between runs, per board.
+  # These are cookies for a logged-in account -- treated exactly like the
+  # vault: local only, git-ignored, never synced anywhere.
+  session_dir: "secrets/sessions"
+
+# ==========================================================================
+#  HUMAN-IN-THE-LOOP REVIEW  (dual-channel approval + in-line editing)
+#
+#  A drafted application is pushed to BOTH Telegram Saved Messages and
+#  WhatsApp, and you answer from wherever you happen to be:
+#
+#      done 7                          submit draft #7
+#      موافق ٧                          the same, in Arabic
+#      edit 7 salary: 15000 AED        change one field, then re-confirm
+#      تعديل 7 خطاب التغطية: ...        rewrite the cover letter
+#      edit 7: make it shorter         free-form -- Gemini applies it
+#      decline 7  /  رفض ٧              discard the draft
+#      status  /  الحالة                what is waiting for you
+#
+#  Run the listener with:  python main.py --listen        (stays connected)
+#                          python main.py --listen-once   (one poll, for cron)
+# ==========================================================================
+hitl:
+  # Whether replies are READ at all. This gates the listener, not the card:
+  # a drafted application always reaches both channels, because that dispatch
+  # IS the review gate. Set false to keep approval in the terminal only.
+  enabled: true
+
+  # Which channels a review card goes out on. Turning one off does not change
+  # which commands are accepted -- replies are only ever read from Telegram,
+  # because WhatsApp via CallMeBot is send-only. Turning BOTH off is ignored:
+  # a review gate nobody is told about is a gate that stalls forever.
+  channels:
+    telegram: true
+    whatsapp: true
+
+  # Only this Telegram account may drive the listener. Saved Messages is
+  # already private, so this is belt-and-braces -- but the thing on the other
+  # end of a mis-delivered "done" is a job application sent in your name.
+  # Leave blank to accept whichever account the session belongs to.
+  telegram_owner_id: 1443640499
+
+  # A bare "done" with several drafts pending: refuse and list them (true), or
+  # act on the newest (false). Submitting cannot be undone, so the default is
+  # to ask. A bare "done" with exactly ONE draft pending always just works.
+  confirm_when_ambiguous: true
+
+  # Free-form edits ("edit 7: make it shorter") are applied to the cover letter
+  # by Gemini. With this off they are recorded as a note on the draft instead,
+  # and nothing is rewritten.
+  allow_ai_revision: true
+
+  # Ignore commands older than this when the listener starts or reconnects, so
+  # a restart cannot replay last week's "done" and submit an old draft.
+  max_command_age_minutes: 180
+
+  # --listen-once reads at most this many recent Saved Messages per pass.
+  poll_batch: 40
+
+  # -- Inbound WhatsApp (two-way HITL) ------------------------------------
+  # CallMeBot, which carries every outbound WhatsApp card here, is SEND-ONLY:
+  # it has no receive endpoint at all. So replying on WhatsApp needs a relay
+  # that can POST incoming messages to this bot -- Meta's Cloud API, Twilio,
+  # or anything you control (a Baileys bridge, n8n, a phone shortcut).
+  #
+  # Until one is configured this stays off and replies are Telegram-only;
+  # outbound WhatsApp cards are unaffected.
+  #
+  # The endpoint can submit a job application, so it FAILS CLOSED: with no
+  # secret set it refuses every request rather than accepting them.
+  whatsapp_inbound:
+    enabled: false
+    host: "0.0.0.0"
+    port: 8080
+    # Meta Cloud API: the app secret it signs X-Hub-Signature-256 with, and
+    # the token it echoes during webhook verification.
+    app_secret: ""
+    verify_token: ""
+    # Any other relay: a secret it must send as X-Relay-Token.
+    shared_secret: ""
+    # Only this number may drive the bot. Defaults to WHATSAPP_PHONE.
+    allowed_number: ""
+
+  # `--listen` runs an event handler AND this poll sweep in the same process.
+  # The event path is the fast one; the sweep is the safety net, because
+  # Telegram never delivers an update for a message the SAME session sent --
+  # which means the event handler cannot be verified from inside the bot, only
+  # by you typing on your phone. Silent inaction on an approval is the worst
+  # failure this component has, so it does not depend on one mechanism. Both
+  # routes share a forward-only cursor, so nothing is ever executed twice.
+  poll_interval_seconds: 60
 
 # -- Inbound interview / status email monitor ------------------------------
 email_monitor:

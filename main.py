@@ -11,9 +11,13 @@ AI Job Hunter -- entry point.
   Phase 2 -- auto-apply & interview copilot (LOCAL only, needs a browser):
     python main.py --register [Platform]   assisted signup: pre-fills, you submit
     python main.py --apply                 draft applications for top matches
+    python main.py --provision             vault credentials for every board
+    python main.py --vault [--reveal]      show the vault + profile payload
     python main.py --applications          list drafts and their status
     python main.py --approve <id>          approve a draft, then submit it
     python main.py --decline <id>          discard a draft
+    python main.py --listen                approve/edit by replying on Telegram
+    python main.py --listen-once           process replies once, then exit
     python main.py --inbox                 scan the mailbox for interview mail
     python main.py --watch-inbox           keep scanning on an interval
     python main.py --stats         what the bot has done so far
@@ -284,6 +288,88 @@ def cmd_register(platform_name):
     return 0
 
 
+def cmd_provision():
+    """Derive and vault credentials for every configured board. Offline.
+
+    Deliberately does NOT open a browser or create anything. Deriving a
+    password and banking it is reversible and safe to run for all boards at
+    once; creating accounts is neither. Running this first also means the vault
+    is already correct before any signup starts, so an interrupted registration
+    leaves a recoverable credential rather than one that existed only in a
+    browser window that got closed.
+    """
+    from auto_apply.profile_builder import configured_platforms, provision
+
+    store = _store()
+    try:
+        platforms = configured_platforms()
+        if not platforms:
+            print("  No platforms configured under auto_apply.platforms.")
+            return 1
+        print("\n  PROVISIONING %d PLATFORM(S)" % len(platforms))
+        print("  " + "-" * 74)
+        for platform in platforms:
+            profile = provision(platform, store)
+            print("  %-14s %-34s user=%s%s"
+                  % (platform.name, profile.email, profile.username,
+                     "  [manual signup]" if platform.manual_signup else ""))
+        print("\n  Credentials are encrypted in the vault. Inspect them with:")
+        print("    python main.py --vault            (masked)")
+        print("    python main.py --vault --reveal   (shows the passwords)")
+        print("  Create the accounts with:  python main.py --register <name>\n")
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_vault(reveal=False):
+    """Show what is in `credentials_vault`. Passwords masked unless asked for."""
+    from auto_apply.profile_builder import build_profile, find_platform
+
+    store = _store()
+    try:
+        rows = store.list_platforms()
+        print()
+        print("  CREDENTIALS VAULT   (%s)" % store.path)
+        print("  " + "-" * 88)
+        if not rows:
+            print("  (empty -- run: python main.py --provision)")
+        print("  %-14s %-34s %-20s %-12s %s"
+              % ("PLATFORM", "EMAIL", "USERNAME", "STATUS", "PASSWORD"))
+        for row in rows:
+            secret = "********"
+            if reveal:
+                full = store.get_credentials(row["platform_name"]) or {}
+                secret = full.get("password") or "(unreadable)"
+            print("  %-14s %-34s %-20s %-12s %s"
+                  % (row["platform_name"], row.get("email") or "-",
+                     row.get("username") or "-",
+                     row.get("profile_status") or "-", secret))
+
+        print()
+        print("  PROFILE PAYLOAD SENT TO EACH SIGNUP FORM")
+        print("  " + "-" * 88)
+        sample = next((find_platform(r["platform_name"]) for r in rows), None)
+        if sample is None:
+            print("  (no configured platform to build a payload for)")
+        else:
+            profile = build_profile(sample)
+            for label, value in (
+                ("Name", profile.full_name), ("Email", profile.email),
+                ("Username", profile.username), ("Phone", profile.phone),
+                ("Location", profile.location), ("Headline", profile.headline),
+                ("Bio", profile.bio[:200] + ("..." if len(profile.bio) > 200 else "")),
+                ("CV", profile.cv_path or "NONE ON DISK"),
+            ):
+                print("  %-10s %s" % (label + ":", value or "-"))
+        print()
+        if not reveal and rows:
+            print("  Passwords are masked. Re-run with --reveal to print them.\n")
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_apply(db, limit):
     """Draft applications for the best recent matches. Never LinkedIn."""
     from auto_apply.engine import is_automatable, prepare_application
@@ -395,6 +481,84 @@ def cmd_decline(app_id):
         log.error("%s", exc)
         return 1
     finally:
+        store.close()
+    return 0
+
+
+def cmd_listen(db, once=False):
+    """Read approval / edit replies out of Telegram Saved Messages.
+
+    This is the other half of the dual-channel review card. The card goes out
+    to Telegram and WhatsApp when a draft is prepared; this is what turns the
+    reply -- "done 7", "تعديل 7 الراتب: 15000" -- back into an action.
+
+    Commands are read from Telegram only. CallMeBot is a send-only transport:
+    there is no way to receive a WhatsApp reply through it, so WhatsApp carries
+    the card and Telegram carries the conversation.
+    """
+    from auto_apply.control import (
+        ReviewController, TelegramCommandListener, listener_enabled,
+    )
+    from notifier import WhatsAppNotifier
+
+    if not listener_enabled():
+        log.error(
+            "The review listener is switched off (hitl.enabled: false in "
+            "config.yml). Drafts still reach both channels; approve them with "
+            "`python main.py --approve <id>`."
+        )
+        return 2
+    if not settings.telegram_ready:
+        log.error(
+            "The review listener needs the Telegram user client. Run "
+            "`python auth_telegram.py` once, then try again."
+        )
+        return 2
+
+    store, notifier = _store(), WhatsAppNotifier(db)
+    controller = ReviewController(store, notifier)
+    listener = TelegramCommandListener(controller, db=db)
+    _install_signal_handlers()
+
+    # -- the WhatsApp half, if a relay is configured ------------------------
+    # Said out loud either way. "Listening on both channels" printed over a
+    # channel that physically cannot receive is the kind of reassuring lie
+    # that costs someone an afternoon.
+    inbound_server = None
+    try:
+        from auto_apply import inbound
+
+        ready, why = inbound.readiness()
+        if ready:
+            wa_listener = inbound.WhatsAppCommandListener(controller)
+            inbound_server, _thread = inbound.serve_whatsapp_inbound(wa_listener)
+            print("  WhatsApp inbound: LIVE (webhook accepting commands).")
+        else:
+            print("  WhatsApp inbound: OFF — %s" % why)
+    except Exception as exc:
+        log.warning("WhatsApp inbound could not start: %s", exc)
+        print("  WhatsApp inbound: FAILED TO START — %s" % exc)
+
+    try:
+        if once:
+            batch = int((settings.raw.get("hitl", {}) or {}).get("poll_batch", 40))
+            executed = listener.poll_once(limit=batch)
+            print("  %d command(s) executed, %d message(s) inspected."
+                  % (executed, listener.stats.seen))
+            return 0
+        print("  Listening on Telegram Saved Messages. Reply 'done <id>' to "
+              "submit a draft, 'help' for the syntax. Ctrl-C to stop.")
+        listener.run_forever()
+        log.info(
+            "Listener stopped -- %d message(s) seen, %d command(s) executed.",
+            listener.stats.seen, listener.stats.executed,
+        )
+    finally:
+        if inbound_server is not None:
+            try:
+                inbound_server.shutdown()
+            except Exception:
+                pass
         store.close()
     return 0
 
@@ -559,6 +723,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="audit every source now and WhatsApp the report")
     mode.add_argument("--register", nargs="?", const="", metavar="PLATFORM",
                       help="assisted signup: pre-fills the form, you submit")
+    mode.add_argument("--provision", action="store_true",
+                      help="derive + vault credentials for every board (offline)")
+    mode.add_argument("--vault", action="store_true",
+                      help="show the credentials vault and the profile payload")
     mode.add_argument("--apply", action="store_true",
                       help="draft applications for the best matches")
     mode.add_argument("--applications", action="store_true",
@@ -567,6 +735,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="approve a draft and submit it")
     mode.add_argument("--decline", type=int, metavar="ID",
                       help="discard a draft")
+    mode.add_argument("--listen", action="store_true",
+                      help="watch Telegram Saved Messages for approvals/edits")
+    mode.add_argument("--listen-once", action="store_true",
+                      help="process new review replies once, then exit (cron)")
     mode.add_argument("--inbox", action="store_true",
                       help="scan the mailbox once for interview mail")
     mode.add_argument("--watch-inbox", action="store_true",
@@ -583,6 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how many applications --apply may draft at once")
     p.add_argument("--no-submit", action="store_true",
                    help="with --approve, approve only and do not submit")
+    p.add_argument("--reveal", action="store_true",
+                   help="with --vault, print the stored passwords in clear")
     p.add_argument("--keep-days", type=int, default=180,
                    help="retention window for --prune (default 180)")
     p.add_argument("--dry-run", action="store_true",
@@ -603,8 +777,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.threshold is not None:
         settings.raw.setdefault("engine", {})["match_threshold"] = args.threshold
 
-    # --stats never talks to the network, so it must not require credentials.
-    if not (args.stats or args.applications):
+    # These never talk to the network, so they must not require credentials.
+    if not (args.stats or args.applications or args.vault or args.provision):
         try:
             settings.require_valid()
         except ConfigError as exc:
@@ -619,6 +793,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stats(db)
         if args.applications:
             return cmd_applications()
+        if args.provision:
+            return cmd_provision()
+        if args.vault:
+            return cmd_vault(reveal=args.reveal)
         if args.register is not None:
             return cmd_register(args.register or None)
         if args.apply:
@@ -627,6 +805,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_approve(args.approve, submit=not args.no_submit)
         if args.decline:
             return cmd_decline(args.decline)
+        if args.listen or args.listen_once:
+            return cmd_listen(db, once=args.listen_once)
         if args.inbox or args.watch_inbox:
             return cmd_inbox(args.watch_inbox, args.interval)
         if args.digest:

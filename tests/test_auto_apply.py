@@ -270,10 +270,20 @@ class TestReviewMessages(unittest.TestCase):
             "salary_expectation": "12,000 AED",
         }
         msg = format_review_message(7, self._ev(), draft, "tanqeeb:uae")
-        self.assertIn("[#7]", msg)
+        # The reference the user quotes back. It is printed identically on both
+        # channels because "done 7" resolves against it, and an id that differs
+        # between cards is an id that submits the wrong application.
+        self.assertIn("[DRAFT #7]", msg)
         self.assertIn("Etisalat", msg)
+        self.assertIn("VoIP Engineer", msg)
+        self.assertIn("tanqeeb:uae", msg)
+        self.assertIn("88%", msg)
         self.assertIn("Years with SIP?", msg)
         self.assertIn("12,000 AED", msg)
+        # Both ways of answering it, because the card is read on a phone far
+        # more often than next to a terminal.
+        self.assertIn("done 7", msg)
+        self.assertIn("موافق 7", msg)
         self.assertIn("--approve 7", msg)
         self.assertIn("--decline 7", msg)
 
@@ -293,8 +303,11 @@ class TestReviewMessages(unittest.TestCase):
             "company": "Etisalat", "role": "VoIP Engineer",
             "platform": "tanqeeb", "screenshot_path": "/tmp/shot.png",
         })
-        self.assertIn("[#9]", msg)
-        self.assertIn("Screenshot saved", msg)
+        self.assertIn("[DRAFT #9]", msg)
+        self.assertIn("screenshot saved", msg)
+        self.assertIn("shot.png", msg)
+        self.assertNotIn("/tmp/", msg,
+                         "the card should name the file, not the whole path")
 
     def test_submitted_message_is_honest_when_no_screenshot(self):
         from auto_apply.engine import format_submitted_message

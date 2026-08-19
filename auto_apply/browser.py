@@ -30,8 +30,16 @@ log = logging.getLogger(__name__)
 SCREENSHOT_DIR = ROOT / "screenshots"
 SESSION_DIR = ROOT / "state" / "browser_sessions"
 
-# Semantic field -> substrings that identify it, most specific first.
+# Semantic field -> substrings that identify it.
+#
+# ORDER IS SIGNIFICANT: the groups run most-specific to most-generic, and
+# `_classify` returns the FIRST group that matches. See its docstring for why
+# that beats picking the longest matching substring.
 FIELD_PATTERNS: dict[str, tuple[str, ...]] = {
+    # Before "email" on purpose: several boards label the sign-in handle
+    # "username or email", and that field wants the handle, not the address.
+    "username":         ("username", "user name", "login id", "handle",
+                         "screen name", "اسم المستخدم"),
     "email":            ("e-mail", "email", "بريد"),
     "phone":            ("mobile", "phone", "tel", "whatsapp", "هاتف", "جوال", "موبايل"),
     "first_name":       ("first name", "given name", "الاسم الاول"),
@@ -41,13 +49,33 @@ FIELD_PATTERNS: dict[str, tuple[str, ...]] = {
     "salary":           ("salary", "expected pay", "compensation", "expected ctc",
                          "الراتب", "الأجر"),
     "notice_period":    ("notice period", "availability", "start date", "متى يمكنك"),
-    "years_experience": ("years of experience", "experience years", "سنوات الخبرة"),
+    # Deliberately NOT a bare "experience": "Describe your experience with
+    # Asterisk" is a screening question for the model to answer, and matching
+    # it here would type the number 3 into a free-text box.
+    "years_experience": ("years of experience", "years experience",
+                         "yearsexperience", "experience years",
+                         "total experience", "yrs experience",
+                         "experience in years", "سنوات الخبرة"),
     "current_title":    ("current title", "job title", "current position",
                          "المسمى الوظيفي"),
     "current_employer": ("current company", "current employer", "employer",
                          "الشركة الحالية"),
     "location":         ("location", "city", "address", "المدينة", "الموقع"),
     "linkedin":         ("linkedin",),
+    # Profile-building fields. These only appear on REGISTRATION forms, and
+    # they are the ones that make a profile look finished to a recruiter --
+    # leaving them blank is the difference between a real profile and a stub.
+    # Both sit ahead of `cover_letter` because "about you" and "professional
+    # summary" would otherwise be swallowed by its "additional information".
+    # No "job title" needle here: `current_title` owns that, and it runs first.
+    "headline":         ("headline", "professional title", "profile title",
+                         "tagline", "المسمى المهني"),
+    # NOT "about you": it matches inside "Tell us about your most difficult
+    # outage", which is a screening question for the model to answer, and
+    # filling it with the CV summary answers a question nobody asked.
+    "bio":              ("bio", "biography", "about yourself",
+                         "professional summary", "career summary", "objective",
+                         "personal statement", "نبذة", "الملخص المهني"),
     "cover_letter":     ("cover letter", "motivation", "why do you", "message",
                          "additional information", "خطاب", "لماذا"),
     "resume":           ("resume", "cv", "curriculum", "attach", "upload",
@@ -77,17 +105,73 @@ class FormField:
         )
 
 
+# Punctuation that separates words inside a form's own naming, rather than
+# carrying meaning. `candidate[cover_letter]`, `applicant-email` and
+# `notice.period` are all ordinary conventions for a `name` attribute, and
+# `_label_for` feeds those attributes straight in -- so without folding them to
+# spaces, the space-separated patterns above match none of them. That is not a
+# corner case: snake_case IS the convention for HTML name attributes, so a form
+# whose inputs carry no visible <label> was classified almost entirely as
+# `unknown` and every field on it went to Gemini as a free-text question.
+_LABEL_SEPARATORS = re.compile(r"[\s_\-\[\]().:;,/\\|]+")
+
+
+def _fold_label(text: str | None) -> str:
+    return _LABEL_SEPARATORS.sub(" ", (text or "").lower()).strip()
+
+
+#: Below this length, a single Latin word is matched as a WHOLE TOKEN rather
+#: than as a substring. Substring matching is what lets `emailAddress` (which
+#: folds to one word) resolve at all, but on a short needle it is a liability:
+#: "tel" matches inside "Tell us about your most difficult outage", and "city"
+#: matches inside "capacity". Both were live misclassifications -- the first
+#: put the candidate's phone number into a free-text essay box.
+_SHORT_NEEDLE = 4
+
+
+def _token_only(needle: str) -> bool:
+    return (len(needle) <= _SHORT_NEEDLE
+            and needle.isascii() and needle.isalpha())
+
+
+#: The patterns, folded the same way the label is, longest first within each
+#: group, each paired with how it must be matched. Precomputed because
+#: `inspect_form` calls `_classify` once per input on the page.
+_FOLDED_PATTERNS: dict[str, tuple[tuple[str, bool], ...]] = {
+    kind: tuple(
+        (needle, _token_only(needle))
+        for needle in sorted(
+            {_fold_label(n) for n in needles if _fold_label(n)},
+            key=len, reverse=True,
+        )
+    )
+    for kind, needles in FIELD_PATTERNS.items()
+}
+
+
 def _classify(haystack: str) -> str:
-    blob = re.sub(r"\s+", " ", (haystack or "").lower())
+    """Name the semantic field this label describes, or "unknown".
+
+    Matching is by GROUP PRIORITY, not by longest substring. Longest-substring
+    was the obvious rule and it is wrong in a way that costs real data: the
+    label "Email address" contains both "email" (5) and location's "address"
+    (7), so the longer one won and the form got the candidate's city typed into
+    the email box. Priority ordering has no such failure -- a label is
+    classified by the most specific concept it mentions, and the table is
+    written most-specific-first for exactly that reason.
+
+    Within one group the needles are tried longest-first, which is what keeps
+    "الاسم الاول" from being read as the bare "الاسم".
+    """
+    blob = _fold_label(haystack)
     if not blob:
         return "unknown"
-    # Longest pattern first, so "first name" beats "name".
-    best, best_len = "unknown", 0
-    for kind, needles in FIELD_PATTERNS.items():
-        for needle in needles:
-            if needle in blob and len(needle) > best_len:
-                best, best_len = kind, len(needle)
-    return best
+    padded = f" {blob} "
+    for kind, needles in _FOLDED_PATTERNS.items():
+        for needle, whole_token in needles:
+            if f" {needle} " in padded if whole_token else needle in blob:
+                return kind
+    return "unknown"
 
 
 def timestamped_screenshot_path(prefix: str) -> Path:
@@ -106,15 +190,88 @@ def playwright_available() -> bool:
         return False
 
 
-@contextmanager
-def browser_page(
-    platform: str = "default", headed: bool | None = None
-) -> Iterator[Any]:
-    """Yield a Playwright page with a persistent per-platform session.
+def platform_slug(platform: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(platform or "default").lower()).strip("_") \
+        or "default"
 
-    Persistence matters: a login survives between runs, so the bot signs in
-    once rather than repeatedly submitting credentials -- which is both slower
-    and exactly the pattern that trips anti-automation heuristics.
+
+def storage_state_path(platform: str) -> Path:
+    """Where this board's authenticated cookies live.
+
+    A separate, portable artefact from the Chromium profile directory. The
+    profile already persists a login on THIS machine; the state file is the
+    part you can inspect, back up, delete when a board logs you out, and copy
+    to another machine. Both are secrets -- they are a logged-in session -- so
+    they live under `secrets/` and are git-ignored like the vault.
+    """
+    configured = (settings.raw.get("auto_apply", {}) or {}).get("session_dir")
+    base = Path(configured) if configured else Path("secrets/sessions")
+    if not base.is_absolute():
+        base = ROOT / base
+    return base / f"{platform_slug(platform)}_state.json"
+
+
+def has_saved_session(platform: str) -> bool:
+    path = storage_state_path(platform)
+    try:
+        return path.exists() and path.stat().st_size > 2
+    except OSError:
+        return False
+
+
+def save_storage_state(context: Any, platform: str) -> str:
+    """Bank the authenticated cookies. Returns the path, or "" on failure.
+
+    Called after YOU have signed in (or solved the CAPTCHA and submitted), so
+    the next `--apply` opens the board's pages as a logged-in candidate and
+    sees the real application form instead of the public landing page.
+    """
+    path = storage_state_path(platform)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = path.parent / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n", encoding="utf-8")
+        context.storage_state(path=str(path))
+        try:                                    # best effort; POSIX only
+            path.chmod(0o600)
+        except OSError:
+            pass
+        log.info("Saved the authenticated %s session to %s", platform, path)
+        return str(path)
+    except Exception as exc:
+        log.warning("Could not save the %s session: %s", platform, exc)
+        return ""
+
+
+def clear_storage_state(platform: str) -> bool:
+    path = storage_state_path(platform)
+    if path.exists():
+        path.unlink()
+        log.info("Cleared the saved %s session.", platform)
+        return True
+    return False
+
+
+@contextmanager
+def browser_context(
+    platform: str = "default", headed: bool | None = None,
+    use_state: bool = True,
+) -> Iterator[Any]:
+    """Yield (context, page) for one board, signed in if we have a session.
+
+    TWO LAYERS OF PERSISTENCE, and they do different jobs:
+
+      * `user_data_dir` -- a real Chromium profile. Keeps the login on THIS
+        machine and carries the things cookies alone do not (localStorage,
+        service workers, the device fingerprint a board remembers you by).
+      * `storage_state` -- a JSON cookie snapshot, loaded on top. Portable,
+        inspectable, and the thing that survives a wiped profile directory.
+
+    Loading the state on top of the profile is deliberate belt-and-braces:
+    whichever of the two is fresher wins, and a board that logged the profile
+    out can be recovered by re-importing the state rather than signing in
+    again.
     """
     if not playwright_available():
         raise RuntimeError(
@@ -127,8 +284,9 @@ def browser_page(
 
     cfg = settings.raw.get("auto_apply", {}) or {}
     show = cfg.get("headed", True) if headed is None else headed
-    profile_dir = SESSION_DIR / re.sub(r"[^A-Za-z0-9_-]+", "_", platform.lower())
+    profile_dir = SESSION_DIR / platform_slug(platform)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    state = storage_state_path(platform)
 
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
@@ -140,14 +298,39 @@ def browser_page(
             args=["--disable-blink-features=AutomationControlled"],
         )
         context.set_default_timeout(int(cfg.get("page_timeout", 45)) * 1000)
+
+        if use_state and has_saved_session(platform):
+            try:
+                import json as _json
+
+                cookies = _json.loads(state.read_text(encoding="utf-8"))
+                if cookies.get("cookies"):
+                    context.add_cookies(cookies["cookies"])
+                    log.info("Restored %d saved cookie(s) for %s.",
+                             len(cookies["cookies"]), platform)
+            except Exception as exc:
+                log.warning("Saved %s session could not be restored (%s); "
+                            "continuing signed out.", platform, exc)
+
         page = context.pages[0] if context.pages else context.new_page()
         try:
-            yield page
+            yield context, page
         finally:
             try:
                 context.close()
             except Exception:
                 pass
+
+
+@contextmanager
+def browser_page(
+    platform: str = "default", headed: bool | None = None,
+    use_state: bool = True,
+) -> Iterator[Any]:
+    """Yield just the page. The common case; `browser_context` when you need
+    the context itself (to save the session after a login)."""
+    with browser_context(platform, headed=headed, use_state=use_state) as (_ctx, page):
+        yield page
 
 
 def _label_for(page: Any, handle: Any) -> str:
@@ -298,6 +481,55 @@ def looks_like_application_form(fields: list[FormField]) -> tuple[bool, str]:
     )
 
 
+# Markers that mean a human challenge stands between us and the submit button.
+# Matched against page markup rather than rendered text: reCAPTCHA and Turnstile
+# render inside a cross-origin iframe whose text we cannot read, but the iframe
+# itself is always in the DOM.
+_CAPTCHA_MARKERS: tuple[tuple[str, str], ...] = (
+    ("g-recaptcha", "Google reCAPTCHA"),
+    ("recaptcha/api", "Google reCAPTCHA"),
+    ("hcaptcha", "hCaptcha"),
+    ("cf-turnstile", "Cloudflare Turnstile"),
+    ("challenges.cloudflare.com", "Cloudflare challenge"),
+    ("funcaptcha", "FunCaptcha / Arkose"),
+    ("arkoselabs", "FunCaptcha / Arkose"),
+    ("geetest", "GeeTest"),
+    ("data-sitekey", "a CAPTCHA widget"),
+    ("captcha", "a CAPTCHA"),
+    ("أنا لست روبوت", "a CAPTCHA"),
+    ("i'm not a robot", "a CAPTCHA"),
+)
+
+
+def detect_captcha(page: Any) -> tuple[bool, str]:
+    """Is a human-verification challenge on this page?
+
+    This runs BEFORE the submit click, and a positive result stops the flow.
+    The reason is the failure mode it prevents, which is the same one
+    `looks_like_application_form` exists for: clicking "submit" underneath an
+    unsolved CAPTCHA does not raise. The page re-renders with an error, the
+    screenshot captures that error page, and the application is banked as
+    `submitted`. The user then waits for a reply to something that was never
+    delivered -- which is strictly worse than a recorded failure, because it
+    looks like success.
+
+    Never raises: an inspection that cannot run must not be able to block a
+    submission that would otherwise have worked.
+    """
+    try:
+        markup = page.content() or ""
+    except Exception as exc:
+        log.debug("Could not read the page for CAPTCHA detection: %s", exc)
+        return False, ""
+
+    haystack = markup.lower()
+    for needle, name in _CAPTCHA_MARKERS:
+        if needle.lower() in haystack:
+            log.warning("CAPTCHA detected on the application page: %s.", name)
+            return True, name
+    return False, ""
+
+
 def fill_field(page: Any, field_: FormField, value: str) -> bool:
     """Fill one field. Returns False rather than raising on any failure."""
     if not value:
@@ -315,6 +547,190 @@ def fill_field(page: Any, field_: FormField, value: str) -> bool:
     except Exception as exc:
         log.debug("Could not fill %s (%s): %s", field_.kind, field_.selector, exc)
         return False
+
+
+# Selectors tried in order to find the form's own submit control. Bilingual,
+# because half these boards render in Arabic.
+SUBMIT_SELECTORS: tuple[str, ...] = (
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Apply")',
+    'button:has-text("Submit")',
+    'button:has-text("Register")',
+    'button:has-text("Sign up")',
+    'button:has-text("Create account")',
+    'button:has-text("تقديم")',
+    'button:has-text("إرسال")',
+    'button:has-text("تسجيل")',
+    'button:has-text("إنشاء حساب")',
+)
+
+
+def click_submit(page: Any, timeout_ms: int = 5000) -> str:
+    """Press the form's own submit control. Returns the selector, or "".
+
+    Shared between registration and application on purpose: they were two
+    separate lists that had already drifted -- the application flow knew the
+    Arabic "تقديم" and the registration flow knew none of it, so an
+    Arabic-rendered signup page had no submit button as far as the bot was
+    concerned.
+    """
+    for selector in SUBMIT_SELECTORS:
+        try:
+            page.click(selector, timeout=timeout_ms)
+            log.info("Submitted via %s", selector)
+            return selector
+        except Exception:
+            continue
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Applicant tracking systems
+# ---------------------------------------------------------------------------
+# Most real application forms are not built by the job board -- they are an
+# embedded ATS, and each one has its own shape. Knowing WHICH one is on the
+# page is what turns "a form" into "a form I know is multi-step and where the
+# CV upload is behind a button rather than an <input type=file>".
+ATS_MARKERS: tuple[tuple[str, str], ...] = (
+    ("myworkdayjobs.com", "workday"),
+    ("workday", "workday"),
+    ("greenhouse.io", "greenhouse"),
+    ("grnhse", "greenhouse"),
+    ("lever.co", "lever"),
+    ("smartrecruiters", "smartrecruiters"),
+    ("taleo.net", "taleo"),
+    ("taleo", "taleo"),
+    ("icims.com", "icims"),
+    ("successfactors", "successfactors"),
+    ("ashbyhq.com", "ashby"),
+    ("bamboohr.com", "bamboohr"),
+    ("recruitee.com", "recruitee"),
+    ("workable.com", "workable"),
+    ("jobvite", "jobvite"),
+)
+
+#: ATSes whose application is a WIZARD, not one page. Submitting these means
+#: walking "Next" until the final button appears.
+MULTI_STEP_ATS = frozenset({"workday", "taleo", "icims", "successfactors",
+                            "smartrecruiters"})
+
+
+def detect_ats(page: Any) -> str:
+    """Name the applicant tracking system behind this page, or "".
+
+    Checks the URL first -- it is the strongest signal and cannot be faked by
+    page copy -- then the markup, which catches an ATS embedded in an iframe on
+    the employer's own domain.
+    """
+    try:
+        url = str(getattr(page, "url", "") or "").lower()
+    except Exception:
+        url = ""
+    for needle, name in ATS_MARKERS:
+        if needle in url:
+            return name
+    try:
+        markup = (page.content() or "").lower()
+    except Exception:
+        return ""
+    for needle, name in ATS_MARKERS:
+        if needle in markup:
+            return name
+    return ""
+
+
+# Controls that move a wizard FORWARD without finishing it. Kept strictly
+# separate from SUBMIT_SELECTORS: clicking "Submit" when you meant "Next"
+# files a half-empty application, which is unrecoverable.
+NEXT_SELECTORS: tuple[str, ...] = (
+    'button:has-text("Save and Continue")',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+    'button:has-text("Save & Continue")',
+    'button[data-automation-id="bottom-navigation-next-button"]',
+    'a:has-text("Continue")',
+    'button:has-text("التالي")',
+    'button:has-text("متابعة")',
+)
+
+
+def has_submit(page: Any) -> bool:
+    """Is a real submit control present on THIS page of the form?
+
+    The wizard walker uses this to know when to stop advancing. It only looks
+    -- it never clicks -- because the difference between "Next" and "Submit" is
+    the difference between filling page two and filing a half-empty
+    application in someone's name.
+    """
+    for selector in SUBMIT_SELECTORS:
+        try:
+            if page.query_selector(selector) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def click_next(page: Any, timeout_ms: int = 4000) -> str:
+    """Advance one page of a multi-step form. Returns the selector, or ""."""
+    for selector in NEXT_SELECTORS:
+        try:
+            page.click(selector, timeout=timeout_ms)
+            log.info("Advanced the form via %s", selector)
+            return selector
+        except Exception:
+            continue
+    return ""
+
+
+def attach_cv(page: Any, field_: "FormField | None", cv_path: str) -> bool:
+    """Put the CV into the page, whichever way this form accepts one.
+
+    Three routes, tried in order, because "upload your CV" is rendered three
+    different ways in the wild:
+
+      1. A real `<input type=file>` -- `set_input_files` on its selector.
+      2. A hidden input behind a styled button -- `set_input_files` on the
+         first file input on the page, ignoring the visible control entirely.
+      3. A button that opens the OS file chooser with no input to target --
+         caught with `expect_file_chooser`.
+
+    Route 2 is the one that matters most in practice: Greenhouse, Lever and
+    almost every modern ATS hide the real input and style a <div> over it, so
+    matching on the visible label alone finds a button that cannot be filled.
+    """
+    if not cv_path:
+        return False
+
+    if field_ is not None:
+        try:
+            page.set_input_files(field_.selector, cv_path, timeout=15000)
+            return True
+        except Exception as exc:
+            log.debug("CV upload via the detected field failed: %s", exc)
+
+    try:
+        page.set_input_files('input[type="file"]', cv_path, timeout=8000)
+        log.info("Attached the CV to the page's hidden file input.")
+        return True
+    except Exception as exc:
+        log.debug("CV upload via the first file input failed: %s", exc)
+
+    for selector in ('button:has-text("Upload")', 'button:has-text("Attach")',
+                     'label:has-text("Resume")', 'button:has-text("Resume")',
+                     'button:has-text("CV")'):
+        try:
+            with page.expect_file_chooser(timeout=5000) as chooser_info:
+                page.click(selector, timeout=4000)
+            chooser_info.value.set_files(cv_path)
+            log.info("Attached the CV through the file chooser (%s).", selector)
+            return True
+        except Exception:
+            continue
+
+    log.warning("Could not attach the CV by any route.")
+    return False
 
 
 def capture_evidence(page: Any, prefix: str) -> str:

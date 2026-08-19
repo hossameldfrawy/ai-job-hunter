@@ -290,9 +290,23 @@ class GeminiEvaluator:
             else list(self.models)
         )
         errors: list[str] = []
+        # Whether any model in the chain refused for QUOTA reasons specifically.
+        # This has to survive the loop. `QuotaExhausted` is a `GeminiError`, so
+        # a single `except GeminiError` swallowed it here and re-raised a plain
+        # GeminiError at the bottom -- which meant `evaluate()`'s
+        # `except QuotaExhausted` short-circuit was unreachable code, and every
+        # remaining batch waited out four backoffs against a quota that would
+        # not clear for hours. Roughly 20 minutes of stalling against a
+        # 25-minute job timeout, for a run that could not have succeeded.
+        quota_blocked = False
         for model in chain:
             try:
                 payload = self._post(model, body)
+            except QuotaExhausted as exc:
+                quota_blocked = True
+                errors.append(f"{model}: {exc}")
+                log.warning("Gemini model %s is out of quota -- trying next.", model)
+                continue
             except GeminiError as exc:
                 errors.append(f"{model}: {exc}")
                 log.warning("Gemini model %s unavailable -- trying next.", model)
@@ -302,7 +316,13 @@ class GeminiEvaluator:
             with self._counter_lock:
                 self.tokens_used += int(usage.get("totalTokenCount") or 0)
             return payload, model
-        raise GeminiError("every model in the chain failed -> " + " | ".join(errors))
+
+        detail = "every model in the chain failed -> " + " | ".join(errors)
+        # Only when NOTHING answered: a quota-blocked model that another model
+        # covers for is not an exhausted run.
+        if quota_blocked:
+            raise QuotaExhausted(detail)
+        raise GeminiError(detail)
 
     # -- parsing ------------------------------------------------------------
     @staticmethod
@@ -333,6 +353,19 @@ class GeminiEvaluator:
                     return json.loads(match.group(0))
                 except json.JSONDecodeError:
                     pass
+            if finish == "MAX_TOKENS":
+                # Name the cause. A response cut off mid-string is not
+                # "unparseable JSON" in any way the reader can act on -- it is
+                # a token budget that was too small, and saying so is the
+                # difference between a fix and an afternoon. Seen live on an
+                # Arabic cover letter, which costs ~3x the tokens of the
+                # equivalent English.
+                raise GeminiError(
+                    f"response truncated at the {len(text)}-character mark "
+                    f"(finishReason=MAX_TOKENS) -- raise maxOutputTokens for "
+                    f"this call; Arabic output needs roughly 3x the budget of "
+                    f"English: {text[:120]}"
+                )
             raise GeminiError(f"unparseable JSON: {text[:200]}")
 
     # -- public API ---------------------------------------------------------

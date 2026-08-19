@@ -21,6 +21,7 @@ Run:  python -m pytest tests/test_no_real_sends.py -v
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import sys
@@ -47,6 +48,24 @@ if not REAL:
         "Running them under `unittest discover` skips the transport stubs and "
         "the socket block, and the suite will message your real accounts."
     )
+
+
+@contextlib.contextmanager
+def _real_callmebot():
+    """Put the genuine `_send_callmebot` back for the duration of a test.
+
+    The suite replaces it with a recorder so the WhatsApp half of every
+    dual-channel card can be asserted on. Anything proving that the PRODUCTION
+    code honours DRY_RUN has to reach past that recorder, or it proves only
+    that the recorder works -- which is the exact class of mistake this file
+    exists to catch.
+    """
+    stub = WhatsAppNotifier._send_callmebot
+    WhatsAppNotifier._send_callmebot = REAL["_send_callmebot"]
+    try:
+        yield
+    finally:
+        WhatsAppNotifier._send_callmebot = stub
 
 
 def _eval(fingerprint: str = "fp-nosend") -> Evaluation:
@@ -94,8 +113,120 @@ class TestProductionCodeHonoursDryRun(unittest.TestCase):
             tuc.build_client = original
         self.assertEqual(calls, [], "dry_run reached the transport layer")
 
+    def test_real_send_photo_returns_without_uploading(self):
+        """The evidence screenshot rides the same guard as the text card."""
+        ok, detail = REAL["send_photo_via_telegram"](
+            self.n, "screenshots/20260819-101500_app7.png", "[DRAFT #7]"
+        )
+        self.assertTrue(ok, "a dry run should report success, not failure")
+        self.assertEqual(
+            detail, "dry_run",
+            "send_photo_via_telegram must short-circuit on dry_run BEFORE it "
+            "builds a Telethon client -- it is a second route to the same "
+            "Saved Messages inbox, so it needs the same guard",
+        )
+
+    def test_real_send_callmebot_delivers_nothing_on_a_dry_run(self):
+        """The WhatsApp leg, proven against the real method.
+
+        `_send_callmebot` is stubbed for the rest of the suite so tests can
+        read the WhatsApp card. That makes THIS assertion the only place the
+        production guard is actually exercised, so it drives the stashed
+        original and watches the transport underneath it.
+        """
+        import http_client
+
+        attempts = []
+
+        def tripwire(url, *args, **kwargs):
+            attempts.append(url)
+            raise AssertionError("CallMeBot was called during a dry run")
+
+        original = http_client.get
+        http_client.get = tripwire
+        try:
+            ok, detail = REAL["_send_callmebot"](self.n, "🚨 job card")
+        finally:
+            http_client.get = original
+        self.assertTrue(ok)
+        self.assertEqual(detail, "dry_run")
+        self.assertEqual(attempts, [], "dry_run reached the HTTP transport")
+
+    def test_the_telegram_senders_work_from_inside_a_running_event_loop(self):
+        """Regression, found in production.
+
+        `asyncio.run()` RAISES when a loop is already running in this thread,
+        and the coroutine it was given is then never awaited. The poll-mode
+        review listener calls the notifier from inside its own loop, so every
+        Telegram reply failed with "telegram fallback failed: RuntimeError"
+        while WhatsApp went out perfectly -- the user saw half a conversation
+        and the log line said "delivered".
+        """
+        import asyncio
+        import warnings
+
+        async def from_inside_a_loop():
+            return (
+                REAL["send_via_telegram"](self.n, "reply from the poll loop"),
+                REAL["send_photo_via_telegram"](self.n, "/x/shot.png", "cap"),
+            )
+
+        with warnings.catch_warnings():
+            # An un-awaited coroutine surfaces as a RuntimeWarning; -W error
+            # would turn the old bug into a failure here rather than a silent
+            # wrong answer, so make sure it cannot be filtered away.
+            warnings.simplefilter("error", RuntimeWarning)
+            (text_ok, text_detail), (photo_ok, photo_detail) = asyncio.run(
+                from_inside_a_loop()
+            )
+
+        self.assertTrue(text_ok)
+        self.assertEqual(text_detail, "dry_run")
+        self.assertTrue(photo_ok)
+        self.assertEqual(photo_detail, "dry_run")
+
+    def test_the_loop_safe_runner_returns_the_coroutines_value(self):
+        import asyncio
+
+        from notifier import _run_coroutine
+
+        async def answer():
+            return 42
+
+        self.assertEqual(_run_coroutine(answer), 42)
+
+        async def outer():
+            return _run_coroutine(answer)
+
+        self.assertEqual(asyncio.run(outer()), 42,
+                         "the value was lost when a loop was already running")
+
+    def test_the_loop_safe_runner_propagates_failures(self):
+        import asyncio
+
+        from notifier import _run_coroutine
+
+        async def explode():
+            raise ValueError("boom")
+
+        with self.assertRaises(ValueError):
+            _run_coroutine(explode)
+
+        async def outer():
+            return _run_coroutine(explode)
+
+        with self.assertRaises(ValueError):
+            asyncio.run(outer())
+
     def test_real_send_raw_delivers_on_neither_channel(self):
-        ok, detail = REAL["send_raw"](self.n, "digest part 1/2")
+        """CallMeBot first, Telegram fallback -- neither may deliver.
+
+        Both legs are restored from the stash: `send_raw` calls
+        `_send_callmebot` through `self`, so leaving the recorder in place
+        would prove only that the recorder returns success.
+        """
+        with _real_callmebot():
+            ok, detail = REAL["send_raw"](self.n, "digest part 1/2")
         self.assertTrue(ok)
         self.assertEqual(detail, "dry_run")
 
@@ -176,6 +307,35 @@ class TestHarnessIsArmed(unittest.TestCase):
         with self.assertRaises(NetworkBlockedInTests):
             http_client.get("https://api.callmebot.com/whatsapp.php?text=hi")
 
+    def test_a_real_browser_cannot_be_launched(self):
+        """A Chromium is not a socket, so the network block never saw it.
+
+        A harness that stubbed `browser_page` but not `browser_context` drove a
+        live job board for two seconds on every run and passed while doing it.
+        """
+        from auto_apply.browser import playwright_available
+
+        if not playwright_available():
+            self.skipTest("Playwright is not installed on this machine")
+        import playwright.sync_api as pw
+
+        with self.assertRaises(NetworkBlockedInTests):
+            pw.sync_playwright()
+
+    def test_the_apply_flow_cannot_reach_a_real_browser(self):
+        """Both entry points, since stubbing one and not the other is the bug."""
+        from auto_apply.browser import playwright_available
+
+        if not playwright_available():
+            self.skipTest("Playwright is not installed on this machine")
+        import auto_apply.browser as browser_mod
+
+        for opener in (browser_mod.browser_context, browser_mod.browser_page):
+            with self.subTest(opener=opener.__name__):
+                with self.assertRaises(NetworkBlockedInTests):
+                    with opener("tanqeeb"):
+                        pass
+
     def test_real_credentials_are_not_visible_to_tests(self):
         """A stray call must authenticate as nobody, not as the user."""
         self.assertEqual(os.environ.get("TELEGRAM_STRING_SESSION"), "")
@@ -198,26 +358,147 @@ class TestHarnessIsArmed(unittest.TestCase):
 
 
 class TestEveryTelegramCallSiteIsGuarded(unittest.TestCase):
-    """One guard protects six call sites -- so it must stay the only route."""
+    """One guard protects every call site -- so it must stay the only route."""
 
-    def test_no_module_bypasses_send_via_telegram(self):
-        """Nothing may call Telethon's send_message except the notifier."""
+    #: Modules that legitimately hold a Telethon client. Everything else has to
+    #: go through the notifier, which is where the DRY_RUN guard lives.
+    ALLOWED = (
+        "notifier.py", "telegram_user_client.py", "auth_telegram.py",
+        "check_telegram.py", "setup_wizard.py",
+    )
+
+    def _offenders(self, needle: str) -> list[str]:
         root = Path(__file__).resolve().parent.parent
-        offenders = []
+        found = []
         for path in root.rglob("*.py"):
             parts = set(path.parts)
             if parts & {"tests", ".venv", "venv", "__pycache__"}:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            if "send_message(" in text and path.name not in (
-                "notifier.py", "telegram_user_client.py", "auth_telegram.py",
-                "check_telegram.py", "setup_wizard.py",
-            ):
-                offenders.append(str(path.relative_to(root)))
+            if needle in text and path.name not in self.ALLOWED:
+                found.append(str(path.relative_to(root)))
+        return found
+
+    def test_no_module_bypasses_send_via_telegram(self):
+        """Nothing may call Telethon's send_message except the notifier."""
         self.assertEqual(
-            offenders, [],
+            self._offenders("send_message("), [],
             "these modules reach Telegram without going through "
             "WhatsAppNotifier.send_via_telegram, so they ignore DRY_RUN",
+        )
+
+    def test_no_module_uploads_a_file_to_telegram_directly(self):
+        """The evidence screenshot is a SECOND route into the same inbox.
+
+        `send_file` bypasses `send_message` entirely, so the original scan
+        would not have caught a module pushing screenshots to the user's Saved
+        Messages on every test run.
+        """
+        self.assertEqual(
+            self._offenders("send_file("), [],
+            "these modules upload to Telegram without going through "
+            "WhatsAppNotifier.send_photo_via_telegram, so they ignore DRY_RUN",
+        )
+
+
+class TestTheReviewFlowCannotReachTheUser(unittest.TestCase):
+    """The HITL engine is the newest, chattiest source of outbound traffic.
+
+    It emits a card when a draft is prepared, another after every edit, a
+    confirmation with a screenshot on submission, and a reply to `status` and
+    `help`. All of it lands in the same Saved Messages inbox the suite once
+    spammed, so it gets the same proof.
+    """
+
+    def setUp(self):
+        from vault import SecureStore
+
+        self.store = SecureStore(Path(tempfile.mkdtemp()) / "review.db")
+        self.notifier = WhatsAppNotifier(None)
+        self.notifier.dry_run = True
+        OUTBOX.clear()
+
+    def tearDown(self):
+        self.store.close()
+
+    def _draft(self):
+        return self.store.record_application(
+            job_fingerprint="fp-nosend", job_id=101, company="Etisalat",
+            role="VoIP Engineer", platform="tanqeeb:uae",
+            job_url="https://uae.tanqeeb.com/1.html",
+            payload={"fields": {}, "field_map": [], "draft": {},
+                     "form_ok": True},
+            cover_letter="A letter", status="review_pending",
+        )
+
+    def test_a_review_card_is_recorded_on_both_channels_and_delivered_on_none(self):
+        from auto_apply.review import DraftCard, dispatch_review
+
+        dispatch_review(self.notifier,
+                        DraftCard.from_row(self.store.get_application(self._draft())))
+        self.assertEqual(len(OUTBOX.telegram), 1)
+        self.assertEqual(len(OUTBOX.whatsapp), 1)
+        self.assertEqual(OUTBOX.http, [], "an outbound HTTP call was attempted")
+
+    def test_send_dual_honours_dry_run_on_the_real_transports(self):
+        """Both legs of the real method, with the recorders lifted."""
+        import http_client
+
+        attempts = []
+        original_get = http_client.get
+        http_client.get = lambda url, *a, **k: attempts.append(url)
+        stub_tg = WhatsAppNotifier.send_via_telegram
+        stub_wa = WhatsAppNotifier._send_callmebot
+        stub_photo = WhatsAppNotifier.send_photo_via_telegram
+        WhatsAppNotifier.send_via_telegram = REAL["send_via_telegram"]
+        WhatsAppNotifier._send_callmebot = REAL["_send_callmebot"]
+        WhatsAppNotifier.send_photo_via_telegram = REAL["send_photo_via_telegram"]
+        try:
+            result = self.notifier.send_dual("full card", "short card",
+                                             photo="/nonexistent/shot.png")
+        finally:
+            http_client.get = original_get
+            WhatsAppNotifier.send_via_telegram = stub_tg
+            WhatsAppNotifier._send_callmebot = stub_wa
+            WhatsAppNotifier.send_photo_via_telegram = stub_photo
+
+        self.assertTrue(result.telegram_ok)
+        self.assertTrue(result.whatsapp_ok)
+        self.assertEqual(result.telegram_detail, "dry_run")
+        self.assertEqual(result.whatsapp_detail, "dry_run")
+        self.assertEqual(result.photo_detail, "dry_run")
+        self.assertEqual(attempts, [], "dry_run reached CallMeBot")
+
+    def test_the_controller_answers_through_the_notifier_only(self):
+        from auto_apply.control import ReviewController
+
+        controller = ReviewController(self.store, self.notifier,
+                                      submit_fn=lambda *a, **k: True,
+                                      approve_fn=lambda app_id, store: True)
+        self._draft()
+        controller.handle("status")
+        controller.handle("help")
+        self.assertTrue(OUTBOX.telegram, "the reply never reached the recorder")
+        self.assertEqual(OUTBOX.http, [])
+
+    def test_the_listener_ignores_its_own_cards_in_this_very_process(self):
+        """Belt and braces: the loop that could message the user is the same
+        loop that reads her Saved Messages."""
+        from auto_apply.control import ReviewController, TelegramCommandListener
+        from auto_apply.review import BOT_MARK
+
+        listener = TelegramCommandListener(
+            ReviewController(self.store, self.notifier,
+                             submit_fn=lambda *a, **k: True),
+            owner_id=None, max_age_minutes=0,
+        )
+        app_id = self._draft()
+        self.assertIsNone(listener.handle_message(
+            f"{BOT_MARK}done {app_id}"
+        ))
+        self.assertEqual(
+            self.store.get_application(app_id)["status"], "review_pending",
+            "the bot submitted an application by reading its own card",
         )
 
 

@@ -68,6 +68,44 @@ _FAILURE_HINTS = (
 
 
 @dataclass(slots=True)
+class DualResult:
+    """The outcome of one event sent down BOTH channels.
+
+    Kept separate from `DispatchResult` (which counts a whole batch of job
+    alerts) because the HITL review flow sends ONE event at a time and the
+    caller needs to know which channel carried it: the WhatsApp card points at
+    the Telegram card by reference, so "Telegram failed but WhatsApp went" is a
+    materially different state from "both went".
+    """
+
+    telegram_ok: bool = False
+    telegram_detail: str = ""
+    whatsapp_ok: bool = False
+    whatsapp_detail: str = ""
+    photo_ok: bool = False
+    photo_detail: str = ""
+
+    @property
+    def delivered(self) -> bool:
+        """True if the reader will see this at all."""
+        return self.telegram_ok or self.whatsapp_ok
+
+    @property
+    def channels(self) -> list[str]:
+        return [
+            name for name, ok in (("telegram", self.telegram_ok),
+                                  ("whatsapp", self.whatsapp_ok)) if ok
+        ]
+
+    def summary(self) -> str:
+        if self.delivered:
+            return "delivered via " + "+".join(self.channels)
+        return (f"delivered on NEITHER channel "
+                f"(telegram: {self.telegram_detail[:70]} | "
+                f"whatsapp: {self.whatsapp_detail[:70]})")
+
+
+@dataclass(slots=True)
 class DispatchResult:
     sent: int = 0
     failed: int = 0
@@ -82,6 +120,47 @@ class DispatchResult:
 def _strip_control(text: str) -> str:
     """Remove characters that break URL encoding or render as tofu."""
     return "".join(ch for ch in text if ch == "\n" or ch >= " ")
+
+
+def _run_coroutine(factory: Any) -> Any:
+    """Drive an async factory to completion from sync code. Loop or no loop.
+
+    `asyncio.run()` RAISES if a loop is already running in this thread, and the
+    coroutine it was handed is then never awaited. That is not theoretical: the
+    poll-mode review listener (`--listen-once`) calls into here from inside its
+    own event loop, so every single Telegram reply failed with
+    "telegram fallback failed: RuntimeError" while WhatsApp went out perfectly.
+    The user saw half a conversation and the log said "delivered".
+
+    A factory rather than a coroutine, so the coroutine object is created
+    inside whichever loop will actually run it.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())     # the common case: plain sync caller
+
+    # Already inside a loop. Give the coroutine a loop of its own on another
+    # thread and block until it finishes, so the caller's contract -- a
+    # synchronous call that has completed by the time it returns -- still holds.
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = asyncio.run(factory())
+        except BaseException as exc:      # noqa: BLE001 - re-raised below
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, name="telegram-send", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def _clean_field(value: str, limit: int) -> str:
@@ -306,8 +385,6 @@ class WhatsAppNotifier:
         if not self._telegram_available():
             return False, "telegram fallback unavailable (no session or Telethon)"
 
-        import asyncio
-
         from scrapers.telegram_user_client import build_client, ensure_authorized
 
         async def _send() -> None:
@@ -319,10 +396,52 @@ class WhatsAppNotifier:
                 await client.disconnect()
 
         try:
-            asyncio.run(_send())
+            _run_coroutine(_send)
             return True, "sent via telegram"
         except Exception as exc:
             return False, f"telegram fallback failed: {type(exc).__name__}: {exc}"[:200]
+
+    def send_photo_via_telegram(self, path: str, caption: str = "") -> tuple[bool, str]:
+        """Deliver a FILE (the submission screenshot) to Saved Messages.
+
+        The evidence screenshot is the whole point of the confirmation message:
+        "submitted" is a claim, the full-page capture is the proof. WhatsApp
+        cannot carry it -- CallMeBot's free endpoint takes a query string, not
+        an upload -- so the image goes down the Telegram side of the dual
+        dispatch and the WhatsApp card names the file instead.
+
+        HONOURS DRY_RUN for the same reason `send_via_telegram` does: Saved
+        Messages is a real inbox the user reads, and the test suite runs on a
+        machine that holds a valid MTProto session.
+        """
+        caption = _strip_control(caption)[:1024]
+        if self.dry_run:
+            log.info("[DRY_RUN] would Telegram photo %s (%s)", path, caption[:60])
+            return True, "dry_run"
+
+        from pathlib import Path as _Path
+
+        if not path or not _Path(path).exists():
+            return False, f"no screenshot file at {path or '(empty path)'}"
+        if not self._telegram_available():
+            return False, "telegram unavailable (no session or Telethon)"
+
+        from scrapers.telegram_user_client import build_client, ensure_authorized
+
+        async def _send() -> None:
+            client = build_client()
+            await ensure_authorized(client)
+            try:
+                await client.send_file("me", path, caption=caption,
+                                       force_document=False)
+            finally:
+                await client.disconnect()
+
+        try:
+            _run_coroutine(_send)
+            return True, "photo sent via telegram"
+        except Exception as exc:
+            return False, f"telegram photo failed: {type(exc).__name__}: {exc}"[:200]
 
     def _send_callmebot(self, message: str) -> tuple[bool, str]:
         """WhatsApp only, with no fallback. Never raises.
@@ -393,6 +512,74 @@ class WhatsAppNotifier:
         if ok:
             return True, f"telegram fallback (callmebot: {primary_error[:60]})"
         return False, f"{primary_error} | {detail}"
+
+    # -- dual-channel single events ----------------------------------------
+    def send_dual(
+        self, telegram_text: str, whatsapp_text: str | None = None,
+        photo: str = "", photo_caption: str = "",
+        channels: Iterable[str] = ("telegram", "whatsapp"),
+    ) -> DualResult:
+        """Send ONE event to Telegram AND WhatsApp, with per-channel content.
+
+        This is the transport behind the human-in-the-loop review flow. It is
+        deliberately NOT `send_raw`: send_raw treats Telegram as a FALLBACK and
+        stops as soon as CallMeBot accepts, which would leave the review card on
+        exactly one channel. A review card that arrives on only one channel is
+        the failure this exists to prevent -- the user answers wherever they
+        happen to be looking.
+
+        Telegram goes FIRST, for the same reason `dispatch` does: the WhatsApp
+        card is the short one and it points at the Telegram card by reference
+        ("Full card: Saved Messages [DRAFT #7]"). Printing that pointer before
+        its target exists would send the reader after a card that is not there.
+
+        `whatsapp_text` defaults to the Telegram text. Callers that care about
+        the CallMeBot URL budget -- which is every caller carrying Arabic --
+        should pass a purpose-built short card instead of relying on the
+        last-resort truncation inside `_send_callmebot`.
+
+        `channels` narrows delivery to a subset. It exists so a configuration
+        switch can turn one channel off honestly, rather than the switch being
+        documented and ignored; a channel that is off reports `"disabled"`
+        rather than a failure, because the user asked for that.
+        """
+        wanted = {str(c).strip().lower() for c in channels}
+        result = DualResult()
+
+        if "telegram" not in wanted:
+            result.telegram_detail = "disabled"
+            result.photo_detail = "disabled" if photo else ""
+        # One branch, not two -- see dispatch(). A separate `elif` arm here is
+        # how dry_run stopped applying to Telegram the first time.
+        elif self.dry_run or self._telegram_available():
+            result.telegram_ok, result.telegram_detail = self.send_via_telegram(
+                telegram_text
+            )
+            if photo:
+                result.photo_ok, result.photo_detail = self.send_photo_via_telegram(
+                    photo, photo_caption or ""
+                )
+        else:
+            result.telegram_detail = "telegram unavailable (no session or Telethon)"
+            if photo:
+                result.photo_detail = result.telegram_detail
+
+        if "whatsapp" in wanted:
+            result.whatsapp_ok, result.whatsapp_detail = self._send_callmebot(
+                telegram_text if whatsapp_text is None else whatsapp_text
+            )
+        else:
+            result.whatsapp_detail = "disabled"
+
+        if not wanted:
+            log.warning("send_dual was asked to use no channels at all.")
+            return result
+
+        if not result.delivered:
+            log.error("Dual dispatch reached NEITHER channel: %s", result.summary())
+        else:
+            log.info("Dual dispatch %s.", result.summary())
+        return result
 
     # -- high level ---------------------------------------------------------
     def dispatch(self, evaluations: Iterable[Evaluation]) -> DispatchResult:

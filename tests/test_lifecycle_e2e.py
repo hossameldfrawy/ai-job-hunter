@@ -63,9 +63,22 @@ class FakePage:
         self.body = body
         self.visited: list[str] = []
         self.clicked: list[str] = []
+        self.uploaded: list[tuple[str, str]] = []
 
     def goto(self, url, **kwargs):
         self.visited.append(url)
+
+    # The CV now goes in through `attach_cv`, which drives Playwright directly
+    # rather than through `fill_field`. Implementing it here keeps the REAL
+    # upload logic under test instead of faking past it.
+    def set_input_files(self, selector, value, timeout=None):
+        self.uploaded.append((selector, value))
+
+    def content(self):
+        return "<form><input name='email'></form>"
+
+    def query_selector(self, selector):
+        return object() if "submit" in selector.lower() else None
 
     def inner_text(self, _selector):
         return self.body
@@ -121,13 +134,57 @@ PROFILE = CandidateProfile(
 )
 
 
-class RecordingNotifier:
+class FakeContext:
+    """Stands in for a Playwright BrowserContext."""
+
     def __init__(self):
-        self.sent: list[str] = []
+        self.saved_for: list[str] = []
+
+
+class RecordingNotifier:
+    """A dual-channel notifier that records instead of delivering.
+
+    It implements `send_dual` on purpose. Every card in the apply flow now goes
+    to Telegram AND WhatsApp with different content, and a fake that only knows
+    `send_via_telegram` would silently exercise the compatibility fallback --
+    proving the flow works on a notifier nobody ships, and testing nothing at
+    all about the WhatsApp half.
+    """
+
+    def __init__(self):
+        self.sent: list[str] = []          # telegram, in order
+        self.whatsapp: list[str] = []
+        self.photos: list[tuple[str, str]] = []
 
     def send_via_telegram(self, message):
         self.sent.append(str(message))
         return True, "sent"
+
+    def send_photo_via_telegram(self, path, caption=""):
+        self.photos.append((str(path), str(caption)))
+        return True, "sent"
+
+    def send_dual(self, telegram_text, whatsapp_text=None, photo="",
+                  photo_caption="", channels=("telegram", "whatsapp")):
+        from notifier import DualResult
+
+        wanted = {str(c).lower() for c in channels}
+        if "telegram" in wanted:
+            self.sent.append(str(telegram_text))
+            if photo:
+                self.photos.append((str(photo), str(photo_caption)))
+        if "whatsapp" in wanted:
+            self.whatsapp.append(str(telegram_text if whatsapp_text is None
+                                     else whatsapp_text))
+        return DualResult(telegram_ok="telegram" in wanted,
+                          telegram_detail="recorded",
+                          whatsapp_ok="whatsapp" in wanted,
+                          whatsapp_detail="recorded",
+                          photo_ok=bool(photo) and "telegram" in wanted)
+
+    @property
+    def both(self) -> str:
+        return "\n".join(self.sent + self.whatsapp)
 
 
 class LifecycleHarness(unittest.TestCase):
@@ -158,8 +215,19 @@ class LifecycleHarness(unittest.TestCase):
         settings.raw["cv"]["paths"] = []
 
         @contextmanager
-        def fake_browser_page(platform="default", headed=None):
+        def fake_browser_page(platform="default", headed=None, use_state=True):
             yield self.page
+
+        # Faked TOO, not just `browser_page`. The registration flow needs the
+        # context itself in order to save the authenticated session, so it
+        # calls `browser_context` -- and with only `browser_page` stubbed this
+        # harness quietly launched a REAL headless Chromium on every run.
+        self.context = FakeContext()
+
+        @contextmanager
+        def fake_browser_context(platform="default", headed=None,
+                                 use_state=True):
+            yield self.context, self.page
 
         def fake_fill_field(page, field_, value):
             self.filled.append((field_.kind, value))
@@ -171,6 +239,8 @@ class LifecycleHarness(unittest.TestCase):
             return path
 
         self._saved = {
+            "browser_context": browser_mod.browser_context,
+            "save_storage_state": browser_mod.save_storage_state,
             "browser_page": browser_mod.browser_page,
             "inspect_form": browser_mod.inspect_form,
             "fill_field": browser_mod.fill_field,
@@ -179,6 +249,11 @@ class LifecycleHarness(unittest.TestCase):
             "load_candidate": candidate_mod.load_candidate,
         }
         browser_mod.browser_page = fake_browser_page
+        browser_mod.browser_context = fake_browser_context
+        browser_mod.save_storage_state = (
+            lambda ctx, platform: ctx.saved_for.append(platform)
+            or f"/secrets/sessions/{platform}_state.json"
+        )
         browser_mod.inspect_form = lambda page, *a, **k: list(self.form)
         browser_mod.fill_field = fake_fill_field
         browser_mod.capture_evidence = fake_capture
@@ -192,6 +267,8 @@ class LifecycleHarness(unittest.TestCase):
             os.environ["CV_PATH"] = self._saved_cv_env
         settings.raw["cv"]["paths"] = self._saved_cv_chain
         browser_mod.browser_page = self._saved["browser_page"]
+        browser_mod.browser_context = self._saved["browser_context"]
+        browser_mod.save_storage_state = self._saved["save_storage_state"]
         browser_mod.inspect_form = self._saved["inspect_form"]
         browser_mod.fill_field = self._saved["fill_field"]
         browser_mod.capture_evidence = self._saved["capture_evidence"]
@@ -268,9 +345,24 @@ class TestHappyPath(LifecycleHarness):
         self.assertIn("NEW PLATFORM ACCOUNT CREATED", joined)
         self.assertIn("APPLICATION DRAFT READY FOR REVIEW", joined)
         self.assertIn("APPLICATION SUCCESSFULLY SUBMITTED", joined)
+        self.assertIn(f"[DRAFT #{app_id}]", joined,
+                      "both cards must quote the reference the user replies to")
+        self.assertIn(f"done {app_id}", joined,
+                      "the review card must show the reply that approves it")
         self.assertIn(f"--approve {app_id}", joined,
-                      "the review card must quote the runnable command")
-        self.assertIn("Screenshot saved", joined)
+                      "the review card must quote the runnable command too")
+        self.assertIn("screenshot saved", joined.lower())
+
+        # -- 7. BOTH channels carried both cards ----------------------------
+        wa = "\n".join(self.notifier.whatsapp)
+        self.assertIn("DRAFT READY FOR REVIEW", wa,
+                      "the review card never reached WhatsApp")
+        self.assertIn("APPLICATION SUBMITTED", wa,
+                      "the confirmation never reached WhatsApp")
+        self.assertEqual(
+            [p[0] for p in self.notifier.photos], [final["screenshot_path"]],
+            "the evidence screenshot was not pushed to Telegram",
+        )
 
     def test_the_cv_is_uploaded_and_the_cover_letter_is_placed(self):
         ev = self._ev()
@@ -278,8 +370,9 @@ class TestHappyPath(LifecycleHarness):
         approve(app_id, self.v)
         submit_application(app_id, self.v, self.notifier, dry_run=False)
 
+        self.assertTrue(self.page.uploaded, "the CV was never attached")
+        self.assertTrue(self.page.uploaded[0][1].lower().endswith(".pdf"))
         kinds = [k for k, _ in self.filled]
-        self.assertIn("resume", kinds, "the CV was never attached")
         self.assertIn("cover_letter", kinds)
         cover = dict((k, v) for k, v in self.filled)["cover_letter"]
         self.assertIn("Issabel", cover)
@@ -378,9 +471,11 @@ class TestSearchWidgetIsRefused(LifecycleHarness):
                                      self.v, self.notifier)
         self.assertIsNotNone(app_id)
         card = self.notifier.sent[-1]
-        self.assertIn("No auto-submittable form found", card)
+        self.assertIn("NO AUTO-SUBMITTABLE FORM FOUND", card.upper())
         self.assertIn("egypt.tanqeeb.com", card,
                       "the card must carry the link to apply manually")
+        self.assertIn("No auto-submit form", self.notifier.whatsapp[-1],
+                      "the WhatsApp card must warn too, not just Telegram")
 
     def test_submission_is_refused_without_launching_a_browser(self):
         app_id = prepare_application(self._ev(fingerprint="fp-widget3"),
@@ -449,8 +544,10 @@ class TestFailureIsRecoverable(LifecycleHarness):
         app = self.v.get_application(app_id)
         self.assertEqual(app["status"], "failed")
         self.assertIn("submit button", (app["failure_reason"] or "").lower())
-        self.assertIn("APPLICATION #%d FAILED" % app_id,
-                      "\n".join(self.notifier.sent))
+        self.assertIn("APPLICATION FAILED", "\n".join(self.notifier.sent))
+        self.assertIn("[DRAFT #%d]" % app_id, "\n".join(self.notifier.sent))
+        self.assertIn("APPLICATION FAILED", "\n".join(self.notifier.whatsapp),
+                      "a failed submission must be reported on BOTH channels")
         self.assertIn("egypt.tanqeeb.com", self.notifier.sent[-1],
                       "the failure notice must carry the manual link")
 

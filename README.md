@@ -124,14 +124,163 @@ Local only. It needs a real browser and it writes to a private vault, so it
 never runs on the cloud schedule — that stays a pure discovery pipeline.
 
 ```bash
-python main.py --register Tanqeeb   # assisted signup: pre-fills, you submit
+python main.py --provision          # vault credentials for every board (offline)
+python main.py --vault              # what is stored + the profile payload
+python main.py --register Tanqeeb   # signup: pre-fills, submits unless CAPTCHA
 python main.py --apply              # draft applications for top matches
 python main.py --applications       # what is drafted / submitted
 python main.py --approve 1          # approve a draft, then submit it
 python main.py --decline 1          # discard it
+python main.py --listen             # approve/edit by REPLYING on Telegram
+python main.py --listen-once        # process replies once, then exit (cron)
 python main.py --inbox              # scan the mailbox for interview mail
 python main.py --watch-inbox        # keep scanning
 ```
+
+### Approve and edit by reply, on WhatsApp and Telegram
+
+A drafted application is pushed to **both** channels, and you answer it from
+wherever you happen to be. The terminal commands above still work; they are no
+longer the only way in, because in practice the draft is read on a phone hours
+before the terminal is next opened, and the posting has often closed by then.
+
+```
+📝 APPLICATION DRAFT READY FOR REVIEW [DRAFT #1]
+
+🏢 Company:  Etisalat
+💼 Role:     VoIP Engineer
+🌐 Platform: tanqeeb:uae
+📊 Match:    95%
+
+📋 PROPOSED FORM ANSWERS
+💰 Salary:     12,000 AED
+🧮 Experience: 3 years
+1. How many years have you used Asterisk?
+   → Three years.
+
+✍️ TAILORED COVER LETTER
+I have run Issabel and Asterisk PBX estates for three years...
+```
+
+Reply with any of these, in Arabic or English:
+
+| Reply | What happens |
+|---|---|
+| `done` / `done 1` / `موافق ١` / `اعتمد 1` | Playwright submits it, captures a full-page screenshot, marks it `submitted`, and confirms on both channels with the image |
+| `edit 1 salary: 18000 AED` | rewrites the draft **and** the value that will be typed into the form, then re-sends the card |
+| `edit 1 cover letter: <new text>` | same, for the letter |
+| `edit 1 answer 2: <new answer>` | replaces one screening answer |
+| `edit 1: make it shorter` | free-form — Gemini applies the instruction to the letter |
+| `تعديل ١ الراتب: ١٥٠٠٠` | any of the above, in Arabic, with Arabic-Indic digits |
+| `decline 1` / `رفض ١` | discards the draft |
+| `status` / `الحالة` | what is waiting for you |
+| `help` / `مساعدة` | the full syntax |
+
+Four things this is careful about, each of which is a way it could go wrong:
+
+* **An edit changes what is SUBMITTED, not just what is shown.** The card reads
+  `cover_letter_text`; the browser types `submitted_payload_json["fields"]`.
+  Both are rewritten from one instruction, because updating only the first
+  produces a draft that looks edited and submits the original.
+* **An edit always returns the draft to `review_pending`,** so the next `done`
+  confirms the version you actually read.
+* **A bare `done` with several drafts pending refuses to guess.** It lists them
+  and asks for a number — submitting cannot be undone. With exactly one draft
+  pending it just works. (`hitl.confirm_when_ambiguous: false` to change that.)
+* **The bot never obeys its own cards.** Every card carries an invisible marker,
+  because the card itself contains the line `done 1` as *instructions* — and it
+  is delivered to the same Saved Messages the listener reads.
+
+Commands are read from **Telegram only**. CallMeBot is send-only: there is no
+way to receive a WhatsApp reply through it, so WhatsApp carries the card and
+Telegram carries the conversation. Tuning lives under `hitl:` in `config.yml`.
+
+**Replying on WhatsApp needs a relay.** CallMeBot — which carries every
+outbound WhatsApp card here — is *send-only*: it has no receive endpoint at
+all. So `auto_apply/inbound.py` exposes a webhook that accepts inbound messages
+from whatever relay you can get: Meta's WhatsApp Cloud API (verified by
+`X-Hub-Signature-256`), Twilio (form-encoded), or anything you control that can
+POST JSON — a Baileys bridge, n8n, a phone shortcut. All three normalise to the
+same command and run the same pipeline as Telegram. Configure it under
+`hitl.whatsapp_inbound`; until you do, `--listen` says so explicitly rather
+than claiming a channel it cannot receive on.
+
+That endpoint can submit a job application, so it **fails closed**: no secret
+configured means every request is refused, a bad HMAC is refused, a message
+from any number but yours is refused, and a re-delivered message never executes
+twice.
+
+**`--listen` runs two mechanisms, not one.** An event handler reacts the instant
+you reply, and a poll sweep re-checks every 60s. That redundancy is deliberate:
+Telegram never delivers an update for a message the *same* session sent, so the
+event handler cannot be verified from inside the bot — only by you typing on
+your phone, and by then it is too late to discover it was not wired up. Silent
+inaction on an approval is the worst failure this component has. Both routes
+share one forward-only cursor, so nothing is ever executed twice.
+
+### Fourteen boards, one saved login each
+
+| Region | Boards |
+|---|---|
+| Egypt & Gulf | Tanqeeb (all 7 countries), Wuzzuf, Bayt, GulfTalent, Naukrigulf, Forasna, Akhtaboot |
+| Global | Talent.com, Indeed, Glassdoor, ZipRecruiter, Foundit/Monster, RemoteOK, WeWorkRemotely |
+
+Each board declares the **hosts** it serves, so a scraped job URL resolves back
+to the login that can open it. Matching is on the registrable domain, never a
+substring — `notbayt.com.evil.test` cannot borrow Bayt's cookies.
+
+**This is what unblocks applying at all.** Signed out, these boards serve a
+public landing page whose only form is the site search — which the submit gate
+correctly refuses. `--register <board>` saves the authenticated session to
+`secrets/sessions/<board>_state.json`, and `--apply` / `--approve` then open the
+job page as a signed-in candidate, where the real application form exists.
+
+Two layers of persistence, doing different jobs: a Chromium profile directory
+(keeps the login on this machine, including localStorage and device
+fingerprint) plus a portable `storage_state` JSON snapshot (survives a wiped
+profile, and can be copied or deleted per board).
+
+### Multi-step ATS forms
+
+`browser.py` recognises Workday, Greenhouse, Lever, SmartRecruiters, Taleo,
+iCIMS, Ashby, BambooHR, Recruitee, Workable and Jobvite — from the URL first,
+then from the markup, which catches an ATS iframed onto the employer's own
+domain. Wizard-style ATSes are walked page by page: fill what is visible, click
+Continue, fill the next page, and stop the moment a real submit control
+appears. `Next` and `Submit` selectors are kept strictly disjoint, because
+clicking submit when you meant next files a half-empty application.
+
+The CV goes in by three routes in order — the detected field, the page's first
+(usually hidden) file input, then the OS file chooser. Route two is the one
+that matters: Greenhouse and Lever style a `<div>` over the real input, so the
+visible control cannot be filled.
+
+Ten standard screening questions (notice period, expected salary, years with
+VoIP/Asterisk/Python/AI, sponsorship, relocation, start date) are drafted up
+front and matched onto the board's own wording by topic — a wizard's page three
+says "Notice period (weeks)" where the draft says "What is your notice period?",
+and exact matching would leave it blank and fail validation.
+
+### Platform provisioning
+
+`--provision` derives a **different** password per board from one seed
+(HMAC-SHA256) and vaults platform, email, username and password. It opens
+nothing and creates nothing, so it is safe to run for every board at once — and
+running it first means an interrupted signup still leaves a recoverable
+credential rather than one that existed only in a browser window you closed.
+
+| Board | Signup |
+|---|---|
+| Tanqeeb, Wuzzuf, Talent.com, GulfTalent | pre-filled and submitted automatically |
+| Bayt, Naukrigulf | pre-filled, **never** auto-submitted (`manual_signup`) |
+
+`--register <board>` fills everything the inspector can name — contact details,
+the professional headline, the bio, the CV upload — then submits, **unless** a
+human-verification challenge is on the page, in which case it stops and hands
+over. Pushing through a CAPTCHA is what turns "an account" into "a banned
+account on a board the job hunt depends on". Bayt and Naukrigulf are marked
+manual because they verify by SMS, where a half-created account burns the email
+address. Set `auto_submit_registration: false` to always stop and confirm.
 
 ### The vault is a separate database, on purpose
 
@@ -482,7 +631,11 @@ candidates; the rest were dead, dormant, or posting medical jobs.
 | `python auth_telegram.py` | One-time Telegram login (private groups) |
 | `python check_telegram.py` | Verify the Telegram client, list your groups |
 | `python check_telegram.py --scan 168 --suggest` | Rank your chats by hiring output, emit a narrowed `include_chats` |
-| `python -m pytest` | Offline test suite (272 tests, no network) |
+| `python main.py --listen` | Approve/edit drafts by replying on Telegram |
+| `python main.py --listen-once` | Process new replies once, then exit (cron) |
+| `python main.py --provision` | Derive + vault credentials for every board |
+| `python main.py --vault [--reveal]` | Show the vault and the profile payload |
+| `python -m pytest` | Offline test suite (860 tests, no network) |
 
 ---
 
@@ -512,14 +665,18 @@ unable to reach you, through three independent layers:
 | Layer | What it does |
 |---|---|
 | **Environment** | Real credentials are replaced with obvious test values *before* `config.py` reads `.env`, so a stray call authenticates as nobody. `TELEGRAM_STRING_SESSION` is emptied outright. |
-| **Transports** | `send_via_telegram`, `send_raw` and `http_client.get` become recorders that deliver nothing. Ask for the `outbox` fixture to assert on what *would* have been sent. |
+| **Transports** | `send_via_telegram`, `send_photo_via_telegram`, `send_raw`, `_send_callmebot` and `http_client.get` become recorders that deliver nothing. Ask for the `outbox` fixture to assert on what *would* have been sent, by channel. |
 | **Sockets** | `connect()` to any non-loopback address raises. Loopback stays open because asyncio's self-pipe needs it. |
 
 The socket layer is the one that matters — the first two can be defeated by a
 test that builds its own client; a blocked socket cannot.
 `tests/test_no_real_sends.py` asserts all three are armed *and* that the real
 production methods honour `DRY_RUN`, checked against the genuine
-implementations rather than the stubs.
+implementations rather than the stubs. It also scans every module for a direct
+`send_message(` or `send_file(` call, so a new route into your Saved Messages
+cannot appear without going through the one guarded method — and it drives the
+review listener against its own cards, to prove the bot cannot approve an
+application by reading the card it just sent.
 
 No secrets are supplied to CI on purpose: a suite that needs a real key to pass
 has a bug, and it should surface there rather than in your Telegram.
@@ -556,7 +713,10 @@ auto_apply/             Phase 2: registration, drafting, approval, submission
   ├─ gmail_oauth.py     Gmail API OAuth2: token lifecycle and refresh
   ├─ email_listener.py  Inbox monitor, backends, exactly-once alerting
   ├─ engine.py          Draft → review → approve → submit → evidence
-  ├─ browser.py         Playwright plumbing and semantic form detection
+  ├─ review.py          The review card per channel + the in-line edit engine
+  ├─ commands.py        The Arabic/English reply grammar ("done 7", "تعديل ...")
+  ├─ control.py         What a reply DOES + the Saved-Messages listener
+  ├─ browser.py         Playwright plumbing, semantic form + CAPTCHA detection
   ├─ profile_builder.py Assisted account creation, per-platform passwords
   └─ candidate.py       Structured profile extracted from the CV
 setup_wizard.py         Setup, verification, secret export
@@ -567,6 +727,15 @@ discover_channels.py    Public Telegram channel auditor
 tests/                  Offline suite -- run with pytest, never unittest
   ├─ conftest.py        The safety harness: env, transports, sockets
   ├─ test_no_real_sends.py   Proof the suite cannot message you
+  ├─ test_scrapers_audit.py  Every ingestion source against fixed markup
+  ├─ test_evaluator_ai.py    Prompt, schema, retries, quota exhaustion
+  ├─ test_db_integrity.py    Dedup keys, migrations, rollback, encryption
+  ├─ test_browser_forms.py   Form inspector, CV mapping, CAPTCHA, screenshots
+  ├─ test_gmail_oauth.py     Token refresh, IMAP fallback, inbox triage
+  ├─ test_hitl_commands.py   The reply grammar, recall AND precision
+  ├─ test_hitl_review.py     Both review cards + the in-line edit engine
+  ├─ test_hitl_controller.py Approve/edit/decline + the listener's gates
+  ├─ test_hitl_e2e.py        draft → edit by reply → done → submit → evidence
   ├─ test_inbox_dedup.py     Exactly-once alerting, Gemini quota
   └─ test_lifecycle_e2e.py   register → apply → approve → evidence
 pytest.ini              testpaths=tests, warnings are errors

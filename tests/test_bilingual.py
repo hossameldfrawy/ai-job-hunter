@@ -544,11 +544,13 @@ class TestSourceHealthDigest(unittest.TestCase):
     def test_callmebot_guard_bounds_any_message(self):
         """Even a caller that ignores the budget must not produce a dead URL.
 
-        Exercises `_send_callmebot` rather than `send_raw` on purpose: send_raw
-        falls back to Telegram, and a unit test must never reach the user's real
-        account.
+        Exercises the REAL `_send_callmebot`, pulled out of conftest's stash,
+        rather than the recorder that stands in for it during the rest of the
+        suite -- testing the stub would prove only that the stub works. It is
+        also deliberately not `send_raw`, which falls back to Telegram and so
+        could reach the user's real account.
         """
-        from urllib.parse import quote
+        from conftest import REAL
 
         from notifier import MAX_URL_LENGTH, WhatsAppNotifier
 
@@ -565,7 +567,7 @@ class TestSourceHealthDigest(unittest.TestCase):
         original = http_client.get
         http_client.get = fake_get
         try:
-            n._send_callmebot("مطلوب مهندس دعم فني " * 200)
+            REAL["_send_callmebot"](n, "مطلوب مهندس دعم فني " * 200)
         finally:
             http_client.get = original
         self.assertLessEqual(len(captured["url"]), MAX_URL_LENGTH)
