@@ -769,6 +769,50 @@ class TestRegistryAndBoundary(unittest.TestCase):
     def test_run_all_with_no_scrapers_is_a_clean_pass(self):
         self.assertEqual(scrapers.run_all([]), ([], []))
 
+    def test_a_hanging_source_cannot_wedge_the_run(self):
+        """The failure a per-request timeout does not catch.
+
+        `requests` bounds the gap between bytes, not the total, so a portal
+        that never finishes responding never trips it. Before the ingestion
+        budget existed this test hung forever instead of failing.
+        """
+        import threading
+        import time
+
+        release = threading.Event()
+
+        class Wedged(BaseScraper):
+            name = "wedged"
+
+            def collect(self):
+                release.wait(30)          # never set within the budget
+                return []
+
+        class Quick(BaseScraper):
+            name = "quick"
+
+            def collect(self):
+                from models import JobPost
+
+                return [JobPost(source="quick", title="VoIP Engineer")]
+
+        started = time.monotonic()
+        try:
+            jobs, results = scrapers.run_all(
+                [Wedged({}), Quick({})], max_workers=2, budget_s=0.5,
+            )
+        finally:
+            release.set()                 # never leak the thread into later tests
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 10, "run_all waited on the wedged source")
+        self.assertEqual(len(jobs), 1, "the healthy source's postings were lost")
+        by_name = {r.name: r for r in results}
+        self.assertEqual(set(by_name), {"wedged", "quick"})
+        self.assertTrue(by_name["quick"].ok)
+        self.assertFalse(by_name["wedged"].ok)
+        self.assertIn("timed out", by_name["wedged"].error)
+
 
 # ---------------------------------------------------------------------------
 class TestSharedParsingHelpers(unittest.TestCase):

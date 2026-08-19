@@ -10,7 +10,9 @@ health report. One dead source never blocks the others: each runs inside
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed,
+)
 from typing import Any
 
 from models import JobPost
@@ -93,27 +95,63 @@ def build_scrapers(settings: Any, db: Any = None) -> list[BaseScraper]:
     return built
 
 
+# Wall-clock ceiling for one ingestion fan-out, across all sources.
+#
+# Per-request timeouts are not enough on their own. `requests` bounds the gap
+# between bytes, not the total, so a portal that dribbles a byte every 20s
+# (Tanqeeb has done exactly this) never trips a read timeout and never
+# returns. Unattended in a cloud daemon that is not a slow run -- it is a run
+# that never ends, and every later stage waits behind it forever.
+DEFAULT_RUN_BUDGET_S = 600.0
+
+
 def run_all(
-    scrapers: list[BaseScraper], max_workers: int = 8
+    scrapers: list[BaseScraper], max_workers: int = 8,
+    budget_s: float | None = DEFAULT_RUN_BUDGET_S,
 ) -> tuple[list[JobPost], list[ScrapeResult]]:
-    """Run every scraper concurrently. Returns (all_postings, per_source_report)."""
+    """Run every scraper concurrently. Returns (all_postings, per_source_report).
+
+    Bounded by `budget_s`. Sources that have not finished by then are reported
+    as failed and the run proceeds with whatever did land -- a partial harvest
+    beats a daemon wedged behind one unresponsive board.
+    """
     if not scrapers:
         return [], []
 
     jobs: list[JobPost] = []
     results: list[ScrapeResult] = []
 
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
+    try:
         futures = {pool.submit(s.run): s for s in scrapers}
-        for future in as_completed(futures):
-            scraper = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:  # BaseScraper.run should prevent this
-                log.error("[%s] escaped its error boundary: %s", scraper.name, exc)
-                result = ScrapeResult(scraper.name, [], False, str(exc)[:300], 0.0)
-            results.append(result)
-            jobs.extend(result.jobs)
+        try:
+            for future in as_completed(futures, timeout=budget_s):
+                scraper = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # BaseScraper.run should prevent this
+                    log.error("[%s] escaped its error boundary: %s", scraper.name, exc)
+                    result = ScrapeResult(scraper.name, [], False, str(exc)[:300], 0.0)
+                results.append(result)
+                jobs.extend(result.jobs)
+        except FuturesTimeout:
+            stalled = [s for f, s in futures.items() if not f.done()]
+            log.error(
+                "Ingestion budget of %.0fs expired with %d source(s) still "
+                "running: %s. Continuing with partial results.",
+                budget_s, len(stalled), ", ".join(s.name for s in stalled),
+            )
+            for scraper in stalled:
+                results.append(ScrapeResult(
+                    scraper.name, [], False,
+                    f"timed out (exceeded the {budget_s:.0f}s ingestion budget)",
+                    float(budget_s or 0.0),
+                ))
+    finally:
+        # wait=False is the whole point: a wedged socket thread must not be
+        # able to hold the run open. cancel_futures drops the queued work that
+        # never started.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     ok = sum(1 for r in results if r.ok)
     log.info(
