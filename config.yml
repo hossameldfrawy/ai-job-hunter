@@ -33,9 +33,11 @@ engine:
   eval_batch_size: 8
   # Gemini batches run in parallel. Each call is mostly network wait, so this
   # is the difference between a ~3-minute and a ~1-minute evaluation phase.
-  # Keep it low: the free tier limits REQUESTS PER MINUTE, and 429s are handled
-  # by backoff but cost latency. 3 is a safe, tested default.
-  eval_concurrency: 3
+  # Measured: at 3, a 15-batch run tripped the free tier's per-minute limit
+  # repeatedly and needed 31 calls to land 15 batches -- the backoff recovered
+  # every one, but the retries cost more time than the parallelism saved.
+  # 2 is the tested default. Raise it only on a paid key.
+  eval_concurrency: 2
   # Hard ceiling on jobs sent to Gemini per run (protects the free-tier quota).
   max_evaluations_per_run: 120
   # Hard ceiling on WhatsApp messages per run (protects against alert storms).

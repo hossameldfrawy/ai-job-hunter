@@ -112,9 +112,13 @@ secret.
 
 ### 2c. Runtime and cadence
 
-A full sweep takes about **6 minutes**: LinkedIn dominates it (92 paged
-requests behind a 2.5 s per-host throttle), with Tanqeeb, talent.com and the
-Telegram client running concurrently underneath.
+A full sweep takes about **6 minutes** when Gemini is healthy, and up to
+**11 minutes** when it is rate-limiting — measured, not estimated. Scraping is
+~5 min of that (LinkedIn dominates: 92 paged requests behind a 2.5 s per-host
+throttle, with Tanqeeb, talent.com and the Telegram client running concurrently
+underneath). Evaluation is ~1 min normally but stretches to ~6 min when the free
+tier throttles and batches have to back off. Both fit inside the 25-minute job
+timeout with room to spare.
 
 The schedule ships at `*/30`. To go to `*/15`, edit the cron in the workflow --
 but note Gemini's free tier is metered per day as well as per minute. Steady

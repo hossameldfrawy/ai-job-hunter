@@ -40,9 +40,12 @@ It runs entirely on GitHub's infrastructure. **Your computer can be off.**
 A representative live run:
 
 ```
-2,771 scraped  →  2,097 recent  →  963 never seen  →  315 candidates
-                                                       →  120 evaluated  →  alerts
+2,758 scraped  →  2,077 recent  →  195 never seen  →  192 candidates
+                                                       →  120 evaluated  →  3 alerts
 ```
+
+(The 195 "never seen" are exactly the 195 postings the *previous* run deferred
+past its evaluation cap — deferral and re-queue working end to end.)
 
 Every stage is counted in `run_report.json`, so you can always see where a
 posting was lost. The funnel exists because Gemini's free tier is metered per
