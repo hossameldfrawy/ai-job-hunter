@@ -89,12 +89,21 @@ def _age_gate(jobs: list[JobPost], max_days: int) -> tuple[list[JobPost], int]:
     return kept, dropped
 
 
-def _source_sample(result: Any) -> dict[str, str]:
-    """Pick one posting to prove a source really returned real data.
+def _source_sample(
+    result: Any, profile: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Pick one posting that proves a source returned *useful* data.
 
-    Prefers the freshest posting that actually names a company, because
-    "Last seen: <title> @ <company>" is only convincing evidence when both
-    halves are present. Falls back to the newest, then simply the first.
+    The obvious choice -- the newest posting -- turns out to be weak evidence.
+    A live audit produced "Marketing & Communications Manager", "Mechanical
+    Engineer" and even a candidate's profile page: all genuinely scraped, none
+    of them showing the source finding work worth having.
+
+    So the sample prefers the highest-scoring RELEVANT posting, falling back to
+    the freshest when a source found nothing relevant. That fallback is itself
+    the useful signal: a source reporting 928 postings with no relevant sample
+    is reachable but mistargeted, which reads very differently from one that is
+    simply down.
     """
     jobs = [j for j in getattr(result, "jobs", []) or [] if j.title]
     if not jobs:
@@ -104,10 +113,27 @@ def _source_sample(result: Any) -> dict[str, str]:
         posted = getattr(job, "posted_at", None)
         return posted.timestamp() if posted else 0.0
 
-    named = [j for j in jobs if j.company]
-    pool = named or jobs
-    best = max(pool, key=freshness)
-    return {"title": best.title, "company": best.company or ""}
+    chosen: Any = None
+    relevant = False
+    if profile:
+        from relevance import score_job
+
+        best_score, best_job = max(
+            ((score_job(j, profile)[0], j) for j in jobs),
+            key=lambda pair: (pair[0], freshness(pair[1])),
+        )
+        if best_score >= 2:
+            chosen, relevant = best_job, True
+
+    if chosen is None:
+        named = [j for j in jobs if j.company]
+        chosen = max(named or jobs, key=freshness)
+
+    return {
+        "title": chosen.title,
+        "company": chosen.company or "",
+        "relevant": "yes" if relevant else "no",
+    }
 
 
 def apply_eval_cap(
@@ -223,7 +249,7 @@ def run_once(db: Database, notifier: WhatsAppNotifier | None = None) -> RunRepor
     report.sources = [
         {"name": r.name, "ok": r.ok, "count": r.count,
          "seconds": round(r.duration_s, 1), "error": r.error,
-         "sample": _source_sample(r)}
+         "sample": _source_sample(r, settings.profile)}
         for r in sorted(results, key=lambda r: -r.count)
     ]
     report.errors.extend(f"{r.name}: {r.error}" for r in results if not r.ok)

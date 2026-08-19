@@ -262,7 +262,7 @@ def cmd_digest(db: Database) -> int:
     report.sources = [
         {"name": r.name, "ok": r.ok, "count": r.count,
          "seconds": round(r.duration_s, 1), "error": r.error,
-         "sample": _source_sample(r)}
+         "sample": _source_sample(r, settings.profile)}
         for r in sorted(results, key=lambda r: -r.count)
     ]
 

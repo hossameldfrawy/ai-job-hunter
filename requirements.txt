@@ -9,5 +9,9 @@ python-dotenv==1.0.1
 tenacity==9.0.0
 pypdf==5.1.0
 
-# ── Optional extras (install with: pip install -r requirements-extra.txt)
-# Telethon==1.36.0        # private/restricted Telegram channels (needs session)
+# Telegram MTProto user client. NOT optional, despite how it started out:
+#   * it ingests your joined private groups, and
+#   * it is the fallback delivery channel when CallMeBot refuses.
+# The cloud runner logged "Telethon is not installed" and silently skipped
+# both, so a scheduled run found 9 real matches and delivered 0 of them.
+Telethon==1.44.0

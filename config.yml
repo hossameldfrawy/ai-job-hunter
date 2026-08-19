@@ -402,6 +402,11 @@ talent:
 #   * a zero-result search returns generic filler rather than nothing, so
 #     results are checked against the query before being emitted.
 # Keep terms SHORT: multi-word queries are ANDed and usually match nothing.
+# CLOUD CAVEAT (measured 2026-08-19): Tanqeeb blocks GitHub Actions IP ranges.
+# Every subdomain tripped the circuit breaker after 4 consecutive failures and
+# the source returned 0 from the runner, versus 928 from a home connection. It
+# stays enabled because it is the best GCC source when the bot runs on a VPS,
+# Docker or your own machine -- and it costs only ~18s to fail fast in the cloud.
 tanqeeb:
   enabled: true
   max_per_query: 20
@@ -474,6 +479,13 @@ facebook:
 
 # -- Alert delivery ---------------------------------------------------------
 notifications:
+  # If CallMeBot refuses, deliver the alert to your Telegram Saved Messages
+  # instead. This is not a nicety: CallMeBot answers GitHub Actions runners
+  # with HTTP 403 (it blocks datacentre IPs), so without this a scheduled run
+  # can find real matches and deliver none of them. Verified: the identical
+  # request returns 200 from a home connection and 403 from the cloud.
+  telegram_fallback: true
+
   # Send a run summary even when nothing matched (quiet heartbeat).
   send_heartbeat: false
   # Alert if the pipeline itself breaks (scrapers all dead, Gemini down).

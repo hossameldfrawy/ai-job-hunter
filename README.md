@@ -184,6 +184,27 @@ is a regression test for it.
 Arabic keywords live alongside the English ones in `config.yml` under
 `profile:`, and Tanqeeb is queried in both languages.
 
+### What changes when it runs in the cloud
+
+GitHub Actions runs from datacentre IPs, and two services treat those
+differently from a home connection. Both were found by reading a real cloud run,
+not by guessing:
+
+| | Local / VPS | GitHub Actions | Handling |
+|---|---|---|---|
+| **CallMeBot (WhatsApp)** | HTTP 200 | **HTTP 403** | Falls back to Telegram Saved Messages |
+| **Tanqeeb** | 928 postings | **0** (all subdomains blocked) | Circuit breaker fails it fast in ~18s |
+| Everything else | works | works | — |
+
+The CallMeBot block is the one that mattered: a scheduled run found **9 genuine
+matches and delivered none of them**, with `alerts_failed: 9` the only trace.
+Alerts now fall back to your Telegram Saved Messages, which has no such
+restriction and reuses the MTProto session the bot already holds. Set
+`notifications.telegram_fallback: false` to disable.
+
+If you want Tanqeeb's GCC coverage as well, run the bot on a VPS or in Docker
+(`python main.py --daemon`) rather than on Actions — see DEPLOYMENT.md.
+
 ### Source health & audit digest
 
 Proof that every platform actually ran, delivered to WhatsApp:

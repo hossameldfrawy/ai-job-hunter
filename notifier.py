@@ -174,8 +174,57 @@ class WhatsAppNotifier:
             time.sleep(self.interval - elapsed)
         self._last_send = time.monotonic()
 
+    # -- fallback channel ---------------------------------------------------
+    @staticmethod
+    def _telegram_available() -> bool:
+        try:
+            from scrapers.telegram_user_client import telethon_available
+        except Exception:
+            return False
+        return bool(telethon_available() and settings.telegram_ready)
+
+    def send_via_telegram(self, message: str) -> tuple[bool, str]:
+        """Deliver to your own Telegram Saved Messages.
+
+        This exists because CallMeBot answers a GitHub Actions runner with
+        HTTP 403 -- it blocks datacentre IP ranges. Measured: the identical
+        request returns 200 from a home connection and 403 from the cloud, so
+        a scheduled run found nine genuine matches and delivered none of them.
+
+        Telegram has no such restriction, and the bot already holds an
+        authorised MTProto session for ingestion. Saved Messages is the target
+        because it is private, always present, and needs no extra setup.
+        Message limit is 4096 characters rather than CallMeBot's URL budget, so
+        nothing has to be shortened here.
+        """
+        if not self._telegram_available():
+            return False, "telegram fallback unavailable (no session or Telethon)"
+
+        import asyncio
+
+        from scrapers.telegram_user_client import build_client, ensure_authorized
+
+        async def _send() -> None:
+            client = build_client()
+            await ensure_authorized(client)
+            try:
+                await client.send_message("me", message[:4096], link_preview=False)
+            finally:
+                await client.disconnect()
+
+        try:
+            asyncio.run(_send())
+            return True, "sent via telegram"
+        except Exception as exc:
+            return False, f"telegram fallback failed: {type(exc).__name__}: {exc}"[:200]
+
     def send_raw(self, message: str) -> tuple[bool, str]:
-        """Deliver one message. Returns (ok, detail). Never raises."""
+        """Deliver one message. Returns (ok, detail). Never raises.
+
+        Tries CallMeBot first (WhatsApp is the requested channel), then falls
+        back to Telegram if configured -- see `send_via_telegram` for why that
+        matters in the cloud.
+        """
         if self.dry_run:
             log.info("[DRY_RUN] would send:\n%s\n", message)
             return True, "dry_run"
@@ -206,8 +255,27 @@ class WhatsAppNotifier:
             return False, f"{type(exc).__name__}: {exc}"
 
         if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}: {resp.text[:150]}"
-        return self._classify(resp.text)
+            return self._fallback(
+                message, f"HTTP {resp.status_code}: {resp.text[:120]}"
+            )
+        ok, detail = self._classify(resp.text)
+        if ok:
+            return True, detail
+        return self._fallback(message, detail)
+
+    def _fallback(self, message: str, primary_error: str) -> tuple[bool, str]:
+        """CallMeBot refused; try Telegram before giving up on the alert."""
+        if not settings.notifications.get("telegram_fallback", True):
+            return False, primary_error
+        if not self._telegram_available():
+            return False, primary_error
+
+        log.warning("CallMeBot failed (%s); falling back to Telegram.",
+                    primary_error[:90])
+        ok, detail = self.send_via_telegram(message)
+        if ok:
+            return True, f"telegram fallback (callmebot: {primary_error[:60]})"
+        return False, f"{primary_error} | {detail}"
 
     # -- high level ---------------------------------------------------------
     def dispatch(self, evaluations: Iterable[Evaluation]) -> DispatchResult:
@@ -298,10 +366,15 @@ class WhatsAppNotifier:
             sample = src.get("sample") or {}
             title = _clean_field(str(sample.get("title", "")), 58)
             company = _clean_field(str(sample.get("company", "")), 34)
-            if title and company:
-                line += f'\n└ Last seen: "{title} @ {company}"'
-            elif title:
-                line += f'\n└ Last seen: "{title}"'
+            shown = f"{title} @ {company}" if title and company else title
+            # A source can be perfectly reachable and still return nothing worth
+            # applying to. Distinguishing the two is the difference between
+            # "working" and "working for me".
+            on_profile = str(sample.get("relevant", "yes")) == "yes"
+            if shown and on_profile:
+                line += f'\n└ Last seen: "{shown}"'
+            elif shown:
+                line += f'\n└ Reachable, none on-profile: "{shown}"'
             elif count == 0:
                 line += "\n└ nothing new this run"
             blocks.append(line)
