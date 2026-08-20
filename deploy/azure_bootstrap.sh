@@ -72,6 +72,15 @@ step "STEP 1c  Virtualenv + Python dependencies"
 "$VENV/bin/pip" install -r "$APP_DIR/requirements.txt" --quiet
 ok "requirements.txt installed"
 
+# requirements.txt is deliberately lean -- it carries what the daemon RUNS,
+# not what proves it works, so pytest lives in requirements-dev.txt. The test
+# gate below needs it, and without this the gate fails as "No module named
+# pytest", which reads exactly like a red suite.
+if [ "${SKIP_TESTS:-0}" != "1" ] && [ -f "$APP_DIR/requirements-dev.txt" ]; then
+  "$VENV/bin/pip" install -r "$APP_DIR/requirements-dev.txt" --quiet
+  ok "requirements-dev.txt installed (test gate)"
+fi
+
 # ---------------------------------------------------------------------------
 step "STEP 1d  Chromium + its OS libraries"
 # `playwright install-deps` resolves the correct package set for THIS distro
@@ -87,7 +96,7 @@ sudo "$VENV/bin/playwright" install-deps chromium || {
 ok "chromium ready"
 
 # ---------------------------------------------------------------------------
-step "STEP 3b  Swap (protects Playwright from the OOM killer on a 4GB box)"
+step "STEP 3b  Swap (headroom so Chromium is never the OOM killer's target)"
 if [ "$(swapon --show --noheadings | wc -l)" -gt 0 ]; then
   ok "swap already active: $(free -h | awk '/Swap/{print $2}')"
 else
