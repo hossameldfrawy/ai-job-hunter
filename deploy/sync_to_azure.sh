@@ -37,7 +37,9 @@ step "Preflight"
    via the Azure portal (VM > Help > Reset password > Add SSH public key)."
 ok "ssh to $VM_HOST"
 
-"${SSH[@]}" "mkdir -p '$APP_DIR/secrets' '$APP_DIR/state' '$APP_DIR/assets'"
+# browser_sessions must exist before scp -r: `scp -r src/. dst/` refuses to
+# create the destination and fails with a canonicalization error.
+"${SSH[@]}" "mkdir -p '$APP_DIR/secrets' '$APP_DIR/state/browser_sessions' '$APP_DIR/assets'"
 
 # ---------------------------------------------------------------------------
 # Stop the daemon before touching the databases. SQLite in WAL mode keeps
@@ -107,10 +109,39 @@ ok "cleared stale WAL/SHM sidecars on the VM"
 
 # ---------------------------------------------------------------------------
 step "Browser sessions"
+# A Chromium profile is mostly disposable cache: 341MB on disk, of which the
+# part that actually carries a login -- Network/Cookies, Local State,
+# Preferences, Local/Session Storage, IndexedDB -- is about 10MB. Shipping the
+# rest means thousands of scp round-trips to deliver files Chromium throws away
+# and regenerates on first launch.
+#
+# Singleton{Lock,Socket,Cookie} are excluded for a different reason: they are
+# symlinks naming the HOST and PID that held the profile. Carried over they
+# name a machine that is not this one, and Chromium either honours a lock
+# nothing holds or trips over a dangling link.
+PROFILE_EXCLUDES=(
+  --exclude='*/Cache'
+  --exclude='*/Code Cache'
+  --exclude='*/GPUCache'
+  --exclude='*/ShaderCache'
+  --exclude='*/GrShaderCache'
+  --exclude='*/DawnGraphiteCache'
+  --exclude='*/DawnWebGPUCache'
+  --exclude='*/BrowserMetrics'
+  --exclude='*/Crashpad'
+  --exclude='*/component_crx_cache'
+  --exclude='*/extensions_crx_cache'
+  --exclude='*/CacheStorage'
+  --exclude='*/ScriptCache'
+  --exclude='SingletonLock'
+  --exclude='SingletonSocket'
+  --exclude='SingletonCookie'
+)
 if [ -d "$HERE/state/browser_sessions" ]; then
-  "${SCP[@]}" -r "$HERE/state/browser_sessions/." \
-      "$VM_USER@$VM_HOST:$APP_DIR/state/browser_sessions/"
-  ok "$(find "$HERE/state/browser_sessions" -maxdepth 1 -mindepth 1 -type d | wc -l) board profile(s)"
+  profiles=$(find "$HERE/state/browser_sessions" -maxdepth 1 -mindepth 1 -type d | wc -l)
+  tar -cz -C "$HERE/state/browser_sessions" "${PROFILE_EXCLUDES[@]}" . \
+    | "${SSH[@]}" "tar -xz -C '$APP_DIR/state/browser_sessions'"
+  ok "$profiles board profile(s), caches excluded"
 else
   warn "no state/browser_sessions/ locally"
 fi
