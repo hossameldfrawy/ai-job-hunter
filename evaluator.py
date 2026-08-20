@@ -748,7 +748,15 @@ class GeminiEvaluator:
                     "properties": {"ok": {"type": "BOOLEAN"}},
                     "required": ["ok"],
                 },
-                "maxOutputTokens": 256,
+                # 8192, to reply with `{"ok":true}`. Not a typo: on a thinking
+                # model the reasoning tokens are drawn from this same budget
+                # before a single character of the answer is emitted, so a
+                # ceiling sized to the ANSWER starves the response entirely.
+                # At 256 this returned finishReason=MAX_TOKENS with four
+                # characters of output and reported the API as down while the
+                # batch path -- same key, same model, 8192 -- was working.
+                # Nothing is billed for headroom that goes unused.
+                "maxOutputTokens": 8192,
             },
         }
         try:
